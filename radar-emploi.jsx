@@ -398,19 +398,86 @@ const offerLang = (o) => o?.language || "fr";
 const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais" };
 
 /* ════════════════════════════════════════════════════════════════════════
-   3. PERSISTANCE — window.storage
+   3. ENVIRONNEMENT & PERSISTANCE
+   Deux environnements, détectés au chargement :
+   - « chat » : artefact dans une conversation claude.ai → window.storage + API Claude (web_search, MCP) ;
+   - « publié » : page Artifact publiée → capacités claude.use() : db (données privées par personne),
+     sample (Claude sur le compte du lecteur), mcp (connecteurs Gmail / Google Calendar), downloads.
    ════════════════════════════════════════════════════════════════════════ */
+
+const RT = { mode: null, db: null, uid: null, sample: null, mcp: null, downloads: null };
+const MCP_SERVER_NAME = { gmail: "Gmail", gcal: "Google Calendar" };
+
+async function initRuntime() {
+  if (RT.mode) return RT;
+  if (typeof window !== "undefined" && window.storage && typeof window.storage.get === "function") {
+    RT.mode = "chat";
+    return RT;
+  }
+  if (typeof window !== "undefined" && window.claude?.use) {
+    const use = (n) => window.claude.use(n).catch(() => null);
+    const [db, user, sample, mcp, downloads] = await Promise.all([use("db"), use("user"), use("sample"), use("mcp"), use("downloads")]);
+    Object.assign(RT, { db, sample, mcp, downloads });
+    try { RT.uid = user ? await user.id() : null; } catch { RT.uid = null; }
+    RT.mode = "published";
+    return RT;
+  }
+  RT.mode = "none";
+  return RT;
+}
+
+/* Données publiées : un document par tranche de 180 Ko (limite 256 Kio par document), sous data/users/<id>/ (privé). */
+const DB_CHUNK = 180000;
+const dbQueues = {};
+const dbDoc = (name) => RT.db.doc(`data/users/${RT.uid}/${name}`);
+const dbName = (key) => key.replace(/[^a-z0-9]/gi, "_");
+const dbStore = {
+  async get(key) {
+    const k = dbName(key);
+    const meta = await dbDoc(`${k}__meta`).get();
+    if (!meta.exists) return null;
+    const n = Number(meta.data()?.n) || 0;
+    const parts = await Promise.all(Array.from({ length: n }, (_, i) => dbDoc(`${k}__${i}`).get()));
+    return JSON.parse(parts.map((x) => String(x.data()?.c ?? "")).join(""));
+  },
+  set(key, value) {
+    const k = dbName(key);
+    const run = async () => {
+      const str = JSON.stringify(value);
+      const chunks = [];
+      for (let i = 0; i < str.length; i += DB_CHUNK) chunks.push(str.slice(i, i + DB_CHUNK));
+      if (!chunks.length) chunks.push("");
+      const prev = await dbDoc(`${k}__meta`).get();
+      const prevN = prev.exists ? Number(prev.data()?.n) || 0 : 0;
+      for (let i = 0; i < chunks.length; i++) await dbDoc(`${k}__${i}`).set({ c: chunks[i] });
+      await dbDoc(`${k}__meta`).set({ n: chunks.length, at: nowISO() });
+      for (let i = chunks.length; i < prevN; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+    };
+    dbQueues[k] = (dbQueues[k] || Promise.resolve()).catch(() => {}).then(run);
+    return dbQueues[k];
+  },
+  async remove(key) {
+    const k = dbName(key);
+    const meta = await dbDoc(`${k}__meta`).get().catch(() => null);
+    const n = meta?.exists ? Number(meta.data()?.n) || 0 : 0;
+    for (let i = 0; i < n; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+    await dbDoc(`${k}__meta`).delete().catch(() => {});
+  },
+};
 
 const storage = {
   available() {
+    if (RT.mode === "published") return !!(RT.db && RT.uid);
     return typeof window !== "undefined" && !!window.storage && typeof window.storage.get === "function";
   },
   async list(prefix) {
+    if (RT.mode === "published") throw new Error("list indisponible");
     const r = await window.storage.list(prefix);
     const keys = Array.isArray(r) ? r : r?.keys || [];
     return keys.map((k) => (typeof k === "string" ? k : k?.key)).filter(Boolean);
   },
   async get(key) {
+    if (RT.mode === "published") return dbStore.get(key);
     const r = await window.storage.get(key);
     if (r === null || r === undefined) return null;
     const raw = typeof r === "string" ? r : r.value;
@@ -418,9 +485,11 @@ const storage = {
     return typeof raw === "string" ? JSON.parse(raw) : raw;
   },
   async set(key, value) {
+    if (RT.mode === "published") return dbStore.set(key, value);
     await window.storage.set(key, JSON.stringify(value));
   },
   async remove(key) {
+    if (RT.mode === "published") return dbStore.remove(key);
     try { await window.storage.delete(key); } catch { /* clé absente */ }
   },
 };
@@ -517,7 +586,81 @@ async function runConversation(settings, v, o) {
   throw new Error("La recherche n'a pas abouti (trop d'étapes). Réessayez avec moins de sources.");
 }
 
-async function callClaude(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000 }) {
+/* Outils de connecteurs exposés à Claude dans la version publiée (lecture Gmail uniquement). */
+const PUB_TOOLS = {
+  gmail: {
+    search_threads: {
+      description: "Recherche des fils Gmail (syntaxe Gmail : from:, after:YYYY/MM/DD, OR…). Renvoie id, objet, expéditeur, date et extrait des messages. Lecture seule.",
+      schema: { type: "object", properties: { query: { type: "string", description: "Requête Gmail" }, pageSize: { type: "integer", description: "1 à 50" } }, required: ["query"] },
+      input: (i) => ({ query: String(i.query || ""), pageSize: clamp(Number(i.pageSize) || 20, 1, 50) }),
+    },
+    get_thread: {
+      description: "Lit un fil Gmail complet en texte brut à partir de son identifiant (threadId obtenu par search_threads). Lecture seule.",
+      schema: { type: "object", properties: { threadId: { type: "string" } }, required: ["threadId"] },
+      input: (i) => ({ threadId: String(i.threadId || ""), messageFormat: "PLAIN_TEXT" }),
+    },
+  },
+};
+
+const SAMPLE_ERRORS = {
+  not_granted: "Accès à Claude refusé pour cette page. Rechargez la page pour l'autoriser.",
+  rate_limited: "Trop de demandes simultanées. Patientez un instant puis relancez.",
+  session_expired: "Session claude.ai expirée : reconnectez-vous puis rechargez la page.",
+  sampling_disabled: "L'appel à Claude est désactivé pour votre compte ou votre organisation.",
+  prompt_too_large: "Demande trop volumineuse : réduisez le nombre d'offres ou le texte collé.",
+  tools_unavailable: "Cette vue ne permet pas à Claude d'utiliser les connecteurs. Ouvrez la page dans claude.ai.",
+  cancelled: "Demande annulée.",
+};
+
+async function callSample(settings, { system, prompt, web, mcp = [] }) {
+  if (!RT.sample) throw new Error("Claude n'est pas disponible dans cette vue : ouvrez la page connecté à claude.ai.");
+  const acc = { toolText: [], toolCalls: [], toolErrors: [] };
+  const tools = [];
+  for (const m of mcp) {
+    const defs = PUB_TOOLS[m.server] || {};
+    for (const name of m.allow || []) {
+      const def = defs[name];
+      if (!def) continue;
+      tools.push({
+        name: `${m.server}_${name}`,
+        description: def.description,
+        inputSchema: def.schema,
+        execute: async (input) => {
+          if (!RT.mcp) throw new Error("Connecteur indisponible dans cette vue");
+          acc.toolCalls.push(name);
+          try {
+            const r = await RT.mcp.callTool(MCP_SERVER_NAME[m.server], name, def.input(input || {}));
+            const txt = typeof r.payload === "string" ? r.payload : JSON.stringify(r.payload ?? r.content ?? "");
+            acc.toolText.push(txt);
+            return txt.slice(0, 30000);
+          } catch (e) {
+            const msg = e?.message || e?.code || "échec du connecteur";
+            acc.toolErrors.push(msg);
+            throw new Error(msg);
+          }
+        },
+      });
+    }
+  }
+  if (mcp.length && !tools.length) throw new Error("Cette action n'est pas disponible via les connecteurs de la version publiée.");
+  const note = web
+    ? "\n\nIMPORTANT : aucune recherche web n'est disponible ici. N'utilise que les informations fournies ; n'invente aucune URL, aucun fait externe ni aucune source. Laisse vides les listes qui exigeraient une recherche."
+    : "";
+  try {
+    const r = await RT.sample(`${system}\n\n${prompt}${note}`, tools.length ? { tools } : {});
+    const text = (r.text || "").trim();
+    return { text, lastText: text, urls: [], toolText: acc.toolText.join("\n"), toolCalls: acc.toolCalls, toolErrors: acc.toolErrors, stop: r.truncated ? "max_tokens" : "end_turn", model: `claude.ai (${r.modelTierApplied || "default"})` };
+  } catch (e) {
+    throw new Error(SAMPLE_ERRORS[e?.code] || e?.message || "Échec de l'appel à Claude.");
+  }
+}
+
+async function callClaude(settings, opts) {
+  if (RT.mode === "published") return callSample(settings, opts);
+  return callClaudeApi(settings, opts);
+}
+
+async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000 }) {
   const o = {
     system, prompt, web, mcp, maxTokens,
     models: [...new Set([settings.model, settings.fallbackModel].filter(Boolean))],
@@ -1432,13 +1575,20 @@ function usePersist(key, value, enabled, onState) {
 }
 
 function usePrefersDark() {
-  const [dark, setDark] = useState(() => typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  const read = () => {
+    if (typeof window === "undefined") return false;
+    const forced = document.documentElement.getAttribute("data-theme");
+    if (forced === "dark" || forced === "light") return forced === "dark";
+    return !!window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  };
+  const [dark, setDark] = useState(read);
   useEffect(() => {
     const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
-    if (!mq) return undefined;
-    const h = (e) => setDark(e.matches);
-    mq.addEventListener?.("change", h);
-    return () => mq.removeEventListener?.("change", h);
+    const h = () => setDark(read());
+    mq?.addEventListener?.("change", h);
+    const mo = typeof MutationObserver !== "undefined" ? new MutationObserver(h) : null;
+    mo?.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => { mq?.removeEventListener?.("change", h); mo?.disconnect(); };
   }, []);
   return dark;
 }
@@ -1492,8 +1642,14 @@ export default function RadarApp() {
         setApps(demo.apps);
         setContacts(demo.contacts);
       };
+      await initRuntime();
       if (!storage.available()) {
-        setStorageState({ ok: false, readOnly: true, message: "window.storage n'est pas disponible ici : les données ne seront pas conservées après fermeture." });
+        setStorageState({
+          ok: false, readOnly: true,
+          message: RT.mode === "published"
+            ? "Connectez-vous à claude.ai pour enregistrer vos données : en attendant, rien n'est conservé après fermeture."
+            : "window.storage n'est pas disponible ici : les données ne seront pas conservées après fermeture.",
+        });
         applyDefaults();
         setLoaded(true);
         return;
@@ -1507,7 +1663,7 @@ export default function RadarApp() {
           try {
             out[name] = await storage.get(key);
           } catch (e) {
-            if (existing) throw e; // la clé existe mais la lecture échoue : on n'écrase rien
+            if (existing || RT.mode === "published") throw e; // lecture en échec : on n'écrase rien
             out[name] = null; // sans liste, une erreur signifie le plus souvent « clé absente »
           }
         }
@@ -1643,6 +1799,7 @@ export default function RadarApp() {
   };
 
   const runWatch = ({ sourceIds, version } = {}) => withBusy("watch", async () => {
+    if (RT.mode === "published") throw new Error("La veille web a besoin de la recherche web, disponible uniquement dans la version « chat » de claude.ai. Ici : importez vos alertes Gmail, collez une annonce, ou importez un fichier JSON.");
     const s = R.current.settings;
     const crit = version || activeVersion(R.current.criteria);
     const list = R.current.sources.filter((x) => (sourceIds ? sourceIds.includes(x.id) : x.enabled) && x.kind !== "email");
@@ -1707,6 +1864,7 @@ export default function RadarApp() {
   const importManual = ({ text, url }) => withBusy("manual", async () => {
     const s = R.current.settings;
     const cleanUrl = str(url);
+    if (RT.mode === "published" && !str(text)) throw new Error("Dans cette version, la recherche web n'est pas disponible : collez le texte de l'annonce (l'URL sera conservée).");
     const res = await askJSON(s, {
       system: SYSTEM_BASE,
       prompt: P.structure({ text: str(text), url: cleanUrl }),
@@ -1961,6 +2119,13 @@ export default function RadarApp() {
     text: `${subject}\n\n${body}`,
     run: () => withBusy("gmail-draft", async () => {
       const s = R.current.settings;
+      if (RT.mode === "published") {
+        if (!RT.mcp) throw new Error("Connecteur Gmail indisponible dans cette vue.");
+        await RT.mcp.callTool("Gmail", "create_draft", { to: to ? [to] : [], subject: subject || "", body: body || "" }).catch((e) => { throw new Error(`Brouillon non créé : ${e?.message || e?.code}`); });
+        if (appId) logApp(appId, "email", `Brouillon Gmail créé : « ${subject} »`);
+        toast("Brouillon créé dans Gmail — non envoyé", "ok");
+        return;
+      }
       const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000 });
       if (res.toolCalls.some((n) => /send/i.test(n))) toast("Alerte : un outil d'envoi a été appelé. Vérifiez vos e-mails envoyés.", "danger");
       if (!res.toolCalls.length) throw new Error("Le connecteur Gmail n'a pas été appelé : aucun brouillon créé. Vérifiez l'activation du connecteur.");
@@ -1976,6 +2141,17 @@ export default function RadarApp() {
     text: `${title}\n${description || ""}`,
     run: () => withBusy("gcal", async () => {
       const s = R.current.settings;
+      if (RT.mode === "published") {
+        if (!RT.mcp) throw new Error("Connecteur Google Calendar indisponible dans cette vue.");
+        const r = await RT.mcp.callTool("Google Calendar", "create_event", {
+          summary: title, startTime: `${toLocalInput(start)}:00`, endTime: `${toLocalInput(end)}:00`, timeZone: "Europe/Brussels",
+          description: description || "", overrideReminders: [{ method: "popup", minutes: reminder }],
+        }).catch((e) => { throw new Error(`Événement non créé : ${e?.message || e?.code}`); });
+        if (appId) logApp(appId, "calendar", `Agenda : « ${title} » le ${fmtDate(start, { time: true })}`);
+        onDone?.(r?.payload || {});
+        toast("Événement ajouté à Google Calendar", "ok");
+        return;
+      }
       const res = await askJSON(s, {
         system: SYSTEM_TOOLS,
         prompt: P.calendarEvent({ title, start: toLocalInput(start) + ":00", end: toLocalInput(end) + ":00", description, reminder }),
@@ -2187,7 +2363,7 @@ export default function RadarApp() {
     const stale = (iso) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= (s.autoWatchHours || 24);
     const t = setTimeout(async () => {
       if (s.autoGmail && stale(s.lastGmailImportAt)) await importGmail(s.gmailDays);
-      if (s.autoWatch && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
+      if (s.autoWatch && RT.mode !== "published" && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
     }, 1500);
     return () => clearTimeout(t);
   }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -2340,7 +2516,7 @@ function TopBar({ onMenu, onPalette, privacy, setPrivacy }) {
   const ThemeIcon = settings.theme === "dark" ? Moon : settings.theme === "light" ? Sun : Monitor;
   const running = busy.watch ? "Veille en cours" : busy.gmail ? "Import Gmail" : busy.score ? "Scoring" : null;
   return (
-    <div className="sticky top-0 z-30" style={T.glass}>
+    <div className="sticky z-30" style={{ ...T.glass, top: "env(safe-area-inset-top, 0px)" }}>
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-10 h-14 flex items-center gap-2">
         <IconBtn icon={Menu} label="Ouvrir le menu" onClick={onMenu} className="md:hidden" />
         <button type="button" onClick={onPalette} className={`flex-1 min-w-0 max-w-md flex items-center gap-2 h-9 px-3 rounded-xl text-sm ${T.sub} ${T.muted} ${T.ring}`} aria-label="Ouvrir la palette de commandes">
@@ -4353,7 +4529,18 @@ function PrivacyView() {
   const set = (k, v) => setSettings((s) => ({ ...s, [k]: v }));
   const json = useMemo(() => (showJson ? JSON.stringify(exportPayload(), null, 2) : ""), [showJson]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const download = () => {
+  const download = async () => {
+    const filename = `radar-sauvegarde-${new Date().toISOString().slice(0, 10)}.json`;
+    if (RT.mode === "published") {
+      if (!RT.downloads) { setShowJson(true); toast("Téléchargement indisponible ici : copiez le JSON affiché.", "warn"); return; }
+      try {
+        await RT.downloads.save({ filename, data: JSON.stringify(exportPayload(), null, 2) });
+        toast("Sauvegarde proposée au téléchargement", "ok");
+      } catch (e) {
+        if (e?.code !== "declined" && e?.code !== "cancelled") { setShowJson(true); toast("Téléchargement impossible : copiez le JSON affiché.", "warn"); }
+      }
+      return;
+    }
     try {
       const blob = new Blob([JSON.stringify(exportPayload(), null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
@@ -4430,6 +4617,11 @@ function PrivacyView() {
 
         <Card className="p-6">
           <SectionTitle action={<Btn size="sm" variant="ghost" icon={Gauge} onClick={testApi} loading={test?.state === "loading"}>Tester l'API</Btn>}>IA & connecteurs</SectionTitle>
+          {RT.mode === "published" && (
+            <Notice icon={Info} className="mb-4">
+              Version publiée : l'IA passe par votre compte claude.ai (une autorisation est demandée au premier appel) et Gmail / Google Calendar par vos connecteurs claude.ai. Les réglages de modèle et d'URL ci-dessous ne s'appliquent qu'à la version « chat ». La veille web n'est disponible que dans cette dernière.
+            </Notice>
+          )}
           {test && test.state !== "loading" && <Notice tone={test.state === "ok" ? "ok" : "danger"} className="mb-4">{test.text}</Notice>}
           <div className="grid grid-cols-2 gap-3">
             <Field label="Modèle"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>

@@ -10,6 +10,17 @@ L'IA collecte, score et prépare ; vous validez tout ce qui sort en votre nom.
 3. Au premier lancement, des données **« exemple »** sont affichées. Supprimez-les dans *Confidentialité & données*.
 4. Renseignez *Profil & critères* (CV collé, réalisations chiffrées), puis cliquez sur **Lancer la veille** ou utilisez `⌘K` / `Ctrl+K`.
 
+### Deux façons de l'utiliser
+
+| | Page publiée (lien claude.ai/artifact) | Artefact dans une conversation claude.ai |
+|---|---|---|
+| Sauvegarde | Espace privé de la page (capacité `db`, visible de vous seul) | `window.storage` |
+| IA | Votre compte claude.ai (capacité `sample`, autorisation au premier appel) | API Claude depuis l'artefact |
+| Gmail / Agenda | Vos connecteurs claude.ai (capacité `mcp` : lecture Gmail, brouillons, création d'événements) | Serveurs MCP dans l'appel API |
+| Veille web | **Indisponible** (pas de recherche web) : alertes Gmail, annonce collée ou import JSON | Disponible (`web_search`) |
+
+Le même fichier détecte l'environnement au chargement.
+
 ## Architecture
 
 | Module | Rôle |
