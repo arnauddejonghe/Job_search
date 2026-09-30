@@ -11,7 +11,7 @@ import {
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
   Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
-  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone,
+  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -60,6 +60,14 @@ const DOC_TYPES = [
   { id: "email", label: "E-mail de candidature" },
 ];
 const DOC_LABEL = Object.fromEntries(DOC_TYPES.map((d) => [d.id, d.label]));
+const REPLY_KINDS = {
+  accuse_reception: "Accusé de réception",
+  invitation_entretien: "Invitation à un entretien",
+  refus: "Refus",
+  demande_info: "Demande d'information",
+  offre: "Offre",
+  autre: "Autre",
+};
 const CONTACT_TYPES = { recruiter: "Recruteur", agency: "Cabinet", hiring: "Hiring manager", network: "Réseau" };
 
 const DEFAULT_SETTINGS = {
@@ -85,6 +93,10 @@ const DEFAULT_SETTINGS = {
   gmailDays: 14,
   lastWatchAt: null,
   lastGmailImportAt: null,
+  lastReplyCheckAt: null,
+  autoWatch: false,
+  autoWatchHours: 24,
+  autoGmail: false,
   sidebarCollapsed: false,
 };
 
@@ -797,6 +809,42 @@ Pour chaque langue (fr, nl, en) : synonymes d'intitulés réellement utilisés d
 Réponds uniquement {"fr":[],"nl":[],"en":[]}.`;
   },
 
+  dedupe(offers) {
+    const compact = offers.map((o) => ({
+      id: o.id, title: o.title, company: o.company, location: o.location, contract: o.contract, publishedAt: o.publishedAt,
+      sites: [...new Set((o.sources || []).map((x) => hostOf(x.url) || x.name))],
+      excerpt: (o.description || "").slice(0, 220),
+    }));
+    return `Mission : repérer les offres qui décrivent le MÊME poste publié plusieurs fois (autre site, cabinet qui anonymise l'employeur, intitulé traduit ou reformulé en FR/NL/EN).
+OFFRES
+${JSON.stringify(compact)}
+
+RÈGLES
+- Ne regroupe que si tu es raisonnablement sûr : même poste, même employeur (ou employeur anonymisé compatible), même lieu, période de publication proche.
+- Deux postes semblables chez deux employeurs différents ne sont PAS des doublons.
+- Chaque id apparaît au plus dans un groupe. Aucun groupe est une réponse valable.
+Réponds uniquement {"groups":[{"ids":["",""],"confidence":"haute|moyenne","reason":"20 mots max"}]}`;
+  },
+
+  replies(items) {
+    return `Date du jour : ${todayStr()}.
+Mission : détecter dans Gmail les réponses reçues aux candidatures ci-dessous. LECTURE SEULE.
+CANDIDATURES
+${JSON.stringify(items)}
+
+MÉTHODE
+1. Pour chaque candidature, recherche les e-mails reçus depuis sa date d'envoi (champ since) venant de l'entreprise, du cabinet ou des contacts listés (nom, domaine, adresse). Ignore les alertes emploi automatiques, newsletters et e-mails envoyés par l'utilisateur.
+2. Ouvre les messages pertinents (25 au maximum au total).
+3. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
+
+RÈGLES
+- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. Si le rattachement à une candidature est incertain, ne le rapporte pas.
+- kind : accuse_reception | invitation_entretien | refus | demande_info | offre | autre.
+- proposedStage : "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
+- interviewAt : date et heure proposées dans l'e-mail (YYYY-MM-DDTHH:mm), sinon null.
+Réponds uniquement {"replies":[{"appId":"","date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"messagesRead":0}`;
+  },
+
   today(items) {
     return `Voici les actions candidates d'une recherche d'emploi discrète (JSON). Classe-les par priorité pour aujourd'hui selon les échéances, le score des offres et l'avancement des candidatures. Pour chacune, une raison de 12 mots max. N'ajoute aucune action.
 ${JSON.stringify(items.map(({ id, label, detail, due }) => ({ id, label, detail, due })))}
@@ -1421,6 +1469,8 @@ export default function RadarApp() {
   const [manualOpen, setManualOpen] = useState(false);
   const [todayAI, setTodayAI] = useState(null);
   const [offerPreset, setOfferPreset] = useState(null);
+  const [dupeProposals, setDupeProposals] = useState(null);
+  const [replyProposals, setReplyProposals] = useState(null);
 
   const prefersDark = usePrefersDark();
   const dark = settings.theme === "dark" || (settings.theme === "system" && prefersDark);
@@ -1675,6 +1725,131 @@ export default function RadarApp() {
     if (r.added.length) await scoreOffers(r.added);
     return r.added[0] || r.merged[0];
   });
+
+  const importOffersJSON = (text) => withBusy("json-import", async () => {
+    let obj;
+    try { obj = JSON.parse(text); } catch (e) { throw new Error(`JSON invalide : ${e.message}`); }
+    const raw = Array.isArray(obj) ? obj : Array.isArray(obj?.offers) ? obj.offers : null;
+    if (!raw) throw new Error("Format attendu : un tableau d'offres, ou {\"offers\": [...]}.");
+    const norm = raw.map((r) => normalizeOffer(r, { sourceName: str(r?.sourceName) || str(r?.source) || "Import JSON", via: "import JSON" })).filter(Boolean);
+    const skipped = raw.length - norm.length;
+    const r = applyIncoming(norm);
+    toast(`Import JSON : ${r.added.length} nouvelle(s), ${r.merged.length} fusion(s)${skipped ? `, ${skipped} ignorée(s) (intitulé ou URL manquant)` : ""}`, skipped ? "warn" : "ok");
+    if (r.added.length) await scoreOffers(r.added);
+    return true;
+  });
+
+  /* ── Doublons : détection IA, fusion validée, annulable ──────────── */
+  const inPipeline = (oid) => R.current.apps.some((a) => a.offerId === oid);
+  const detectDuplicates = () => withBusy("dedupe", async () => {
+    const pool0 = R.current.offers
+      .filter((o) => !o.demo && o.status !== "dismissed")
+      .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || normText(a.title).localeCompare(normText(b.title)))
+      .slice(0, 180);
+    if (pool0.length < 2) { toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
+    const known = new Set(pool0.map((o) => o.id));
+    const used = new Set();
+    const groups = [];
+    for (const batch of chunk(pool0, 60)) {
+      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000 });
+      for (const g of Array.isArray(data?.groups) ? data.groups : []) {
+        const ids = [...new Set((g.ids || []).filter((id) => known.has(id) && !used.has(id)))];
+        if (ids.length < 2) continue;
+        if (ids.filter(inPipeline).length > 1) continue; // deux candidatures distinctes : on ne fusionne pas
+        ids.forEach((id) => used.add(id));
+        groups.push({ id: uid("dup"), ids, confidence: g.confidence === "haute" ? "haute" : "moyenne", reason: str(g.reason), accept: g.confidence === "haute" });
+      }
+    }
+    if (!groups.length) { toast("Aucun doublon détecté.", "ok"); return; }
+    setDupeProposals(groups);
+  });
+
+  const mergeGroup = (ids, reason) => {
+    const list = R.current.offers;
+    const members = ids.map((id) => list.find((o) => o.id === id)).filter(Boolean);
+    if (members.length < 2) return false;
+    const primary = members.find((o) => inPipeline(o.id))
+      || [...members].sort((a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || new Date(a.collectedAt) - new Date(b.collectedAt))[0];
+    const absorbed = members.filter((o) => o.id !== primary.id);
+    const before = { sources: primary.sources, description: primary.description, ...Object.fromEntries(FILLABLE.map((k) => [k, primary[k]])) };
+    const merged = { ...primary, sources: [...(primary.sources || [])] };
+    for (const o of absorbed) {
+      for (const src of o.sources || []) if (!merged.sources.some((x) => canonicalUrl(x.url) === canonicalUrl(src.url) && x.name === src.name)) merged.sources.push(src);
+      for (const k of FILLABLE) if ((merged[k] === null || merged[k] === undefined || merged[k] === "") && o[k]) merged[k] = o[k];
+      if (o.description && (!merged.description || o.description.length > merged.description.length)) merged.description = o.description;
+    }
+    merged.mergeHistory = [...(primary.mergeHistory || []), { id: uid("merge"), at: nowISO(), reason: str(reason), origin: "IA validée", before, absorbed }];
+    const absorbedIds = new Set(absorbed.map((o) => o.id));
+    const next = list.filter((o) => !absorbedIds.has(o.id)).map((o) => (o.id === primary.id ? merged : o));
+    R.current.offers = next;
+    setOffers(next);
+    return true;
+  };
+  const applyDupeProposals = (groups) => {
+    let n = 0;
+    groups.filter((g) => g.accept).forEach((g) => { if (mergeGroup(g.ids, g.reason)) n++; });
+    setDupeProposals(null);
+    toast(n ? `${n} fusion(s) effectuée(s) — annulables depuis la fiche de l'offre` : "Aucune fusion appliquée", n ? "ok" : "neutral");
+  };
+  const undoMerge = (offerId) => {
+    const list = R.current.offers;
+    const o = list.find((x) => x.id === offerId);
+    const last = o?.mergeHistory?.slice(-1)[0];
+    if (!last) return;
+    const restored = { ...o, ...last.before, mergeHistory: o.mergeHistory.slice(0, -1) };
+    const next = [...list.map((x) => (x.id === offerId ? restored : x)), ...last.absorbed.filter((a) => !list.some((x) => x.id === a.id))];
+    R.current.offers = next;
+    setOffers(next);
+    toast(`Fusion annulée : ${last.absorbed.length} offre(s) restaurée(s)`, "ok");
+  };
+
+  /* ── Réponses des recruteurs (Gmail, lecture seule) ──────────────── */
+  const replyKey = (r) => `${r.date || ""}|${normText(r.from)}|${normText(r.subject)}`;
+  const checkReplies = () => withBusy("replies", async () => {
+    const { settings: s, apps: A, offers: O, contacts: C } = R.current;
+    const active = A.filter((a) => !a.demo && a.sentAt && a.stage !== "closed");
+    if (!active.length) { toast("Aucune candidature envoyée à surveiller.", "neutral"); return; }
+    const items = active.map((a) => {
+      const o = O.find((x) => x.id === a.offerId);
+      return {
+        appId: a.id, title: o?.title || null, company: o?.company || null,
+        sites: [...new Set((o?.sources || []).map((x) => hostOf(x.url)).filter(Boolean))],
+        contacts: C.filter((c) => (a.contactIds || []).includes(c.id)).map((c) => ({ name: c.name, email: c.email || null, company: c.company || null })),
+        since: a.sentAt.slice(0, 10),
+      };
+    });
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000 });
+    if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}).`, "danger");
+    if (!res.toolCalls.length) throw new Error("Gmail n'a pas été consulté : vérifiez que le connecteur Gmail est activé pour cet artefact.");
+    setSettings((x) => ({ ...x, lastReplyCheckAt: nowISO() }));
+    const hay = normText(res.toolText);
+    const found = (Array.isArray(res.data?.replies) ? res.data.replies : [])
+      .filter((r) => r && active.some((a) => a.id === r.appId) && str(r.subject))
+      .map((r) => ({
+        id: uid("rep"), appId: r.appId, date: str(r.date), from: str(r.from), subject: str(r.subject),
+        kind: REPLY_KINDS[r.kind] ? r.kind : "autre", summary: str(r.summary),
+        interviewAt: str(r.interviewAt) && !isNaN(new Date(r.interviewAt).getTime()) ? new Date(r.interviewAt).toISOString() : null,
+        action: ["interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
+        verified: hay.includes(normText(r.subject)),
+      }))
+      .filter((r) => !(active.find((a) => a.id === r.appId)?.seenReplies || []).includes(replyKey(r)));
+    if (!found.length) { toast(`Aucune nouvelle réponse (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok"); return; }
+    setReplyProposals(found);
+  });
+  const resolveReply = (r, apply) => {
+    patchApp(r.appId, (a) => {
+      const n = { ...a, seenReplies: [...(a.seenReplies || []), replyKey(r)] };
+      return apply ? addLogEntry(n, "email", `Réponse reçue (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`) : n;
+    });
+    if (apply) {
+      if (r.action === "interview") {
+        if (r.interviewAt) addInterview(r.appId, { at: r.interviewAt, type: "À préciser", location: "", notes: `Selon l'e-mail « ${r.subject} »` });
+        else moveApp(r.appId, "interview");
+      } else if (r.action === "closed") moveApp(r.appId, "closed", { outcome: "refused", reason: r.summary || "Réponse négative reçue par e-mail" });
+      else if (r.action === "offer") moveApp(r.appId, "offer");
+    }
+    setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
+  };
 
   /* ── Critères ───────────────────────────────────────────────────── */
   const saveCriteriaVersion = (label) => {
@@ -1935,12 +2110,13 @@ export default function RadarApp() {
       .slice(0, 3)
       .forEach((o) => items.push({ id: `tri:${o.id}`, label: `Trier une offre à ${o.score.value}`, detail: `${o.title} · ${o.company || NC}`, weight: 2, go: () => openOffer(o.id), demo: o.demo }));
     if (staleIds.length) items.push({ id: "stale", label: `Recalculer ${staleIds.length} score(s) obsolète(s)`, detail: "Les critères ont changé", weight: 3, go: () => rescoreStale() });
+    if (apps.some((a) => !a.demo && a.sentAt && a.stage !== "closed") && (!settings.lastReplyCheckAt || (Date.now() - new Date(settings.lastReplyCheckAt)) / 36e5 > 48)) items.push({ id: "replies", label: "Vérifier les réponses des recruteurs", detail: `Dernière vérification : ${relTime(settings.lastReplyCheckAt)}`, weight: 2, go: () => checkReplies() });
     if (!settings.lastWatchAt || (Date.now() - new Date(settings.lastWatchAt)) / 36e5 > 24) items.push({ id: "watch", label: "Lancer la veille", detail: `Dernière collecte : ${relTime(settings.lastWatchAt)}`, weight: 3, go: () => runWatch() });
     const order = todayAI?.order || {};
     return items
       .map((it) => ({ ...it, ai: order[it.id] }))
       .sort((a, b) => (a.ai?.priority ?? a.weight) - (b.ai?.priority ?? b.weight) || new Date(a.due || 8.64e15) - new Date(b.due || 8.64e15));
-  }, [apps, offers, settings.threshold, settings.lastWatchAt, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [apps, offers, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const prioritizeToday = () => withBusy("today", async () => {
     if (!todayItems.length) return;
@@ -2002,6 +2178,20 @@ export default function RadarApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  /* Veille automatique à l'ouverture (option, désactivée par défaut) : lecture seule, rien n'est envoyé. */
+  const autoRan = useRef(false);
+  useEffect(() => {
+    if (!loaded || autoRan.current || storageState.readOnly) return;
+    autoRan.current = true;
+    const s = R.current.settings;
+    const stale = (iso) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= (s.autoWatchHours || 24);
+    const t = setTimeout(async () => {
+      if (s.autoGmail && stale(s.lastGmailImportAt)) await importGmail(s.gmailDays);
+      if (s.autoWatch && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const go = (v, preset) => { setView(v); setMobileNav(false); if (preset !== undefined) setOfferPreset(preset); window.scrollTo?.({ top: 0 }); };
 
   const dueCount = useMemo(() => apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0), [apps]);
@@ -2017,6 +2207,7 @@ export default function RadarApp() {
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
+    importOffersJSON, detectDuplicates, undoMerge, checkReplies,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -2066,6 +2257,8 @@ export default function RadarApp() {
           {offerSel && <OfferDrawer id={offerSel} onClose={() => setOfferSel(null)} />}
           {appSel && <AppDrawer id={appSel.id} tab={appSel.tab} setTab={(t) => setAppSel((s) => ({ ...s, tab: t }))} onClose={() => setAppSel(null)} />}
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
+          <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
+          <ReplyReviewModal replies={replyProposals} setReplies={setReplyProposals} onResolve={resolveReply} apps={apps} offers={offers} />
           <StageDialog dialog={stageDialog} onClose={() => setStageDialog(null)} />
           <ConfirmExternalModal confirm={confirm} onClose={() => setConfirm(null)} />
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
@@ -2187,6 +2380,8 @@ function CommandPalette({ open, onClose }) {
       { group: "Actions", label: "Importer les alertes e-mail (Gmail)", icon: Mail, run: run(() => app.importGmail()) },
       { group: "Actions", label: "Importer une annonce (URL ou texte)", icon: Clipboard, run: run(() => app.setManualOpen(true)) },
       { group: "Actions", label: "Voir les relances dues", icon: BellRing, run: run(() => app.go("followups")) },
+      { group: "Actions", label: "Vérifier les réponses des recruteurs (Gmail)", icon: MailCheck, run: run(() => app.checkReplies()) },
+      { group: "Actions", label: "Détecter les doublons (IA)", icon: GitMerge, run: run(() => app.detectDuplicates()) },
       { group: "Actions", label: "Recalculer les scores obsolètes", hint: `${app.staleIds.length}`, icon: RefreshCw, run: run(() => app.rescoreStale()) },
       { group: "Actions", label: "Prioriser mes actions du jour (IA)", icon: Wand2, run: run(() => { app.go("dashboard"); app.prioritizeToday(); }) },
       { group: "Actions", label: "Exporter une sauvegarde JSON", icon: Download, run: run(() => app.go("privacy")) },
@@ -2490,7 +2685,7 @@ const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status:
 
 function OffersView() {
   const T = useT();
-  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria } = useApp();
+  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates } = useApp();
   const [f, setF] = useState(DEFAULT_FILTERS);
   const [dense, setDense] = useState(true);
   useEffect(() => {
@@ -2531,6 +2726,7 @@ function OffersView() {
         actions={
           <>
             {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Recalculer {staleIds.length}</Btn>}
+            <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
             <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
           </>
@@ -2646,7 +2842,7 @@ function OffersView() {
 
 function OfferDrawer({ id, onClose }) {
   const T = useT();
-  const { offers, settings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria } = useApp();
+  const { offers, settings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge } = useApp();
   const o = offers.find((x) => x.id === id);
   if (!o) return null;
   const s = o.score;
@@ -2758,6 +2954,21 @@ function OfferDrawer({ id, onClose }) {
         <SectionTitle>Annonce (résumé collecté)</SectionTitle>
         <p className={`text-sm leading-relaxed whitespace-pre-line ${o.description ? "" : T.faint}`}>{show(o.description)}</p>
       </section>
+
+      {o.mergeHistory?.length > 0 && (
+        <section className="mb-8">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Undo2} onClick={() => undoMerge(o.id)}>Annuler la dernière fusion</Btn>}>Historique des fusions</SectionTitle>
+          <ul className="space-y-2">
+            {[...o.mergeHistory].reverse().map((m) => (
+              <li key={m.id} className={`rounded-2xl p-4 text-sm ${T.sub}`}>
+                <div className="flex flex-wrap items-center gap-2"><GitMerge className={`w-3.5 h-3.5 ${T.muted}`} aria-hidden="true" /><span>{fmtDate(m.at, { time: true })}</span><Chip>{m.origin}</Chip></div>
+                {m.reason && <div className={`text-xs mt-1 ${T.muted}`}>{m.reason}</div>}
+                <ul className={`text-xs mt-2 space-y-0.5 ${T.muted}`}>{m.absorbed.map((a) => <li key={a.id}>↳ {a.title} · {show(a.company)} · {(a.sources || []).map((x) => x.name).join(", ")}</li>)}</ul>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section>
         <SectionTitle>Sources ({o.sources?.length || 0})</SectionTitle>
@@ -2988,6 +3199,85 @@ function StageDialog({ dialog, onClose }) {
         <Field label="Notes"><Textarea rows={2} value={itv.notes} onChange={(e) => setItv({ ...itv, notes: e.target.value })} /></Field>
         <Toggle checked={cal} onChange={setCal} label="Créer l'événement dans Google Calendar" description="Une confirmation vous sera demandée en mode discret." />
       </div>
+    </Modal>
+  );
+}
+
+function DupeReviewModal({ groups, setGroups, onApply, offers, apps }) {
+  const T = useT();
+  if (!groups) return null;
+  const offerById = (id) => offers.find((o) => o.id === id);
+  const n = groups.filter((g) => g.accept).length;
+  return (
+    <Modal
+      open
+      wide
+      onClose={() => setGroups(null)}
+      title={`Doublons proposés (${groups.length})`}
+      footer={<><Btn variant="ghost" onClick={() => setGroups(null)}>Annuler</Btn><Btn variant="primary" icon={GitMerge} disabled={!n} onClick={() => onApply(groups)}>Fusionner {n} groupe(s)</Btn></>}
+    >
+      <p className={`text-sm mb-4 ${T.muted}`}>Rien n'est fusionné sans votre validation. L'offre conservée est celle du pipeline, sinon la mieux scorée ; toutes les sources sont réunies et chaque fusion reste annulable depuis la fiche de l'offre.</p>
+      <ul className="space-y-3">
+        {groups.map((g) => (
+          <li key={g.id} className={`rounded-2xl p-4 ${T.sub}`}>
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" className="mt-1" checked={g.accept} onChange={() => setGroups(groups.map((x) => (x.id === g.id ? { ...x, accept: !x.accept } : x)))} aria-label="Fusionner ce groupe" />
+              <span className="flex-1 min-w-0">
+                <span className="flex flex-wrap items-center gap-2"><Chip tone={g.confidence === "haute" ? "ok" : "warn"}>confiance {g.confidence}</Chip>{g.reason && <span className={`text-xs ${T.muted}`}>{g.reason}</span>}</span>
+                <ul className="mt-2 space-y-1">
+                  {g.ids.map((id) => {
+                    const o = offerById(id);
+                    if (!o) return null;
+                    return (
+                      <li key={id} className="text-sm">
+                        <span className="font-medium">{o.title}</span> · {show(o.company)} · {show(o.location)}
+                        <span className={`block text-xs ${T.faint}`}>{(o.sources || []).map((x) => x.name).join(", ")} · {o.score ? `score ${o.score.value}` : "non scorée"}{apps.some((a) => a.offerId === id) ? " · dans le pipeline" : ""}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </span>
+            </label>
+          </li>
+        ))}
+      </ul>
+    </Modal>
+  );
+}
+
+function ReplyReviewModal({ replies, setReplies, onResolve, apps, offers }) {
+  const T = useT();
+  if (!replies) return null;
+  const ACTIONS = { log: "Journaliser seulement", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
+  return (
+    <Modal open wide onClose={() => setReplies(null)} title={`Réponses détectées (${replies.length})`}>
+      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Validez chaque réponse : elle sera ajoutée au journal et l'étape n'avancera que si vous le choisissez. Les relances en attente sont annulées en cas d'entretien, d'offre ou de refus.</p>
+      <ul className="space-y-3">
+        {replies.map((r) => {
+          const app = apps.find((a) => a.id === r.appId);
+          const o = offers.find((x) => x.id === app?.offerId);
+          return (
+            <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
+                <Chip tone={r.kind === "refus" ? "danger" : r.kind === "invitation_entretien" || r.kind === "offre" ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
+                {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
+              </div>
+              <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
+              <div className="text-sm mt-2">« {r.subject} »</div>
+              {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
+              {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
+              <div className="flex flex-wrap items-center gap-2 mt-3">
+                <Select value={r.action} onChange={(e) => setReplies(replies.map((x) => (x.id === r.id ? { ...x, action: e.target.value } : x)))} aria-label="Action" className="h-8 text-xs">
+                  {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                </Select>
+                <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
+                <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </Modal>
   );
 }
@@ -3518,7 +3808,7 @@ function AssistantView() {
 
 function FollowupsView() {
   const T = useT();
-  const { apps, offers, settings, setSettings, openApp } = useApp();
+  const { apps, offers, settings, setSettings, openApp, checkReplies, busy } = useApp();
   const [showDone, setShowDone] = useState(false);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
   const all = apps.flatMap((a) => (a.followUps || []).map((fu) => ({ app: a, fu })));
@@ -3534,7 +3824,11 @@ function FollowupsView() {
   const setRules = (patch) => setSettings((s) => ({ ...s, followUp: { ...s.followUp, ...patch } }));
   return (
     <div>
-      <PageHeader title="Relances & agenda" subtitle="L'IA rédige chaque relance en brouillon ; vous relisez, puis créez le brouillon Gmail et le rappel d'agenda." />
+      <PageHeader
+        title="Relances & agenda"
+        subtitle={`L'IA rédige chaque relance en brouillon ; vous relisez, puis créez le brouillon Gmail et le rappel d'agenda. Réponses vérifiées ${relTime(settings.lastReplyCheckAt)}.`}
+        actions={<Btn icon={MailCheck} loading={busy.replies} onClick={checkReplies}>Vérifier les réponses (Gmail)</Btn>}
+      />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-8">
           {pending.length === 0 && <Card><Empty icon={BellRing} title="Aucune relance en attente" text="Elles apparaîtront quand une candidature passera à « Envoyée »." /></Card>}
@@ -3677,8 +3971,18 @@ function ContactsView() {
 
 function SourcesView() {
   const T = useT();
-  const { sources, setSources, patchSource, runWatch, importGmail, busy, settings, setSettings, setManualOpen } = useApp();
+  const { sources, setSources, patchSource, runWatch, importGmail, busy, settings, setSettings, setManualOpen, importOffersJSON } = useApp();
   const [form, setForm] = useState({ name: "", kind: "company", url: "" });
+  const [jsonText, setJsonText] = useState("");
+  const jsonFile = useRef(null);
+  const readJsonFile = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => importOffersJSON(String(r.result));
+    r.readAsText(f);
+    e.target.value = "";
+  };
   const kinds = ["board", "public", "agency", "company", "custom", "email"];
   const addSource = () => {
     const name = form.name.trim();
@@ -3723,6 +4027,27 @@ function SourcesView() {
           <div className="flex items-center gap-2 mb-1"><Clipboard className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /><span className="font-medium">Import manuel</span></div>
           <p className={`text-sm mb-4 ${T.muted}`}>Collez une URL ou le texte d'une annonce (y compris LinkedIn) : l'IA la structure, la déduplique et la score.</p>
           <Btn icon={Plus} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
+        </Card>
+        <Card className="p-6">
+          <div className="flex items-center gap-2 mb-1"><RefreshCw className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /><span className="font-medium">Automatisation à l'ouverture</span></div>
+          <p className={`text-sm mb-2 ${T.muted}`}>Un artefact ne tourne pas en arrière-plan : ces options lancent la collecte à l'ouverture si la dernière date de plus de l'intervalle choisi. Lecture seule, rien n'est envoyé.</p>
+          <Toggle checked={settings.autoWatch} onChange={(v) => setSettings((s) => ({ ...s, autoWatch: v }))} label="Lancer la veille web" description="Consomme des appels API à chaque déclenchement." />
+          <Toggle checked={settings.autoGmail} onChange={(v) => setSettings((s) => ({ ...s, autoGmail: v }))} label="Importer les alertes Gmail" />
+          <Field label="Intervalle minimum" className="mt-2">
+            <Select value={settings.autoWatchHours} onChange={(e) => setSettings((s) => ({ ...s, autoWatchHours: Number(e.target.value) }))}>
+              {[12, 24, 48, 72].map((h) => <option key={h} value={h}>{h} h</option>)}
+            </Select>
+          </Field>
+        </Card>
+        <Card className="p-6">
+          <div className="flex items-center gap-2 mb-1"><Upload className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /><span className="font-medium">Importer des offres (JSON)</span></div>
+          <p className={`text-sm mb-3 ${T.muted}`}>Pour une veille produite ailleurs (tâche planifiée, export). Format : tableau d'offres ou <code>{"{\"offers\": [...]}"}</code>, champs title, url obligatoires ; company, location, description… facultatifs. Dédoublonnage et scoring automatiques.</p>
+          <Textarea rows={3} value={jsonText} onChange={(e) => setJsonText(e.target.value)} placeholder='[{"title":"…","company":"…","url":"https://…","sourceName":"…"}]' aria-label="Offres JSON" />
+          <div className="flex flex-wrap gap-2 mt-2">
+            <Btn size="sm" disabled={!jsonText.trim()} loading={busy["json-import"]} onClick={async () => { if (await importOffersJSON(jsonText)) setJsonText(""); }}>Importer le JSON collé</Btn>
+            <Btn size="sm" variant="ghost" icon={Upload} onClick={() => jsonFile.current?.click()}>Choisir un fichier</Btn>
+            <input ref={jsonFile} type="file" accept="application/json,.json" className="hidden" onChange={readJsonFile} aria-label="Fichier d'offres JSON" />
+          </div>
         </Card>
       </div>
 
