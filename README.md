@@ -17,9 +17,11 @@ L'IA collecte, score et prépare ; vous validez tout ce qui sort en votre nom.
 | Sauvegarde | Espace privé de la page (capacité `db`, visible de vous seul) | `window.storage` |
 | IA | Votre compte claude.ai (capacité `sample`, autorisation au premier appel) | API Claude depuis l'artefact |
 | Gmail / Agenda | Vos connecteurs claude.ai (capacité `mcp` : lecture Gmail, brouillons, création d'événements) | Serveurs MCP dans l'appel API |
-| Veille web | **Indisponible** (pas de recherche web) : alertes Gmail, annonce collée ou import JSON | Disponible (`web_search`) |
+| Veille web | Par la **Routine « Radar – veille emploi »** : du lundi au vendredi à 7 h 47 et à chaque clic sur « Lancer la veille » (connecteur Claude Code Remote). Un assistant Claude cherche sur le web avec vos critères et vos sources (jamais votre profil), puis dépose les offres dans `veille_inbox` ; la page les importe et les dédoublonne | Disponible (`web_search`) |
 
 Le même fichier détecte l'environnement au chargement.
+
+Dans la page publiée, la base partagée contient `veille/config` (critères et sources, écrit par la page), `veille/routine` (identifiant de la Routine), `veille/status` (état de la dernière exécution) et `veille_inbox/run-*` (offres déposées, purgées après 14 jours). Vos données personnelles restent sous `data/users/<vous>/`, privé.
 
 ## Architecture
 

@@ -97,6 +97,7 @@ const DEFAULT_SETTINGS = {
   autoWatch: false,
   autoWatchHours: 24,
   autoGmail: false,
+  importedRuns: [],
   sidebarCollapsed: false,
 };
 
@@ -390,6 +391,20 @@ function mentionsEmployer(text, names) {
     if (s.length <= 4) return new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text);
     return text.toLowerCase().includes(s.toLowerCase());
   });
+}
+
+function veilleConfig(version, sources, settings, sourceIds) {
+  const { id, label, createdAt, ...c } = version || {};
+  const src = sources
+    .filter((x) => x.kind !== "email" && (sourceIds ? sourceIds.includes(x.id) : x.enabled))
+    .map((x) => ({ name: x.name, kind: x.kind, domains: x.kind === "company" && x.careersUrl ? [hostOf(x.careersUrl)].filter(Boolean) : x.domains || [], careersUrl: x.careersUrl || null }));
+  const body = {
+    criteriaLabel: label || null,
+    roles: c.roles || [], zones: c.zones || [], maxCommute: c.maxCommute ?? 60, remote: c.remote || null,
+    mustHave: c.mustHave || [], exclusions: c.exclusions || [], keywords: c.keywords || { fr: [], nl: [], en: [] },
+    sources: src, lookbackDays: settings.lookbackDays, maxPerSource: settings.maxPerSource, home: "Ohain (Brabant wallon)",
+  };
+  return { ...body, sig: JSON.stringify(body) };
 }
 
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
@@ -1621,6 +1636,9 @@ export default function RadarApp() {
   const [offerPreset, setOfferPreset] = useState(null);
   const [dupeProposals, setDupeProposals] = useState(null);
   const [replyProposals, setReplyProposals] = useState(null);
+  const [veille, setVeille] = useState({ routine: null, status: null, configSig: null, configLoaded: false });
+  const veilleRef = useRef(veille);
+  veilleRef.current = veille;
 
   const prefersDark = usePrefersDark();
   const dark = settings.theme === "dark" || (settings.theme === "system" && prefersDark);
@@ -1799,7 +1817,25 @@ export default function RadarApp() {
   };
 
   const runWatch = ({ sourceIds, version } = {}) => withBusy("watch", async () => {
-    if (RT.mode === "published") throw new Error("La veille web a besoin de la recherche web, disponible uniquement dans la version « chat » de claude.ai. Ici : importez vos alertes Gmail, collez une annonce, ou importez un fichier JSON.");
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig) throw new Error("La veille planifiée n'est pas encore reliée à cette page. En attendant : alertes Gmail, annonce collée ou import JSON.");
+      if (!RT.mcp || !RT.db) throw new Error("Connexion claude.ai requise pour lancer la veille.");
+      const cfg = veilleConfig(version || activeVersion(R.current.criteria), R.current.sources, R.current.settings, sourceIds);
+      if (!cfg.sources.length) throw new Error("Aucune source web active. Activez des sources dans « Sources & collecte ».");
+      const { sig, ...payload } = cfg;
+      try {
+        await RT.mcp.callTool("Claude Code Remote", "fire_trigger", {
+          trigger_id: trig,
+          text: `Lancement manuel depuis la page Radar (${new Date().toLocaleString("fr-BE")}). Utilise CETTE configuration plutôt que veille/config :\n${JSON.stringify(payload)}`,
+        });
+      } catch (e) {
+        throw new Error(`Lancement impossible (${e?.message || e?.code || "connecteur Claude Code Remote"}). Autorisez ce connecteur pour la page puis réessayez.`);
+      }
+      await RT.db.doc("veille/status").set({ state: "requested", requestedAt: nowISO(), message: sourceIds ? `Sources : ${payload.sources.map((x) => x.name).join(", ")}` : null }).catch(() => {});
+      toast("Veille lancée. Les offres arriveront ici d'elles-mêmes d'ici 5 à 15 minutes, même si vous fermez la page.", "ok");
+      return;
+    }
     const s = R.current.settings;
     const crit = version || activeVersion(R.current.criteria);
     const list = R.current.sources.filter((x) => (sourceIds ? sourceIds.includes(x.id) : x.enabled) && x.kind !== "email");
@@ -2354,6 +2390,48 @@ export default function RadarApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  /* Veille planifiée (page publiée) : état, configuration et offres déposées par la Routine. */
+  const ingestRun = (snapDoc) => {
+    const d = snapDoc.data() || {};
+    if ((R.current.settings.importedRuns || []).includes(snapDoc.id)) return;
+    const raw = Array.isArray(d.offers) ? d.offers : [];
+    const norm = raw
+      .map((r) => {
+        const o = normalizeOffer(r, { sourceName: str(r?.sourceName) || "Veille planifiée", via: "veille planifiée (recherche web)" });
+        if (o) o.sources[0].verified = r?.verified === true ? true : null;
+        return o;
+      })
+      .filter(Boolean);
+    const r = applyIncoming(norm);
+    const at = str(d.createdAt) || nowISO();
+    const counts = {};
+    norm.forEach((o) => { const n = o.sources[0].name; counts[n] = (counts[n] || 0) + 1; });
+    setSources((l) => l.map((x) => (counts[x.name] !== undefined || (d.sourcesSearched || []).includes(x.name) ? { ...x, lastRunAt: at, lastCount: counts[x.name] || 0, lastError: null } : x)));
+    setSettings((x) => ({ ...x, lastWatchAt: at, importedRuns: [...(x.importedRuns || []), snapDoc.id].slice(-300) }));
+    R.current.settings = { ...R.current.settings, importedRuns: [...(R.current.settings.importedRuns || []), snapDoc.id] };
+    if (norm.length || raw.length) toast(`Veille reçue : ${r.added.length} nouvelle(s) offre(s), ${r.merged.length} fusion(s). Scorez-les depuis la vue d'ensemble.`, "ok");
+  };
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db) return undefined;
+    const subs = [];
+    const quiet = () => {};
+    try {
+      subs.push(RT.db.doc("veille/routine").onSnapshot((d) => setVeille((v) => ({ ...v, routine: d.exists ? d.data() : null })), quiet));
+      subs.push(RT.db.doc("veille/status").onSnapshot((d) => setVeille((v) => ({ ...v, status: d.exists ? d.data() : null })), quiet));
+      subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
+      subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
+    } catch { /* capacité indisponible */ }
+    return () => subs.forEach((u) => { try { u?.(); } catch { /* ignore */ } });
+  }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* La configuration lue par la veille planifiée suit les critères actifs et les sources (critères et domaines uniquement). */
+  const cfgNow = useMemo(() => veilleConfig(activeVersion(criteria), sources, settings), [criteria, sources, settings.lookbackDays, settings.maxPerSource]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (RT.mode !== "published" || !RT.db || !veille.configLoaded || veille.configSig === cfgNow.sig || storageState.readOnly) return undefined;
+    const t = setTimeout(() => { RT.db.doc("veille/config").set({ ...cfgNow, updatedAt: nowISO() }).catch(() => {}); }, 1500);
+    return () => clearTimeout(t);
+  }, [cfgNow.sig, veille.configLoaded, veille.configSig]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* Veille automatique à l'ouverture (option, désactivée par défaut) : lecture seule, rien n'est envoyé. */
   const autoRan = useRef(false);
   useEffect(() => {
@@ -2383,7 +2461,7 @@ export default function RadarApp() {
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
-    importOffersJSON, detectDuplicates, undoMerge, checkReplies,
+    importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -2511,7 +2589,9 @@ function SidebarContent({ collapsed, dueCount, newCount, onToggle, mobile }) {
 
 function TopBar({ onMenu, onPalette, privacy, setPrivacy }) {
   const T = useT();
-  const { settings, setSettings, progress, busy } = useApp();
+  const { settings, setSettings, progress, busy, veille } = useApp();
+  const vs = veille?.status;
+  const veilleRunning = vs && ["requested", "running"].includes(vs.state) && Date.now() - new Date(vs.requestedAt || vs.startedAt || 0).getTime() < 45 * 6e4;
   const themeNext = { system: "light", light: "dark", dark: "system" };
   const ThemeIcon = settings.theme === "dark" ? Moon : settings.theme === "light" ? Sun : Monitor;
   const running = busy.watch ? "Veille en cours" : busy.gmail ? "Import Gmail" : busy.score ? "Scoring" : null;
@@ -2531,6 +2611,7 @@ function TopBar({ onMenu, onPalette, privacy, setPrivacy }) {
             {progress ? `${progress.label} · ${progress.done}/${progress.total}` : running}
           </span>
         )}
+        {veilleRunning && <span className={`hidden sm:inline-flex items-center gap-2 text-xs ${T.muted}`} aria-live="polite"><Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />{vs.state === "running" ? "Veille en cours" : "Veille demandée"}</span>}
         {settings.discreet && <Chip tone="accent" className="hidden sm:inline-flex"><ShieldCheck className="w-3 h-3" aria-hidden="true" />Mode discret</Chip>}
         <IconBtn icon={privacy ? Eye : EyeOff} label="Masquer l'écran (confidentialité)" onClick={() => setPrivacy(!privacy)} />
         <IconBtn icon={ThemeIcon} label={`Thème : ${settings.theme === "system" ? "système" : settings.theme === "dark" ? "sombre" : "clair"}`} onClick={() => setSettings((s) => ({ ...s, theme: themeNext[s.theme] }))} />
@@ -2726,7 +2807,7 @@ function DashboardView() {
         subtitle={`Dernière veille ${relTime(settings.lastWatchAt)} · dernier import Gmail ${relTime(settings.lastGmailImportAt)}`}
         actions={
           <>
-            {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Recalculer {staleIds.length} score(s)</Btn>}
+            {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length} offre(s)</Btn>}
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
           </>
         }
@@ -2901,7 +2982,7 @@ function OffersView() {
         subtitle={`${list.length} offre(s) affichée(s) sur ${offers.length} · chaque offre garde ses URL sources et dates de collecte`}
         actions={
           <>
-            {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Recalculer {staleIds.length}</Btn>}
+            {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length}</Btn>}
             <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
             <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
@@ -4147,7 +4228,9 @@ function ContactsView() {
 
 function SourcesView() {
   const T = useT();
-  const { sources, setSources, patchSource, runWatch, importGmail, busy, settings, setSettings, setManualOpen, importOffersJSON } = useApp();
+  const { sources, setSources, patchSource, runWatch, importGmail, busy, settings, setSettings, setManualOpen, importOffersJSON, veille } = useApp();
+  const vst = veille?.status;
+  const VSTATE = { requested: "demandée", running: "en cours", done: "terminée", error: "en erreur" };
   const [form, setForm] = useState({ name: "", kind: "company", url: "" });
   const [jsonText, setJsonText] = useState("");
   const jsonFile = useRef(null);
@@ -4181,6 +4264,29 @@ function SourcesView() {
         subtitle={`${enabledCount} source(s) web active(s) · dernière veille ${relTime(settings.lastWatchAt)}`}
         actions={<Btn variant="primary" icon={Play} loading={busy.watch} onClick={() => runWatch()}>Lancer la veille</Btn>}
       />
+      {RT.mode === "published" && (
+        <Card className="p-6 mb-6">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2"><Radio className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /><span className="font-medium">Veille planifiée</span>{veille?.routine ? <Chip tone="ok">active</Chip> : <Chip tone="warn">non reliée</Chip>}</div>
+              <p className={`text-sm mt-1 ${T.muted}`}>
+                {veille?.routine
+                  ? `Un assistant Claude fait la recherche web ${veille.routine.scheduleLabel || "selon le planning"} et à chaque clic sur « Lancer la veille », puis dépose les offres ici. Il ne reçoit que vos critères et vos sources, jamais votre profil.`
+                  : "La recherche web n'est pas possible depuis la page elle-même : elle passe par un assistant planifié qui n'est pas encore relié."}
+              </p>
+              {vst && (
+                <p className={`text-xs mt-2 ${vst.state === "error" ? "text-rose-600" : T.faint}`}>
+                  Dernière exécution {VSTATE[vst.state] || vst.state}
+                  {vst.finishedAt ? ` ${relTime(vst.finishedAt)}` : vst.requestedAt ? ` ${relTime(vst.requestedAt)}` : ""}
+                  {typeof vst.count === "number" ? ` · ${vst.count} offre(s)` : ""}
+                  {vst.message ? ` · ${vst.message}` : ""}
+                </p>
+              )}
+            </div>
+            <Btn variant="primary" icon={Play} loading={busy.watch} disabled={!veille?.routine} onClick={() => runWatch()}>Lancer maintenant</Btn>
+          </div>
+        </Card>
+      )}
       <Notice icon={Info} className="mb-6">
         La collecte passe par la recherche web de l'IA (restreinte au domaine de chaque source), jamais par un accès direct aux sites, bloqué depuis l'artefact. Conséquences : seules les annonces indexées par le moteur remontent, avec parfois quelques jours de décalage. Chaque offre garde son URL et sa date de collecte ; une URL absente des résultats bruts est marquée « à vérifier ».
       </Notice>
