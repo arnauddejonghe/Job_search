@@ -11,7 +11,7 @@ import {
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
   Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
-  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck,
+  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Star, Palette, ChevronLeft,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -31,6 +31,7 @@ const KEYS = {
   offers: "radar:offers",
   apps: "radar:apps",
   contacts: "radar:contacts",
+  ratings: "radar:ratings",
 };
 
 const STAGES = [
@@ -98,11 +99,19 @@ const DEFAULT_SETTINGS = {
   autoWatchHours: 24,
   autoGmail: false,
   importedRuns: [],
+  sourcesPack: 2,
+  autoNext: true,
+  hideOlderThan: 45,
   sidebarCollapsed: false,
 };
 
 const DEFAULT_PROFILE = {
   name: "",
+  email: "",
+  phone: "",
+  linkedinUrl: "",
+  education: [],
+  certifications: [],
   headline: "Business Improvement Manager",
   home: "Ohain (Brabant wallon)",
   summary:
@@ -197,6 +206,25 @@ const DEFAULT_SOURCES = [
     note: "Pas de collecte directe (scraping interdit par LinkedIn). Les offres arrivent via l'import des alertes e-mail Gmail.",
   },
 ].map((s, i) => ({ id: `src_default_${i}`, enabled: s.kind !== "email", careersUrl: null, lastRunAt: null, lastCount: null, lastError: null, lastNote: null, note: null, ...s }));
+
+/* Pack « top employeurs belges » (Bruxelles, Brabant wallon et alentours) : surveillés via la recherche web sur leur domaine. */
+const TOP_EMPLOYERS = [
+  ["Proximus", "proximus.com"], ["Belfius", "belfius.be"], ["KBC / CBC", "kbc.com"], ["BNP Paribas Fortis", "bnpparibasfortis.be"],
+  ["ING Belgique", "ing.be"], ["AG Insurance", "aginsurance.be"], ["AXA Belgium", "axa.be"], ["Ethias", "ethias.be"],
+  ["Allianz Benelux", "allianz.be"], ["Baloise", "baloise.be"], ["Euroclear", "euroclear.com"], ["Swift (La Hulpe)", "swift.com"],
+  ["Mastercard (Waterloo)", "mastercard.com"], ["UCB (Braine-l'Alleud)", "ucb.com"], ["GSK (Wavre / Rixensart)", "gsk.com"],
+  ["IBA (Louvain-la-Neuve)", "iba-worldwide.com"], ["Syensqo", "syensqo.com"], ["Solvay", "solvay.com"], ["Lhoist", "lhoist.com"],
+  ["D'Ieteren", "dieteren.be"], ["Colruyt Group", "colruytgroup.com"], ["Delhaize", "delhaize.be"], ["bpost", "bpost.be"],
+  ["SNCB", "belgiantrain.be"], ["Infrabel", "infrabel.be"], ["Elia", "elia.be"], ["Engie Belgium", "engie.be"], ["Sibelga", "sibelga.be"],
+  ["Vivaqua", "vivaqua.be"], ["STIB-MIVB", "stib-mivb.be"], ["Brussels Airport", "brusselsairport.be"], ["Securex", "securex.be"],
+  ["SD Worx", "sdworx.com"], ["Partena", "partena.be"], ["Smals", "smals.be"], ["Solidaris", "solidaris.be"], ["Mutualité chrétienne", "mc.be"],
+  ["Partenamut", "partenamut.be"], ["UCLouvain", "uclouvain.be"], ["ULB", "ulb.be"], ["Cliniques universitaires Saint-Luc", "saintluc.be"],
+  ["Paradigm (Région bruxelloise)", "paradigm.brussels"], ["Bruxelles Environnement", "environnement.brussels"], ["Sodexo", "sodexo.com"],
+].map(([name, domain]) => ({
+  id: `src_top_${domain.replace(/[^a-z0-9]/gi, "_")}`, name, kind: "company", domains: [domain], careersUrl: null, enabled: true, pack: "top-be",
+  lastRunAt: null, lastCount: null, lastError: null, lastNote: null, note: null,
+}));
+DEFAULT_SOURCES.push(...TOP_EMPLOYERS);
 
 /* Temps de trajet voiture hors heures de pointe depuis Ohain — ordre de grandeur, toujours affiché comme estimation. */
 const COMMUTE_FROM_OHAIN = {
@@ -405,6 +433,170 @@ function veilleConfig(version, sources, settings, sourceIds) {
     sources: src, lookbackDays: settings.lookbackDays, maxPerSource: settings.maxPerSource, home: "Ohain (Brabant wallon)",
   };
   return { ...body, sig: JSON.stringify(body) };
+}
+
+/* Une offre « active » : ni écartée, ni expirée, ni liée à une candidature clôturée. */
+const INACTIVE = ["dismissed", "expired", "closed"];
+const isActiveOffer = (o) => !INACTIVE.includes(o.status);
+const isOldOffer = (o, days) => {
+  if (!days || o.status === "pipeline") return false;
+  const ref = o.publishedAt && !isNaN(new Date(o.publishedAt)) ? o.publishedAt : o.lastSeenAt || o.collectedAt;
+  return Date.now() - new Date(ref).getTime() > days * 864e5;
+};
+const ratingKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
+const fmtRating = (r) => (r && typeof r.rating === "number" ? r.rating.toFixed(1).replace(".", ",") : null);
+
+/* ── Documents « prêts à envoyer » : balisage léger → aperçu, texte ATS et PDF ──
+   # Nom · > accroche (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section / objet
+   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe */
+function parseDoc(text) {
+  const blocks = [];
+  let para = [];
+  const flush = () => { if (para.length) { blocks.push({ t: "para", text: para.join(" ") }); para = []; } };
+  for (const raw of String(text || "").split("\n")) {
+    const l = raw.trim();
+    let m;
+    if (!l) { flush(); continue; }
+    if (l.startsWith("### ")) { flush(); blocks.push({ t: "h3", text: l.slice(4) }); }
+    else if (l.startsWith("## ")) { flush(); blocks.push({ t: "h2", text: l.slice(3) }); }
+    else if (l.startsWith("# ")) { flush(); blocks.push({ t: "name", text: l.slice(2) }); }
+    else if (/^[-•*] /.test(l)) { flush(); blocks.push({ t: "bullet", text: l.slice(2) }); }
+    else if (l.startsWith("> ")) { flush(); blocks.push({ t: "quote", text: l.slice(2) }); }
+    else if (l.startsWith("@ ")) { flush(); blocks.push({ t: "contact", text: l.slice(2) }); }
+    else if (l.startsWith("= ")) { flush(); blocks.push({ t: "date", text: l.slice(2) }); }
+    else if (l.startsWith("~ ")) { flush(); blocks.push({ t: "sign", text: l.slice(2) }); }
+    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) { flush(); blocks.push({ t: "kv", label: m[1], text: m[2] }); }
+    else para.push(l);
+  }
+  flush();
+  return blocks.map((b) => ({ ...b, text: String(b.text || "").replace(/\*\*/g, ""), label: b.label && b.label.replace(/\*\*/g, "") }));
+}
+function docPlainText(text) {
+  return parseDoc(text).map((b) => {
+    if (b.t === "h2") return `\n${b.text.toUpperCase()}`;
+    if (b.t === "h3") return `\n${b.text.split("|").map((x) => x.trim()).filter(Boolean).join(" | ")}`;
+    if (b.t === "bullet") return `- ${b.text}`;
+    if (b.t === "kv") return `${b.label} ${b.text}`;
+    if (b.t === "para") return `${b.text}\n`;
+    return b.text;
+  }).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+const HEX = /^#?([0-9a-f]{6})$/i;
+const cleanHex = (h, fallback = "#3f3d56") => (HEX.test(String(h || "").trim()) ? `#${String(h).trim().replace("#", "").toLowerCase()}` : fallback);
+const hexRgb = (h) => { const x = cleanHex(h).slice(1); return [0, 2, 4].map((i) => parseInt(x.slice(i, i + 2), 16)); };
+function keywordCoverage(text, terms) {
+  const hay = ` ${normText(text)} `;
+  const list = (terms || []).filter(Boolean);
+  const covered = list.filter((t) => hay.includes(` ${normText(t)} `) || hay.includes(normText(t)));
+  return { covered, missing: list.filter((t) => !covered.includes(t)), pct: list.length ? Math.round((covered.length / list.length) * 100) : null };
+}
+
+/* PDF texte (lisible par les ATS) via jsPDF, chargé à la demande depuis cdnjs. */
+let jspdfPromise = null;
+function loadJsPDF() {
+  if (typeof window !== "undefined" && window.jspdf?.jsPDF) return Promise.resolve(window.jspdf);
+  if (!jspdfPromise) {
+    jspdfPromise = new Promise((resolve, reject) => {
+      const sc = document.createElement("script");
+      sc.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+      sc.onload = () => (window.jspdf?.jsPDF ? resolve(window.jspdf) : reject(new Error("jsPDF indisponible")));
+      sc.onerror = () => { jspdfPromise = null; reject(new Error("Chargement du générateur PDF impossible (réseau).")); };
+      document.head.appendChild(sc);
+    });
+  }
+  return jspdfPromise;
+}
+const pdfSafe = (t) => String(t || "")
+  .replace(/[\u2018\u2019\u201A\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u2033]/g, '"')
+  .replace(/[\u2013\u2014\u2212]/g, "-").replace(/\u2026/g, "...").replace(/\u20AC/g, "EUR")
+  .replace(/\u0153/g, "oe").replace(/\u0152/g, "OE").replace(/[\u00A0\u202F\u2009]/g, " ").replace(/[\u2022\u25CF\u25AA]/g, "-")
+  .replace(/[^\x00-\xFF]/g, "");
+
+async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
+  const { jsPDF } = await loadJsPDF();
+  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
+  doc.setProperties({ title: pdfSafe(title), subject: kind === "cv" ? "Curriculum vitae" : "Lettre de motivation", author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
+  const A = hexRgb(accent);
+  const M = 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
+  let y = 18;
+  const lh = (size) => size * 0.3528 * 1.38;
+  const ensure = (h) => { if (y + h > BOTTOM) { doc.addPage(); y = 18; } };
+  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color); };
+  const write = (txt, { size = 10, style = "normal", color = [45, 45, 45], indent = 0, after = 1.4, align } = {}) => {
+    font(size, style, color);
+    const lines = doc.splitTextToSize(pdfSafe(txt), W - indent);
+    for (const line of lines) {
+      ensure(lh(size));
+      if (align === "right") doc.text(line, M + W, y + lh(size) * 0.78, { align: "right" });
+      else doc.text(line, M + indent, y + lh(size) * 0.78);
+      y += lh(size);
+    }
+    y += after;
+  };
+  const blocks = parseDoc(text);
+  let seenName = false;
+  for (const b of blocks) {
+    if (b.t === "name") { seenName = true; write(b.text, { size: kind === "cv" ? 22 : 16, style: "bold", color: A, after: 0.6 }); }
+    else if (b.t === "quote") {
+      if (kind === "cv") write(b.text, { size: 12, color: [70, 70, 70], after: 1 });
+      else write(b.text, { size: 10, after: 0.2 });
+    }
+    else if (b.t === "contact") {
+      write(b.text, { size: 9, color: [110, 110, 110], after: 1.6 });
+      if (seenName) { doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5; }
+    }
+    else if (b.t === "date") { y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
+    else if (b.t === "h2") {
+      if (kind === "cv") {
+        ensure(16); y += 2.5;
+        write(b.text.toUpperCase(), { size: 10.5, style: "bold", color: A, after: 0.4 });
+        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6;
+      } else { y += 2; write(b.text, { size: 10.5, style: "bold", color: [30, 30, 30], after: 3 }); }
+    }
+    else if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      ensure(12); y += 0.8;
+      write(parts[0] || "", { size: 10.5, style: "bold", color: [25, 25, 25], after: 0.2 });
+      if (parts.length > 1) write(parts.slice(1).join("  ·  "), { size: 9, color: [115, 115, 115], after: 1 });
+    }
+    else if (b.t === "bullet") {
+      ensure(lh(10));
+      doc.setFillColor(...A); doc.circle(M + 1.3, y + lh(10) * 0.5, 0.65, "F");
+      write(b.text, { indent: 4.5, after: 0.7 });
+    }
+    else if (b.t === "kv") {
+      font(10, "bold", [30, 30, 30]);
+      const label = `${pdfSafe(b.label)} `;
+      const lw = doc.getTextWidth(label);
+      font(10);
+      const first = doc.splitTextToSize(pdfSafe(b.text), W - lw);
+      ensure(lh(10));
+      font(10, "bold", [30, 30, 30]); doc.text(label, M, y + lh(10) * 0.78);
+      font(10); doc.text(first[0] || "", M + lw, y + lh(10) * 0.78);
+      y += lh(10);
+      const rest = first.slice(1).join(" ");
+      if (rest) write(rest, { after: 0.9 }); else y += 0.9;
+    }
+    else if (b.t === "sign") { y += 4; write(b.text, { style: "bold", after: 1 }); }
+    else write(b.text, { after: kind === "cv" ? 1.8 : 3.2 });
+  }
+  const pages = doc.getNumberOfPages();
+  if (pages > 1) for (let i = 1; i <= pages; i++) { doc.setPage(i); font(8, "normal", [150, 150, 150]); doc.text(`${i} / ${pages}`, M + W, 297 - 9, { align: "right" }); }
+  return doc.output("arraybuffer");
+}
+
+async function saveFile(filename, data, mime) {
+  if (RT.mode === "published") {
+    if (!RT.downloads) throw new Error("Téléchargement indisponible dans cette vue.");
+    try { await RT.downloads.save({ filename, data }); return "saved"; }
+    catch (e) { if (e?.code === "declined" || e?.code === "cancelled") return "declined"; throw new Error(e?.message || "Téléchargement refusé"); }
+  }
+  const url = URL.createObjectURL(new Blob([data], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.target = "_blank"; a.rel = "noopener";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  return "saved";
 }
 
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
@@ -904,6 +1096,78 @@ Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
 {"language":"fr|nl|en","cv":{"text":"","highlights":[]},"letter":{"text":""},"linkedin":{"text":""},"answers":{"items":[{"question":"","answer":""}]},"email":{"subject":"","body":""}}`;
   },
 
+  cvPro(offer, profile, parts, instruction) {
+    const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
+    const contact = [profile.home, profile.email, profile.phone, profile.linkedinUrl].filter(Boolean).join(" | ") || "[à compléter : coordonnées]";
+    return `Mission : produire des documents de candidature PRÊTS À ENVOYER pour l'offre ci-dessous, optimisés à la fois pour les logiciels de tri (ATS) et pour un recruteur humain qui reçoit des centaines de candidatures. Le candidat relira tout avant envoi.
+
+OFFRE
+Intitulé : ${offer.title}
+Entreprise : ${show(offer.company)}
+Lieu : ${show(offer.location)} · Contrat : ${show(offer.contract)} · Télétravail : ${show(offer.remote)}
+Annonce : ${show(offer.description)}
+
+PROFIL
+Nom : ${profile.name || "[à compléter : prénom nom]"}
+Coordonnées : ${contact}
+${profileDigest(profile, true)}
+Formation : ${(profile.education || []).join(" ; ") || "[à compléter]"}
+Certifications : ${(profile.certifications || []).join(" ; ") || "aucune renseignée"}
+
+DOCUMENTS À PRODUIRE : ${parts.join(", ")}
+
+RÈGLES DE FOND
+- Langue : ${lang}. Titres de sections standard dans cette langue (FR : Profil, Réalisations clés, Expérience professionnelle, Compétences, Langues, Formation, Certifications ; NL : Profiel, Belangrijkste realisaties, Werkervaring, Vaardigheden, Talen, Opleiding ; EN : Profile, Key achievements, Professional experience, Skills, Languages, Education).
+- Vérité absolue : uniquement des faits du profil. Aucun chiffre, diplôme, outil ou résultat inventé. Manque → [à compléter : …].
+- ATS : reprends mot pour mot les termes de l'annonce quand le profil les justifie (intitulé, compétences, outils, méthodes), avec acronyme et forme longue (ex. « CRM (Customer Relationship Management) »). Mise en page à une colonne, aucun tableau. L'accroche reprend l'intitulé exact du poste.
+- Humain : proposition de valeur claire en 2 lignes pour CETTE entreprise ; 3 réalisations chiffrées en tête ; puces « verbe d'action + périmètre + résultat » ; zéro cliché ni superlatif ; phrases courtes.
+- Différenciation : relie explicitement 2 ou 3 exigences de l'annonce à des preuves du profil ; dans la lettre, ouvre sur un élément précis de l'annonce ou du contexte de l'entreprise (seulement ce que l'annonce dit, ou un fait public certain), jamais sur « je me permets de… ».
+- Organisation actuelle : reprends exactement le libellé du profil dans le CV ; dans la lettre, désigne-la de façon générique.
+- Longueur : CV 1 à 2 pages (550 à 800 mots), lettre 230 à 320 mots.
+${instruction ? `- Consigne de l'utilisateur : ${instruction}` : ""}
+
+FORMAT DES DOCUMENTS (balisage léger, une instruction par ligne)
+CV :
+# Prénom Nom
+> Accroche reprenant l'intitulé du poste — proposition de valeur
+@ ${contact}
+## Profil
+paragraphe de 3-4 lignes
+## Réalisations clés
+- réalisation chiffrée
+## Expérience professionnelle
+### Fonction | Organisation | Lieu | Période
+- puce
+## Compétences
+**Groupe :** élément, élément, élément
+## Langues
+**Français :** niveau
+## Formation
+### Diplôme | École | Année
+Lettre :
+# Prénom Nom
+@ coordonnées
+= Lieu, le JJ mois AAAA
+> Destinataire (service recrutement / nom si connu)
+> Entreprise
+## Objet : candidature au poste de …
+paragraphes séparés par une ligne vide (accroche, preuves, valeur pour l'entreprise, conclusion avec appel à l'entretien)
+~ Prénom Nom
+
+COULEUR : accent = la couleur principale de la charte de l'entreprise en hexadécimal SEULEMENT si tu la connais avec certitude, sinon null.
+
+Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
+{"language":"fr|nl|en","accent":"#RRGGBB ou null","accentSource":"charte connue | null","keywords":{"fromAd":["15 à 25 termes exacts de l'annonce"],"missingInProfile":["termes de l'annonce que le profil ne permet pas de justifier"]},"cv":"<balisage>","letter":"<balisage>","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
+  },
+
+  ratings(companies) {
+    return `Date du jour : ${todayStr()}.
+Mission : trouver la note employeur publique (avis de salariés) de chaque entreprise ci-dessous, en Belgique de préférence : Glassdoor, Indeed (avis entreprises), Jobat ou équivalent.
+Entreprises : ${JSON.stringify(companies)}
+Règles : utilise web_search. Ne rapporte une note que si elle apparaît explicitement dans un résultat (titre ou extrait) avec sa source ; sinon rating = null. Échelle sur 5. N'invente jamais une note, un nombre d'avis ou une URL.
+Réponds uniquement {"ratings":[{"company":"","rating":null,"reviews":null,"source":"Glassdoor|Indeed|Jobat|…","url":null,"note":"remarque courte, ex. note mondiale et non belge"}]}`;
+  },
+
   gmailDraft({ to, subject, body }) {
     return `Crée UN brouillon dans Gmail avec exactement les éléments ci-dessous, sans les modifier. N'ENVOIE PAS le message : brouillon uniquement.
 Destinataire : ${to || "(laisser vide)"}
@@ -1244,10 +1508,10 @@ function Card({ children, className = "", as: As = "div", ...rest }) {
   );
 }
 
-function Chip({ children, tone = "neutral", className = "" }) {
+function Chip({ children, tone = "neutral", className = "", ...rest }) {
   const T = useT();
   const c = { neutral: T.chip, accent: T.accentSoft, warn: T.warn, danger: T.danger, ok: T.ok }[tone];
-  return <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ${c} ${className}`}>{children}</span>;
+  return <span {...rest} className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ${c} ${className}`}>{children}</span>;
 }
 
 function ScorePill({ score, threshold, size = "md" }) {
@@ -1619,6 +1883,8 @@ export default function RadarApp() {
   const [offers, setOffers] = useState([]);
   const [apps, setApps] = useState([]);
   const [contacts, setContacts] = useState([]);
+  const [ratings, setRatings] = useState({});
+  const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
   const [offerSel, setOfferSel] = useState(null);
@@ -1646,7 +1912,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -1698,8 +1964,15 @@ export default function RadarApp() {
           });
           if (out.profile) setProfile({ ...DEFAULT_PROFILE, ...out.profile });
           setCriteria(out.criteria?.versions?.length ? out.criteria : makeCriteriaState());
-          if (out.sources) setSources(out.sources);
-          setOffers(out.offers || []);
+          if (out.sources) {
+            const have = new Set(out.sources.map((x) => x.id));
+            const missing = (s.sourcesPack || 0) < 2 ? TOP_EMPLOYERS.filter((x) => !have.has(x.id)) : [];
+            setSources([...out.sources, ...missing]);
+            if (missing.length) setSettings((x) => ({ ...x, sourcesPack: 2 }));
+          }
+          const closedOffers = new Set((out.apps || []).filter((a) => a.stage === "closed").map((a) => a.offerId));
+          setOffers((out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o)));
+          if (out.ratings) setRatings(out.ratings);
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -1732,6 +2005,7 @@ export default function RadarApp() {
   usePersist(KEYS.offers, offers, persistOn, setSaveState);
   usePersist(KEYS.apps, apps, persistOn, setSaveState);
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
+  usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -1796,13 +2070,13 @@ export default function RadarApp() {
 
   const staleIds = useMemo(() => {
     const vid = activeVersion(criteria)?.id;
-    return offers.filter((o) => !o.demo && o.status !== "dismissed" && isStale(o, vid)).map((o) => o.id);
+    return offers.filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid)).map((o) => o.id);
   }, [offers, criteria]);
 
   const rescoreStale = () => {
     const vid = activeVersion(R.current.criteria)?.id;
     const ids = R.current.offers
-      .filter((o) => !o.demo && o.status !== "dismissed" && isStale(o, vid))
+      .filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid))
       .sort((a, b) => new Date(b.collectedAt) - new Date(a.collectedAt))
       .slice(0, 40)
       .map((o) => o.id);
@@ -1937,7 +2211,7 @@ export default function RadarApp() {
   const inPipeline = (oid) => R.current.apps.some((a) => a.offerId === oid);
   const detectDuplicates = () => withBusy("dedupe", async () => {
     const pool0 = R.current.offers
-      .filter((o) => !o.demo && o.status !== "dismissed")
+      .filter((o) => !o.demo && isActiveOffer(o))
       .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || normText(a.title).localeCompare(normText(b.title)))
       .slice(0, 180);
     if (pool0.length < 2) { toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
@@ -2045,6 +2319,44 @@ export default function RadarApp() {
     setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
   };
 
+  /* ── Notes employeur (avis publics type Glassdoor) ───────────────── */
+  const requestRatings = (companies) => withBusy("ratings", async () => {
+    const list = [...new Set((companies || []).map((c) => str(c)).filter(Boolean))].filter((c) => !/confidenti|non communiqu|anonyme/i.test(c)).slice(0, 25);
+    if (!list.length) { toast("Aucune entreprise identifiée à noter.", "neutral"); return; }
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La notation passe par la veille planifiée, qui n'est pas reliée à cette page.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « notes employeur » uniquement : ${JSON.stringify({ task: "ratings", companies: list })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      toast(`Notes demandées pour ${list.length} entreprise(s) : elles s'afficheront d'ici quelques minutes.`, "ok");
+      return;
+    }
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000 });
+    const next = {};
+    (res.data?.ratings || []).forEach((r) => {
+      if (!r?.company) return;
+      const url = str(r.url);
+      const seen = url && res.urls.some((u) => canonicalUrl(u) === canonicalUrl(url));
+      const val = Number(r.rating);
+      next[ratingKey(r.company)] = { company: r.company, rating: seen && val > 0 && val <= 5 ? val : null, reviews: seen && Number(r.reviews) > 0 ? Number(r.reviews) : null, source: str(r.source), url: seen ? url : null, note: str(r.note), seenAt: nowISO() };
+    });
+    setRatings((cur) => ({ ...cur, ...next }));
+    toast(`${Object.values(next).filter((x) => x.rating).length} note(s) trouvée(s) sur ${list.length}`, "ok");
+  });
+
+  /* ── Tri rapide des offres ──────────────────────────────────────── */
+  const nextOfferId = (id) => {
+    const q = offerQueue.length ? offerQueue : R.current.offers.filter(isActiveOffer).map((o) => o.id);
+    const i = q.indexOf(id);
+    return i >= 0 ? q[i + 1] || null : q[0] || null;
+  };
+  const triageOffer = (id, patch) => {
+    const nxt = nextOfferId(id);
+    patchOffer(id, patch);
+    if (R.current.settings.autoNext && nxt) setOfferSel(nxt);
+    else setOfferSel(null);
+  };
+
   /* ── Critères ───────────────────────────────────────────────────── */
   const saveCriteriaVersion = (label) => {
     const c = R.current.criteria;
@@ -2097,7 +2409,15 @@ export default function RadarApp() {
     return app.id;
   };
 
-  const moveApp = (id, stage, extra = {}) => patchApp(id, (a) => {
+  const moveApp = (id, stage, extra = {}) => {
+    const cur = R.current.apps.find((a) => a.id === id);
+    if (cur && cur.stage !== stage) {
+      if (stage === "closed") patchOffer(cur.offerId, { status: "closed" });
+      else if (cur.stage === "closed") patchOffer(cur.offerId, { status: "pipeline" });
+    }
+    return moveAppInner(id, stage, extra);
+  };
+  const moveAppInner = (id, stage, extra = {}) => patchApp(id, (a) => {
     if (a.stage === stage) return a;
     const rules = R.current.settings.followUp;
     let n = { ...a, stage, followUps: [...(a.followUps || [])] };
@@ -2210,9 +2530,24 @@ export default function RadarApp() {
     const app = R.current.apps.find((a) => a.id === appId);
     const offer = R.current.offers.find((o) => o.id === app?.offerId);
     if (!app || !offer) throw new Error("Candidature introuvable.");
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, types, instruction), maxTokens: 16000 });
+    const proParts = types.filter((t) => t === "cv" || t === "letter");
+    const otherParts = types.filter((t) => !proParts.includes(t));
+    const [pro, rest] = await Promise.all([
+      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction), maxTokens: 16000 }) : null,
+      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction), maxTokens: 12000 }) : null,
+    ]);
+    const data = { ...(rest?.data || {}), language: pro?.data?.language || rest?.data?.language };
     const versions = {};
-    for (const t of types) {
+    if (pro?.data) {
+      const d = pro.data;
+      const accent = cleanHex(d.accent, null);
+      const common = { accent, accentSource: accent ? str(d.accentSource) || "suggérée" : null, keywords: (d.keywords?.fromAd || []).map(String).slice(0, 30), missingInProfile: (d.keywords?.missingInProfile || []).map(String), tips: (d.tips || []).map(String) };
+      for (const t of proParts) {
+        const txt = typeof d[t] === "string" ? d[t].trim() : "";
+        if (txt) versions[t] = { text: txt, format: "markup", ...common, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
+      }
+    }
+    for (const t of otherParts) {
       const d = data?.[t];
       if (!d) continue;
       let v;
@@ -2234,9 +2569,10 @@ export default function RadarApp() {
     toast("Documents prêts à relire", "ok");
   });
 
-  const saveDocVersion = (appId, type, text, subject) => patchApp(appId, (a) => {
+  const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
     const prev = a.docs?.[type]?.slice(-1)[0];
-    const v = { id: uid("doc"), text, subject, highlights: prev?.highlights, createdAt: nowISO(), origin: "édition" };
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, ...keep } = prev || {};
+    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition" };
     return addLogEntry({ ...a, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
   });
 
@@ -2420,6 +2756,19 @@ export default function RadarApp() {
       subs.push(RT.db.doc("veille/status").onSnapshot((d) => setVeille((v) => ({ ...v, status: d.exists ? d.data() : null })), quiet));
       subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
       subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
+      subs.push(RT.db.collection("veille_ratings").onSnapshot((snap) => {
+        setRatings((cur) => {
+          let changed = false;
+          const next = { ...cur };
+          snap.docs.forEach((d) => {
+            const r = d.data() || {};
+            const key = ratingKey(r.company || d.id);
+            const prev = cur[key];
+            if (key && (!prev || prev.seenAt !== r.seenAt)) { next[key] = { company: r.company, rating: typeof r.rating === "number" ? r.rating : null, reviews: typeof r.reviews === "number" ? r.reviews : null, source: str(r.source), url: str(r.url), note: str(r.note), seenAt: str(r.seenAt) || nowISO() }; changed = true; }
+          });
+          return changed ? next : cur;
+        });
+      }, quiet));
     } catch { /* capacité indisponible */ }
     return () => subs.forEach((u) => { try { u?.(); } catch { /* ignore */ } });
   }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -2462,6 +2811,7 @@ export default function RadarApp() {
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
+    ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -2508,7 +2858,7 @@ export default function RadarApp() {
             </main>
           </div>
 
-          {offerSel && <OfferDrawer id={offerSel} onClose={() => setOfferSel(null)} />}
+          {offerSel && <OfferDrawer key={offerSel} id={offerSel} onClose={() => setOfferSel(null)} />}
           {appSel && <AppDrawer id={appSel.id} tab={appSel.tab} setTab={(t) => setAppSel((s) => ({ ...s, tab: t }))} onClose={() => setAppSel(null)} />}
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
           <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
@@ -2650,7 +3000,7 @@ function CommandPalette({ open, onClose }) {
           return { group: "Préparer candidature", label: `Préparer : ${o?.title || "poste"}`, hint: o?.company || "", icon: Sparkles, run: run(() => app.openApp(a.id, "docs")) };
         }),
       ...app.offers
-        .filter((o) => o.status !== "dismissed")
+        .filter(isActiveOffer)
         .slice(0, 200)
         .map((o) => ({ group: "Offres", label: o.title, hint: `${o.company || NC}${o.score ? ` · ${o.score.value}` : ""}`, icon: Briefcase, run: run(() => app.openOffer(o.id)) })),
     ];
@@ -2764,7 +3114,7 @@ function DashboardView() {
     const upcoming = apps.flatMap((a) => (a.interviews || []).filter((i) => new Date(i.at) >= startOfDay(new Date())));
     return {
       fresh: offers.filter((o) => o.status === "new" && new Date(o.collectedAt).getTime() >= weekAgo).length,
-      above: offers.filter((o) => o.status !== "dismissed" && o.score?.value >= th).length,
+      above: offers.filter((o) => isActiveOffer(o) && o.score?.value >= th).length,
       active: apps.filter((a) => a.stage !== "closed").length,
       due: apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0),
       interviews: upcoming.length,
@@ -2796,7 +3146,7 @@ function DashboardView() {
     return steps.map(([id, label]) => ({ label, count: apps.filter((a) => (a.reached ?? (a.stage === "closed" ? 0 : STAGE_INDEX[a.stage])) >= STAGE_INDEX[id]).length }));
   }, [apps]);
 
-  const top = useMemo(() => offers.filter((o) => o.status !== "dismissed" && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
+  const top = useMemo(() => offers.filter((o) => isActiveOffer(o) && !isOldOffer(o, settings.hideOlderThan) && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
   const hour = new Date().getHours();
   const hello = hour < 12 ? "Bonjour" : hour < 18 ? "Bon après-midi" : "Bonsoir";
 
@@ -2938,11 +3288,11 @@ function DashboardView() {
    11. OFFRES
    ════════════════════════════════════════════════════════════════════════ */
 
-const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score" };
+const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score", hideOld: true };
 
 function OffersView() {
   const T = useT();
-  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates } = useApp();
+  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates, setOfferQueue, ratings, requestRatings } = useApp();
   const [f, setF] = useState(DEFAULT_FILTERS);
   const [dense, setDense] = useState(true);
   useEffect(() => {
@@ -2954,9 +3304,11 @@ function OffersView() {
   const list = useMemo(() => {
     const nq = normText(f.q);
     let l = offers.filter((o) => {
-      if (f.status === "active" && o.status === "dismissed") return false;
+      if (f.status === "active" && !isActiveOffer(o)) return false;
       if (f.status === "new" && o.status !== "new") return false;
-      if (f.status === "dismissed" && o.status !== "dismissed") return false;
+      if (f.status === "dismissed" && !["dismissed", "expired"].includes(o.status)) return false;
+      if (f.status === "closed" && o.status !== "closed") return false;
+      if (f.hideOld && ["active", "new"].includes(f.status) && isOldOffer(o, settings.hideOlderThan)) return false;
       if (f.status === "pipeline" && o.status !== "pipeline") return false;
       if (f.source && !(o.sources || []).some((s) => s.name === f.source)) return false;
       if (f.minScore && !(o.score?.value >= f.minScore)) return false;
@@ -2971,7 +3323,9 @@ function OffersView() {
       source: (a, b) => (a.sources?.[0]?.name || "").localeCompare(b.sources?.[0]?.name || ""),
     }[f.sort];
     return [...l].sort(cmp);
-  }, [offers, f]);
+  }, [offers, f, settings.hideOlderThan]);
+  useEffect(() => { setOfferQueue(list.map((o) => o.id)); }, [list]); // eslint-disable-line react-hooks/exhaustive-deps
+  const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && !/confidenti|non communiqu/i.test(c)))], [list, ratings]);
 
   const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.type === "number" || /minScore|maxCommute/.test(k) ? Number(e.target.value) : e.target.value }));
 
@@ -2983,6 +3337,7 @@ function OffersView() {
         actions={
           <>
             {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length}</Btn>}
+            {unrated.length > 0 && <Btn icon={Star} onClick={() => requestRatings(unrated)} loading={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</Btn>}
             <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
             <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
@@ -3021,7 +3376,8 @@ function OffersView() {
               <option value="active">Actives</option>
               <option value="new">Nouvelles</option>
               <option value="pipeline">Dans le pipeline</option>
-              <option value="dismissed">Écartées</option>
+              <option value="dismissed">Écartées / expirées</option>
+              <option value="closed">Candidatures clôturées</option>
               <option value="all">Toutes</option>
             </Select>
           </Field>
@@ -3037,6 +3393,10 @@ function OffersView() {
             </div>
           </Field>
         </div>
+        <label className={`flex items-center gap-2 text-xs mt-3 ${T.muted}`}>
+          <input type="checkbox" checked={f.hideOld} onChange={(e) => setF((x) => ({ ...x, hideOld: e.target.checked }))} />
+          Masquer les offres de plus de {settings.hideOlderThan} jours (souvent déjà pourvues)
+        </label>
       </Card>
 
       {busy.watch && <Card className="p-6 mb-4"><Skeleton lines={4} /></Card>}
@@ -3056,7 +3416,7 @@ function OffersView() {
                       {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
                       {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">score obsolète</Chip>}
                     </span>
-                    <span className={`block text-xs truncate mt-0.5 ${T.muted}`}>{show(o.company)} · {show(o.location)}</span>
+                    <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}><span className="truncate">{show(o.company)} · {show(o.location)}</span><RatingChip company={o.company} compact /></span>
                   </span>
                   <span className={`hidden md:flex items-center gap-1 text-xs w-20 ${T.muted}`}><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</span>
                   <span className={`hidden lg:block text-xs w-32 truncate ${T.muted}`}>{o.sources?.map((s) => s.name).join(", ")}</span>
@@ -3099,9 +3459,23 @@ function OffersView() {
 
 function OfferDrawer({ id, onClose }) {
   const T = useT();
-  const { offers, settings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge } = useApp();
+  const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel } = useApp();
   const o = offers.find((x) => x.id === id);
+  const queue = offerQueue.length ? offerQueue : offers.filter(isActiveOffer).map((x) => x.id);
+  const pos = queue.indexOf(id);
+  const prevId = pos > 0 ? queue[pos - 1] : null;
+  const nextId = pos >= 0 ? queue[pos + 1] || null : nextOfferId(id);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "ArrowRight" && nextId) { e.preventDefault(); setOfferSel(nextId); }
+      if (e.key === "ArrowLeft" && prevId) { e.preventDefault(); setOfferSel(prevId); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [nextId, prevId]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!o) return null;
+  const mainUrl = (o.sources || []).find((x) => x.url)?.url;
   const s = o.score;
   const app = apps.find((a) => a.offerId === o.id);
   const stale = isStale(o, activeVersion(criteria)?.id);
@@ -3118,24 +3492,49 @@ function OfferDrawer({ id, onClose }) {
       onClose={onClose}
       title={o.title}
       subtitle={`${show(o.company)} · ${show(o.location)}`}
-      headerExtra={o.demo ? <Chip className="mt-2">exemple — donnée fictive</Chip> : null}
+      headerExtra={
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mt-2">
+          {mainUrl ? (
+            <a href={mainUrl} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>
+              Voir l'offre <ExternalLink className="w-3 h-3" aria-hidden="true" />
+            </a>
+          ) : <span className={`text-xs ${T.faint}`}>Lien {NC}</span>}
+          <RatingChip company={o.company} />
+          {o.demo && <Chip>exemple — donnée fictive</Chip>}
+          {o.status === "expired" && <Chip tone="warn">expirée / pourvue</Chip>}
+          {o.status === "closed" && <Chip>candidature clôturée</Chip>}
+          {pos >= 0 && <span className={`text-xs tabular-nums ${T.faint}`}>{pos + 1} / {queue.length}</span>}
+          <span className="inline-flex gap-1">
+            <IconBtn icon={ChevronLeft} label="Offre précédente (←)" onClick={() => prevId && setOfferSel(prevId)} disabled={!prevId} />
+            <IconBtn icon={ChevronRight} label="Offre suivante (→)" onClick={() => nextId && setOfferSel(nextId)} disabled={!nextId} />
+          </span>
+        </div>
+      }
     >
-      <div className="flex flex-wrap gap-2 mb-8">
+      <div className="flex flex-wrap gap-2 mb-3">
         {app ? (
           <Btn variant="primary" icon={Columns} onClick={() => { onClose(); openApp(app.id); }}>Ouvrir la candidature ({STAGE_LABEL[app.stage]})</Btn>
         ) : (
           <>
             <Btn variant="primary" icon={Check} onClick={() => { const aid = addToPipeline(o.id, "retained"); onClose(); openApp(aid, "docs"); }}>Retenir & préparer</Btn>
-            <Btn icon={Plus} onClick={() => addToPipeline(o.id, "new")}>Ajouter au pipeline</Btn>
+            <Btn icon={Plus} onClick={() => { const nxt = nextId; addToPipeline(o.id, "new"); if (settings.autoNext && nxt) setOfferSel(nxt); }}>Ajouter au pipeline</Btn>
           </>
         )}
-        {o.status === "dismissed" ? (
+        {INACTIVE.includes(o.status) && o.status !== "closed" ? (
           <Btn variant="ghost" icon={RotateCcw} onClick={() => patchOffer(o.id, { status: "new" })}>Restaurer</Btn>
         ) : !app && (
-          <Btn variant="ghost" icon={X} onClick={() => { patchOffer(o.id, { status: "dismissed" }); onClose(); }}>Écarter</Btn>
+          <>
+            <Btn variant="ghost" icon={X} onClick={() => triageOffer(o.id, { status: "dismissed", dismissedAt: nowISO() })}>Écarter</Btn>
+            <Btn variant="ghost" icon={Clock} onClick={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO() })}>Expirée / pourvue</Btn>
+          </>
         )}
+        {nextId && <Btn variant="ghost" icon={ArrowRight} onClick={() => setOfferSel(nextId)}>Suivante</Btn>}
         {!o.demo && <Btn variant="ghost" icon={RefreshCw} onClick={() => scoreOffers([o.id])} loading={busy.score}>{s ? "Rescorer" : "Scorer"}</Btn>}
       </div>
+      <label className={`flex items-center gap-2 text-xs mb-8 ${T.faint}`}>
+        <input type="checkbox" checked={!!settings.autoNext} onChange={(e) => setSettings((x) => ({ ...x, autoNext: e.target.checked }))} />
+        Passer automatiquement à l'offre suivante après « Écarter », « Expirée » ou « Ajouter » · flèches ← → pour naviguer
+      </label>
 
       <section className="mb-8">
         <div className="flex items-center gap-4">
@@ -3246,6 +3645,23 @@ function OfferDrawer({ id, onClose }) {
       </section>
     </Drawer>
   );
+}
+
+function RatingChip({ company, compact }) {
+  const T = useT();
+  const { ratings, requestRatings, busy } = useApp();
+  if (!company || /confidenti|non communiqu/i.test(company)) return null;
+  const r = ratings[ratingKey(company)];
+  const v = fmtRating(r);
+  if (compact) return v ? <span className={`text-xs tabular-nums ${T.muted}`} title={`${r.source || "Note employeur"}${r.reviews ? ` · ${r.reviews} avis` : ""}`}>★ {v}</span> : null;
+  if (v) {
+    const label = `★ ${v} / 5 · ${r.source || "avis"}${r.reviews ? ` (${r.reviews.toLocaleString("fr-BE")} avis)` : ""}`;
+    return r.url ? (
+      <a href={r.url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ${T.chip} hover:underline ${T.ring}`} title={r.note || "Note employeur publique"}>{label}</a>
+    ) : <Chip>{label}</Chip>;
+  }
+  if (r) return <Chip title={r.note || ""}>note employeur introuvable</Chip>;
+  return <Btn size="sm" variant="ghost" className="h-6 px-2" loading={busy.ratings} onClick={() => requestRatings([company])}>★ Note employeur</Btn>;
 }
 
 function BulletList({ title, items, icon: Icon, danger, empty = "—" }) {
@@ -3582,7 +3998,11 @@ function AppDrawer({ id, tab, setTab, onClose }) {
       subtitle={
         <span className="flex flex-wrap items-center gap-2">
           <span>{show(offer?.company)}</span>
-          {offer && <button type="button" className={`text-xs underline underline-offset-4 ${T.accentText} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>voir l'offre</button>}
+          {offer?.sources?.find((x) => x.url) && (
+            <a href={offer.sources.find((x) => x.url).url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>Voir l'offre <ExternalLink className="w-3 h-3" aria-hidden="true" /></a>
+          )}
+          {offer && <button type="button" className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>fiche Radar</button>}
+          {offer && <RatingChip company={offer.company} />}
         </span>
       }
       headerExtra={
@@ -3726,7 +4146,7 @@ function DossierPanel({ app, offer }) {
           {loading ? <Skeleton lines={6} /> : (
             <>
               <div className="text-base font-medium">Générer le dossier complet</div>
-              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV adapté, lettre, message LinkedIn, réponses probables au formulaire et e-mail de candidature, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
+              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV et lettre prêts à envoyer (mis en page aux couleurs de l'entreprise, mots-clés de l'annonce pour les ATS, PDF texte), message LinkedIn, réponses probables au formulaire et e-mail, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
               <Field label="Consigne facultative"><Input value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Ex. insister sur l'automatisation, ton plus direct…" /></Field>
               <Btn className="mt-4" variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, DOC_TYPES.map((d) => d.id), instruction)}>Générer</Btn>
             </>
@@ -3745,6 +4165,113 @@ function DossierPanel({ app, offer }) {
   );
 }
 
+/* Aperçu « papier » : toujours sur fond blanc, comme le PDF. */
+function DocPaper({ text, accent, kind }) {
+  const A = cleanHex(accent);
+  const blocks = parseDoc(text);
+  let seenContact = false;
+  return (
+    <div className="rounded-2xl overflow-x-auto" style={{ background: "#ffffff", color: "#2d2d2d", border: "1px solid #e7e5e4", boxShadow: "0 12px 32px -18px rgba(0,0,0,.25)" }}>
+      <div style={{ padding: "32px 34px", fontFamily: '"Inter", Helvetica, Arial, sans-serif', fontSize: 12.5, lineHeight: 1.5, minWidth: 320 }}>
+        {blocks.map((b, i) => {
+          if (b.t === "name") return <div key={i} style={{ color: A, fontSize: kind === "cv" ? 26 : 19, fontWeight: 700, letterSpacing: "-0.01em", lineHeight: 1.15 }}>{b.text}</div>;
+          if (b.t === "quote") return kind === "cv"
+            ? <div key={i} style={{ fontSize: 14, color: "#4a4a4a", marginTop: 4 }}>{b.text}</div>
+            : <div key={i} style={{ marginTop: 2 }}>{b.text}</div>;
+          if (b.t === "contact") { seenContact = true; return <div key={i} style={{ fontSize: 11, color: "#6b6b6b", marginTop: 4, paddingBottom: 12, borderBottom: `2px solid ${A}`, marginBottom: 14 }}>{b.text}</div>; }
+          if (b.t === "date") return <div key={i} style={{ textAlign: "right", color: "#5a5a5a", margin: "8px 0 14px" }}>{b.text}</div>;
+          if (b.t === "h2") return kind === "cv"
+            ? <div key={i} style={{ color: A, fontWeight: 700, fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", margin: "16px 0 6px", paddingBottom: 4, borderBottom: "1px solid #e5e5e5" }}>{b.text}</div>
+            : <div key={i} style={{ fontWeight: 700, margin: "14px 0 12px" }}>{b.text}</div>;
+          if (b.t === "h3") {
+            const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+            return <div key={i} style={{ marginTop: 8 }}><div style={{ fontWeight: 700, color: "#1f1f1f" }}>{parts[0]}</div>{parts.length > 1 && <div style={{ fontSize: 11, color: "#777" }}>{parts.slice(1).join("  ·  ")}</div>}</div>;
+          }
+          if (b.t === "bullet") return <div key={i} style={{ display: "flex", gap: 8, marginTop: 3 }}><span style={{ width: 5, height: 5, borderRadius: 9, background: A, marginTop: 7, flexShrink: 0 }} /><span>{b.text}</span></div>;
+          if (b.t === "kv") return <div key={i} style={{ marginTop: 3 }}><strong style={{ color: "#1f1f1f" }}>{b.label}</strong> {b.text}</div>;
+          if (b.t === "sign") return <div key={i} style={{ marginTop: 18, fontWeight: 700 }}>{b.text}</div>;
+          return <p key={i} style={{ margin: kind === "cv" ? "4px 0" : "0 0 12px", textAlign: kind === "cv" ? "left" : "justify" }}>{b.text}</p>;
+        })}
+        {!seenContact && kind === "cv" && blocks.length > 0 && <div style={{ fontSize: 11, color: "#b45309", marginTop: 12 }}>Coordonnées absentes : ajoutez une ligne « @ … » ou complétez votre profil.</div>}
+      </div>
+    </div>
+  );
+}
+
+const slugFile = (x) => normText(x || "").replace(/\s+/g, "-").slice(0, 40) || "document";
+
+function ProDocTools({ app, type, v, text, setText, accent, setAccent, dirty, onSave }) {
+  const T = useT();
+  const { offers, profile, toast } = useApp();
+  const [mode, setMode] = useState("preview");
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const offer = offers.find((o) => o.id === app.offerId);
+  const cov = useMemo(() => keywordCoverage(text, v.keywords), [text, v.keywords]);
+  const placeholders = (text.match(/\[à compléter/gi) || []).length;
+  const words = docPlainText(text).split(/\s+/).filter(Boolean).length;
+  const downloadPdf = async () => {
+    setPdfBusy(true);
+    try {
+      const data = await buildDocPdf(text, { accent, kind: type, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: v.keywords, author: profile.name });
+      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}.pdf`, data, "application/pdf");
+      if (r === "saved") toast("PDF prêt", "ok");
+    } catch (e) {
+      toast(`PDF impossible : ${e.message}`, "danger");
+    } finally { setPdfBusy(false); }
+  };
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Tabs value={mode} onChange={setMode} tabs={[{ id: "preview", label: "Aperçu" }, { id: "edit", label: "Modifier le texte" }]} />
+        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}>
+          <Palette className="w-4 h-4" aria-hidden="true" /> Couleur
+          <input type="color" value={cleanHex(accent)} onChange={(e) => setAccent(e.target.value)} aria-label="Couleur d'accent" style={{ width: 32, height: 24, border: "none", background: "transparent" }} />
+        </label>
+        {v.accentSource && <span className={`text-xs ${T.faint}`}>({v.accentSource})</span>}
+        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots</span>
+      </div>
+      {mode === "preview" ? <DocPaper text={text} accent={accent} kind={type} /> : (
+        <>
+          <Textarea rows={22} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
+          <p className={`text-xs ${T.faint}`}># nom · &gt; accroche ou destinataire · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
+        </>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={onSave}>Enregistrer une version</Btn>
+        <Btn icon={Download} loading={pdfBusy} onClick={downloadPdf}>Télécharger le PDF</Btn>
+        <CopyBtn text={docPlainText(text)} label="Copier le texte (formulaires, ATS)" size="md" />
+      </div>
+      {type === "cv" && (
+        <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-medium">Analyse ATS</div>
+            {cov.pct !== null && <Chip tone={cov.pct >= 75 ? "ok" : cov.pct >= 50 ? "warn" : "danger"}>{cov.pct} % des mots-clés de l'annonce</Chip>}
+          </div>
+          {cov.covered.length > 0 && <div className="flex flex-wrap gap-1.5">{cov.covered.map((k) => <Chip key={k} tone="ok">{k}</Chip>)}</div>}
+          {cov.missing.length > 0 && (
+            <div>
+              <div className={`text-xs mb-1 ${T.muted}`}>Absents du CV — ajoutez-les seulement si c'est vrai :</div>
+              <div className="flex flex-wrap gap-1.5">{cov.missing.map((k) => <Chip key={k} tone="warn">{k}</Chip>)}</div>
+            </div>
+          )}
+          {v.missingInProfile?.length > 0 && <p className={`text-xs ${T.muted}`}>Exigences non couvertes par votre profil : {v.missingInProfile.join(", ")}. À préparer pour l'entretien.</p>}
+          <ul className={`text-xs space-y-1 ${T.muted}`}>
+            <li>{placeholders ? `⚠ ${placeholders} élément(s) [à compléter] avant envoi.` : "✓ Aucun élément à compléter."}</li>
+            <li>✓ Une colonne, titres standard, texte sélectionnable dans le PDF : lisible par les ATS.</li>
+            <li>{words > 900 ? "⚠ Plus de 900 mots : visez 2 pages maximum." : "✓ Longueur adaptée (1 à 2 pages)."}</li>
+          </ul>
+        </div>
+      )}
+      {v.tips?.length > 0 && (
+        <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
+          <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
+          <ul className="text-sm space-y-1">{v.tips.map((t, i) => <li key={i}>• {t}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DocEditor({ app, type }) {
   const T = useT();
   const { saveDocVersion, generateDocs, busy, settings, createGmailDraft, contacts } = useApp();
@@ -3757,9 +4284,11 @@ function DocEditor({ app, type }) {
   const linked = contacts.filter((c) => (app.contactIds || []).includes(c.id) && c.email);
   const [to, setTo] = useState(linked[0]?.email || "");
   useEffect(() => { setIdx(versions.length - 1); }, [versions.length]);
-  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const isPro = (type === "cv" || type === "letter") && v?.format === "markup";
+  const [accent, setAccent] = useState(cleanHex(v?.accent));
+  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); setAccent(cleanHex(v?.accent)); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const loading = busy[`dossier:${app.id}`];
-  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")));
+  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")) || (isPro && accent !== cleanHex(v.accent)));
   const warn = mentionsEmployer(`${subject}\n${text}`, settings.employerNames);
 
   if (!v) {
@@ -3781,7 +4310,12 @@ function DocEditor({ app, type }) {
         {dirty && <Chip tone="warn">modifications non enregistrées</Chip>}
       </div>
       {warn.length > 0 && <Notice tone="danger" icon={AlertTriangle}>Ce document mentionne votre employeur actuel ({warn.join(", ")}). Vérifiez que c'est voulu avant toute diffusion.</Notice>}
-      {type === "cv" && v.highlights?.length > 0 && (
+      {isPro && !loading && (
+        <ProDocTools app={app} type={type} v={v} text={text} setText={setText} accent={accent} setAccent={setAccent} dirty={dirty}
+          onSave={() => saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource })} />
+      )}
+      {(type === "cv" || type === "letter") && !isPro && <Notice icon={Info}>Ancien format : régénérez ce document pour obtenir la version mise en page (aperçu, analyse ATS et PDF).</Notice>}
+      {type === "cv" && !isPro && v.highlights?.length > 0 && (
         <div className={`rounded-2xl p-4 ${T.sub}`}>
           <div className={`text-xs font-medium mb-2 ${T.muted}`}>Points clés à mettre en avant</div>
           <ul className="space-y-1 text-sm">{v.highlights.map((h, i) => <li key={i} className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-1 shrink-0 ${T.accentText}`} aria-hidden="true" />{h}</li>)}</ul>
@@ -3796,17 +4330,17 @@ function DocEditor({ app, type }) {
           </Field>
         </div>
       )}
-      {loading ? <Card className="p-6"><Skeleton lines={8} /></Card> : (
+      {loading ? <Card className="p-6"><Skeleton lines={8} /></Card> : !isPro && (
         <Textarea rows={type === "linkedin" ? 5 : 16} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: FONT }} />
       )}
       {type === "linkedin" && (
         <p className={`text-xs ${text.length > 300 ? "text-rose-600" : T.faint}`}>{text.length} / 300 caractères (limite d'une invitation). Envoi manuel depuis LinkedIn : aucune automatisation possible.</p>
       )}
-      <div className="flex flex-wrap gap-2">
+      {!isPro && <div className="flex flex-wrap gap-2">
         <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={() => saveDocVersion(app.id, type, text, type === "email" ? subject : undefined)}>Enregistrer une version</Btn>
         <CopyBtn text={type === "email" ? `Objet : ${subject}\n\n${text}` : text} size="md" />
         {type === "email" && <Btn icon={Mail} loading={busy["gmail-draft"]} onClick={() => createGmailDraft({ to, subject, body: text, appId: app.id })}>Créer le brouillon Gmail</Btn>}
-      </div>
+      </div>}
       <div className={`flex flex-col sm:flex-row gap-2 pt-4 border-t ${T.line}`}>
         <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Consigne de régénération (facultatif) : plus court, plus orienté résultats…" aria-label="Consigne de régénération" />
         <Btn icon={RefreshCw} loading={loading} onClick={() => generateDocs(app.id, [type], instr)}>Régénérer</Btn>
@@ -4542,6 +5076,11 @@ function ProfileEditor() {
           <Field label="Poste actuel"><Input value={profile.headline} onChange={(e) => set("headline", e.target.value)} /></Field>
         </div>
         <Field label="Domicile"><Input value={profile.home} onChange={(e) => set("home", e.target.value)} /></Field>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <Field label="E-mail (pour le CV)"><Input type="email" value={profile.email || ""} onChange={(e) => set("email", e.target.value)} /></Field>
+          <Field label="Téléphone"><Input value={profile.phone || ""} onChange={(e) => set("phone", e.target.value)} /></Field>
+          <Field label="URL LinkedIn"><Input value={profile.linkedinUrl || ""} onChange={(e) => set("linkedinUrl", e.target.value)} /></Field>
+        </div>
         <Field label="Résumé"><Textarea rows={5} value={profile.summary} onChange={(e) => set("summary", e.target.value)} /></Field>
         <Field label="Compétences"><ChipInput values={profile.skills} onChange={(v) => set("skills", v)} placeholder="Ajouter une compétence…" /></Field>
         <Field label="Langues" hint="Format : langue (niveau), séparées par des virgules">
@@ -4555,6 +5094,14 @@ function ProfileEditor() {
         <SectionTitle>Réalisations chiffrées</SectionTitle>
         <p className={`text-xs ${T.muted}`}>Base factuelle de tous les documents générés : l'IA n'invente aucun chiffre, elle marque les manques « [à compléter] ».</p>
         <ListEditor items={profile.achievements} onChange={(v) => set("achievements", v)} placeholder="Ex. Réduction de 30 % du temps de traitement des adhésions…" />
+      </Card>
+      <Card className="p-6 space-y-4">
+        <SectionTitle>Formation</SectionTitle>
+        <ListEditor items={profile.education || []} onChange={(v) => set("education", v)} placeholder="Ex. Master en … | Université | Année" />
+      </Card>
+      <Card className="p-6 space-y-4">
+        <SectionTitle>Certifications</SectionTitle>
+        <ListEditor items={profile.certifications || []} onChange={(v) => set("certifications", v)} placeholder="Ex. Microsoft Certified: Power Platform Functional Consultant" />
       </Card>
       <Card className="p-6 space-y-4 lg:col-span-2">
         <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => set("experiences", [...profile.experiences, { id: uid("exp"), role: "", org: "", period: "", highlights: "" }])}>Ajouter</Btn>}>Expériences clés</SectionTitle>
