@@ -11,7 +11,7 @@ import {
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
   Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
-  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Star, Palette, ChevronLeft,
+  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, Redo2, MailCheck, Star, Palette, ChevronLeft, ArrowUp, ArrowDown, Languages, ImagePlus,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -136,10 +136,14 @@ const DEFAULT_PROFILE = {
   ],
   achievements: ["[à compléter : réalisation chiffrée 1]", "[à compléter : réalisation chiffrée 2]"],
   languages: [
-    { lang: "Français", level: "courant" },
-    { lang: "Néerlandais", level: "courant" },
-    { lang: "Anglais", level: "courant" },
+    { lang: "Français", code: "fr", level: "native" },
+    { lang: "Néerlandais", code: "nl", level: "C1" },
+    { lang: "Anglais", code: "en", level: "C1" },
   ],
+  langV2: true,
+  photo: null,
+  photoPolicy: "auto",
+  nameEmployer: true,
   cvText: "",
 };
 
@@ -491,6 +495,282 @@ function keywordCoverage(text, terms) {
   return { covered, missing: list.filter((t) => !covered.includes(t)), pct: list.length ? Math.round((covered.length / list.length) * 100) : null };
 }
 
+/* ── Langues : niveaux CECR exprimés dans la langue du document ─────────────
+   Le niveau est stocké en code (native, C2…A1) ; le libellé est calculé selon la langue du CV. */
+const DOC_LANGS = ["fr", "nl", "en"];
+const LANG_CODE_LABEL = { fr: "FR", nl: "NL", en: "EN" };
+const CEFR = ["native", "C2", "C1", "B2", "B1", "A2", "A1"];
+const CEFR_HINT = {
+  native: "langue maternelle", C2: "maîtrise, niveau bilingue", C1: "autonome, courant", B2: "avancé, indépendant",
+  B1: "seuil, intermédiaire", A2: "élémentaire", A1: "introductif, notions",
+};
+const LEVEL_LABEL = {
+  fr: { native: "langue maternelle", C2: "bilingue (C2)", C1: "courant (C1)", B2: "avancé (B2)", B1: "intermédiaire (B1)", A2: "élémentaire (A2)", A1: "notions (A1)" },
+  nl: { native: "moedertaal", C2: "uitstekend (C2)", C1: "zeer goed (C1)", B2: "goed (B2)", B1: "redelijk (B1)", A2: "basiskennis (A2)", A1: "beginner (A1)" },
+  en: { native: "native", C2: "proficient (C2)", C1: "fluent (C1)", B2: "upper intermediate (B2)", B1: "intermediate (B1)", A2: "elementary (A2)", A1: "beginner (A1)" },
+};
+const LANG_NAMES = {
+  fr: { fr: "Français", nl: "Frans", en: "French" },
+  nl: { fr: "Néerlandais", nl: "Nederlands", en: "Dutch" },
+  en: { fr: "Anglais", nl: "Engels", en: "English" },
+  de: { fr: "Allemand", nl: "Duits", en: "German" },
+  es: { fr: "Espagnol", nl: "Spaans", en: "Spanish" },
+  it: { fr: "Italien", nl: "Italiaans", en: "Italian" },
+  pt: { fr: "Portugais", nl: "Portugees", en: "Portuguese" },
+  ar: { fr: "Arabe", nl: "Arabisch", en: "Arabic" },
+};
+const LANG_ALIASES = { flamand: "nl", vlaams: "nl", flemish: "nl", neerlandais: "nl", nederlands: "nl", dutch: "nl", francais: "fr", frans: "fr", french: "fr", anglais: "en", engels: "en", english: "en", allemand: "de", duits: "de", german: "de", deutsch: "de" };
+function langCodeOf(name) {
+  const n = normText(name);
+  if (LANG_ALIASES[n]) return LANG_ALIASES[n];
+  for (const [code, names] of Object.entries(LANG_NAMES)) if (Object.values(names).some((x) => normText(x) === n)) return code;
+  return null;
+}
+function parseLevel(raw) {
+  const s = String(raw || "");
+  const m = s.toUpperCase().match(/\b([ABC][12])\b/);
+  if (/matern|natif|native|moedertaal|mother/i.test(s)) return "native";
+  if (m) return m[1];
+  if (/bilingue|bilingual|tweetalig/i.test(s)) return "C2";
+  if (/courant|fluent|vloeiend|vlot|zeer goed/i.test(s)) return "C1";
+  if (/avanc|advanced|\bgoed\b|bonne/i.test(s)) return "B2";
+  if (/interm|redelijk/i.test(s)) return "B1";
+  if (/notion|basi|elementa|d[ée]butant|beginner/i.test(s)) return "A2";
+  return null;
+}
+/* Migration : niveaux texte → codes. Un seul C2 sans langue maternelle déclarée = langue maternelle. */
+function normalizeLanguages(list, migrate) {
+  const out = (list || []).filter((l) => l && (l.lang || l.code)).map((l) => {
+    const code = l.code || langCodeOf(l.lang);
+    return { lang: l.lang || LANG_NAMES[code]?.fr || "", code: code || null, level: CEFR.includes(l.level) ? l.level : parseLevel(l.level) };
+  });
+  if (migrate && !out.some((l) => l.level === "native")) {
+    const c2 = out.filter((l) => l.level === "C2");
+    if (c2.length === 1) c2[0].level = "native";
+  }
+  return out;
+}
+const migrateProfile = (p) => {
+  const n = { ...DEFAULT_PROFILE, ...(p || {}) };
+  n.languages = normalizeLanguages(n.languages, !p?.langV2);
+  n.langV2 = true;
+  return n;
+};
+const langName = (l, lang = "fr") => (l.code && LANG_NAMES[l.code]?.[lang]) || l.lang;
+const levelText = (l, lang = "fr") => (l.level ? LEVEL_LABEL[lang]?.[l.level] || l.level : lang === "nl" ? "niveau te bepalen" : lang === "en" ? "level to be specified" : "niveau à préciser");
+const languagesDigest = (langs) => (langs || []).map((l) => `${langName(l)} (${levelText(l)})`).join(", ");
+function languagesMarkup(langs, lang = "fr") {
+  const sep = lang === "fr" ? " :" : ":";
+  const order = (l) => (l.level ? CEFR.indexOf(l.level) : 99);
+  return [...(langs || [])].sort((a, b) => order(a) - order(b)).map((l) => `**${langName(l, lang)}${sep}** ${levelText(l, lang)}`).join("\n");
+}
+
+/* Titres de sections standard (lisibles par les ATS) par langue. */
+const SECTION_TITLES = {
+  fr: { profile: "Profil", achievements: "Réalisations clés", experience: "Expérience professionnelle", skills: "Compétences", languages: "Langues", education: "Formation", certifications: "Certifications" },
+  nl: { profile: "Profiel", achievements: "Belangrijkste realisaties", experience: "Werkervaring", skills: "Vaardigheden", languages: "Talen", education: "Opleiding", certifications: "Certificaten" },
+  en: { profile: "Profile", achievements: "Key achievements", experience: "Professional experience", skills: "Skills", languages: "Languages", education: "Education", certifications: "Certifications" },
+};
+const sectionKind = (title) => {
+  const t = normText(title);
+  for (const titles of Object.values(SECTION_TITLES)) for (const [k, v] of Object.entries(titles)) if (t === normText(v)) return k;
+  if (/^(langues?|talen|taal|languages?)$/.test(t)) return "languages";
+  if (/^(formation|opleiding|education|etudes)/.test(t)) return "education";
+  if (/^(profil|profiel|profile|resume|summary)$/.test(t)) return "profile";
+  return null;
+};
+
+/* Découpage en blocs éditables : en-tête, sections « ## », et pour la lettre, paragraphes. */
+function splitBlocks(text, kind) {
+  const lines = String(text || "").split("\n");
+  const units = [];
+  let cur = { kind: "head", title: "", lines: [] };
+  for (const l of lines) {
+    if (l.trim().startsWith("## ")) { units.push(cur); cur = { kind: "section", title: l.trim().slice(3), lines: [] }; }
+    else cur.lines.push(l);
+  }
+  units.push(cur);
+  const out = [];
+  for (const u of units) {
+    const body = u.lines.join("\n").replace(/^\n+|\n+$/g, "");
+    if (u.kind === "head" && !body) continue;
+    if (kind === "letter" && u.kind === "section") {
+      out.push({ kind: "section", title: u.title, body: "" });
+      body.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean).forEach((para) => out.push({ kind: "para", title: "", body: para }));
+    } else out.push({ kind: u.kind, title: u.title, body });
+  }
+  return out.map((u, i) => ({ ...u, key: `${i}-${u.kind}` }));
+}
+const joinBlocks = (units) => units.map((u) => (u.kind === "section" ? `## ${u.title}${u.body ? `\n${u.body}` : ""}` : u.body)).filter((x) => x.trim()).join("\n\n");
+
+/* Section « Langues » recalculée depuis le profil : niveaux toujours exacts et dans la langue du CV. */
+function injectLanguages(text, langs, lang) {
+  if (!langs?.length) return text;
+  const units = splitBlocks(text, "cv");
+  const body = languagesMarkup(langs, lang);
+  const i = units.findIndex((u) => u.kind === "section" && sectionKind(u.title) === "languages");
+  if (i >= 0) units[i] = { ...units[i], title: SECTION_TITLES[lang]?.languages || units[i].title, body };
+  else {
+    const at = units.findIndex((u) => u.kind === "section" && sectionKind(u.title) === "education");
+    const sec = { kind: "section", title: SECTION_TITLES[lang]?.languages || "Langues", body };
+    if (at >= 0) units.splice(at, 0, sec); else units.push(sec);
+  }
+  return joinBlocks(units);
+}
+
+/* Mots-clés ATS : un terme compte s'il figure mot pour mot dans l'annonce (vérifié ici) et si le profil le justifie. */
+const KW_CATS = ["intitulé", "compétence", "outil", "méthode", "domaine", "soft skill", "langue"];
+function checkKeywords(raw, adText) {
+  const hay = ` ${normText(adText)} `;
+  const verifiable = normText(adText).length >= 250;
+  const seen = new Set();
+  return (raw || []).map((k) => (typeof k === "string" ? { term: k, justified: true } : k)).filter((k) => str(k?.term)).map((k) => {
+    const term = String(k.term).trim();
+    const n = normText(term);
+    return {
+      term,
+      category: KW_CATS.includes(k.category) ? k.category : "compétence",
+      importance: k.importance === "souhaité" ? "souhaité" : "exigé",
+      justified: k.justified !== false,
+      evidence: str(k.evidence),
+      inAd: verifiable ? hay.includes(` ${n} `) || hay.includes(n) : null,
+    };
+  }).filter((k) => { const n = normText(k.term); if (!n || seen.has(n)) return false; seen.add(n); return true; });
+}
+const targetTerms = (kw) => (kw || []).filter((k) => k.justified && k.inAd !== false);
+const titleClaimRisk = (text, offerTitle, headline) => {
+  if (!offerTitle || normText(offerTitle) === normText(headline)) return false;
+  const prof = splitBlocks(text, "cv").find((u) => u.kind === "section" && sectionKind(u.title) === "profile");
+  const t = normText(offerTitle);
+  return !!prof && t.length > 3 && normText(prof.body).includes(t);
+};
+
+/* Contrôle avant envoi : vérifications objectives, sans IA. */
+const CLICHES = {
+  fr: ["passionné", "dynamique", "force de proposition", "je me permets", "n'hésitez pas", "fort de", "motivé et rigoureux", "challenge", "esprit d'équipe", "polyvalent", "proactif", "orienté client", "véritable", "idéalement placé"],
+  nl: ["gepassioneerd", "dynamisch", "teamplayer", "proactief", "aarzel niet", "uitdaging", "stressbestendig", "flexibel ingesteld", "resultaatgericht ingesteld"],
+  en: ["passionate", "dynamic", "go-getter", "team player", "results-driven", "self-starter", "hard-working", "think outside the box", "synergy", "do not hesitate", "detail-oriented"],
+};
+/* Chiffres du document absents du profil : « 30 % », « 1 200 », « 4 personnes »… (années, téléphone et dates exclus). */
+function numbersNotInProfile(text, profile) {
+  const corpus = [
+    profile.summary, profile.headline, profile.cvText,
+    ...(profile.achievements || []), ...(profile.skills || []), ...(profile.education || []), ...(profile.certifications || []),
+    ...(profile.experiences || []).flatMap((e) => [e.role, e.org, e.period, e.highlights]),
+  ].filter(Boolean).join(" ");
+  const norm = (x) => String(x).replace(/[\s  .']/g, "").replace(",", ".");
+  const have = new Set((corpus.match(/\d[\d\s  .,']*\d|\d/g) || []).map(norm));
+  const body = parseDoc(text).filter((b) => !["contact", "date", "name"].includes(b.t)).map((b) => `${b.label || ""} ${b.text}`).join(" \n ");
+  const found = new Set();
+  for (const m of body.matchAll(/(\d[\d\s  .,']*\d|\d)(\s?%)?/g)) {
+    const raw = m[0].trim(), n = norm(m[1]);
+    if (/^(19|20)\d\d$/.test(n)) continue; // années
+    if (n.length >= 9) continue; // téléphone, identifiants
+    if (!m[2] && n.length < 2) continue; // petits nombres isolés (« 3 réalisations »)
+    if (!have.has(n)) found.add(raw);
+  }
+  return [...found];
+}
+function preflightChecks(text, kind, { profile, offer, lang, pages }) {
+  const out = [];
+  const plain = docPlainText(text);
+  const words = plain.split(/\s+/).filter(Boolean).length;
+  const ph = (text.match(/\[à compléter|\[te vervolledigen|\[to complete/gi) || []).length;
+  out.push(ph ? { tone: "danger", text: `${ph} élément(s) [à compléter] à remplir avant envoi.` } : { tone: "ok", text: "Aucun élément à compléter." });
+  const nums = numbersNotInProfile(text, profile);
+  out.push(nums.length
+    ? { tone: "warn", text: `Chiffres absents de votre profil : ${nums.slice(0, 8).join(", ")}${nums.length > 8 ? "…" : ""}. Vérifiez qu'ils sont exacts, ou ajoutez-les à vos réalisations.` }
+    : { tone: "ok", text: "Tous les chiffres figurent dans votre profil." });
+  const hay = ` ${normText(plain)} `;
+  const cl = (CLICHES[lang] || CLICHES.fr).filter((c) => hay.includes(` ${normText(c)} `));
+  if (cl.length) out.push({ tone: "warn", text: `Formules toutes faites : ${cl.join(", ")}. Remplacez-les par un fait.` });
+  const blocks = parseDoc(text);
+  if (kind === "cv") {
+    const contact = blocks.find((b) => b.t === "contact")?.text || "";
+    out.push(/@/.test(contact) && /\d{6,}|\+\d/.test(contact.replace(/[\s.]/g, "")) ? { tone: "ok", text: "E-mail et téléphone présents dans l'en-tête." } : { tone: "warn", text: "En-tête : e-mail ou téléphone manquant (complétez votre profil)." });
+    if (titleClaimRisk(text, offer?.title, profile.headline)) out.push({ tone: "warn", text: `Le profil cite l'intitulé visé « ${offer?.title} » : vérifiez qu'il ne laisse pas croire que vous occupez déjà ce poste.` });
+    out.push(words > 900 ? { tone: "warn", text: `${words} mots : visez 550 à 800.` } : words < 350 ? { tone: "warn", text: `${words} mots : CV un peu court, ajoutez des preuves chiffrées.` } : { tone: "ok", text: `${words} mots.` });
+  } else {
+    out.push(words > 360 ? { tone: "warn", text: `${words} mots : visez 230 à 320.` } : words < 180 ? { tone: "warn", text: `${words} mots : lettre un peu courte.` } : { tone: "ok", text: `${words} mots.` });
+    if (offer?.company && !hay.includes(` ${normText(offer.company)} `)) out.push({ tone: "warn", text: `L'entreprise (${offer.company}) n'est pas citée dans la lettre.` });
+    if (!blocks.some((b) => b.t === "sign")) out.push({ tone: "warn", text: "Signature absente (ligne « ~ Prénom Nom »)." });
+  }
+  const maxPages = kind === "cv" ? 2 : 1;
+  if (pages) out.push(pages > maxPages ? { tone: "warn", text: `${pages} pages : visez ${maxPages} maximum (densité compacte, ou raccourcir un bloc).` } : { tone: "ok", text: `${pages} page${pages > 1 ? "s" : ""}.` });
+  return out;
+}
+
+/* Différence ligne à ligne entre deux versions (plus longue sous-séquence commune). */
+function lineDiff(a, b) {
+  const A = String(a || "").split("\n"), B = String(b || "").split("\n");
+  const n = A.length, m = B.length;
+  const L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) { out.push({ t: "same", s: A[i] }); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) out.push({ t: "del", s: A[i++] });
+    else out.push({ t: "add", s: B[j++] });
+  }
+  while (i < n) out.push({ t: "del", s: A[i++] });
+  while (j < m) out.push({ t: "add", s: B[j++] });
+  return out;
+}
+
+/* Remplace un bloc par la réécriture de l'IA (titre de section conservé ou mis à jour). */
+function applyBlockOutput(units, i, out, kind) {
+  const u = units[i];
+  const sec = splitBlocks(out, "cv").find((x) => x.kind === "section");
+  const n = [...units];
+  if (u.kind === "section") {
+    n[i] = kind === "letter"
+      ? { ...u, title: sec?.title || out.replace(/^##\s*/, "").split("\n")[0].trim() || u.title }
+      : { ...u, title: sec?.title || u.title, body: sec ? sec.body : out.trim() };
+  } else n[i] = { ...u, body: out.replace(/^##\s.*\n?/, "").trim() };
+  return n;
+}
+const blockSource = (u) => (u.kind === "section" ? `## ${u.title}${u.body ? `\n${u.body}` : ""}` : u.body);
+
+/* Photo : recadrage carré à l'import, puis disque sur fond blanc pour l'aperçu et le PDF. */
+function loadImage(src) {
+  return new Promise((resolve, reject) => { const im = new Image(); im.onload = () => resolve(im); im.onerror = () => reject(new Error("Image illisible.")); im.src = src; });
+}
+async function fileToPhoto(file) {
+  if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error("Format accepté : JPEG, PNG ou WebP.");
+  const url = URL.createObjectURL(file);
+  try {
+    const im = await loadImage(url);
+    const side = Math.min(im.naturalWidth, im.naturalHeight);
+    const c = document.createElement("canvas");
+    c.width = c.height = 360;
+    const g = c.getContext("2d");
+    g.fillStyle = "#ffffff"; g.fillRect(0, 0, 360, 360);
+    // recadrage centré, légèrement vers le haut (visage)
+    const sx = (im.naturalWidth - side) / 2, sy = Math.max(0, (im.naturalHeight - side) * 0.3);
+    g.drawImage(im, sx, sy, side, side, 0, 0, 360, 360);
+    return c.toDataURL("image/jpeg", 0.86);
+  } finally { URL.revokeObjectURL(url); }
+}
+const circleCache = new Map();
+async function circlePhoto(dataUrl) {
+  if (!dataUrl) return null;
+  if (circleCache.has(dataUrl)) return circleCache.get(dataUrl);
+  const im = await loadImage(dataUrl);
+  const c = document.createElement("canvas");
+  c.width = c.height = 360;
+  const g = c.getContext("2d");
+  g.fillStyle = "#ffffff"; g.fillRect(0, 0, 360, 360);
+  g.save(); g.beginPath(); g.arc(180, 180, 180, 0, Math.PI * 2); g.closePath(); g.clip();
+  g.drawImage(im, 0, 0, 360, 360); g.restore();
+  const out = c.toDataURL("image/jpeg", 0.9);
+  circleCache.set(dataUrl, out);
+  return out;
+}
+/* Politique photo : « auto » = oui en FR/NL (usage belge courant), non en EN (usage anglo-saxon : sans photo). */
+const photoDefault = (profile, lang) => !!profile?.photo && (profile.photoPolicy === "always" || (profile.photoPolicy !== "never" && lang !== "en"));
+const DEFAULT_DESIGN = { font: "sans", density: "normal", photo: false };
+
 /* PDF texte (lisible par les ATS) via jsPDF, chargé à la demande depuis cdnjs. */
 let jspdfPromise = null;
 function loadJsPDF() {
@@ -512,26 +792,41 @@ const pdfSafe = (t) => String(t || "")
   .replace(/\u0153/g, "oe").replace(/\u0152/g, "OE").replace(/[\u00A0\u202F\u2009]/g, " ").replace(/[\u2022\u25CF\u25AA]/g, "-")
   .replace(/[^\x00-\xFF]/g, "");
 
-async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
+async function renderDocPdf(text, { accent, kind, title, keywords, author, design }) {
   const { jsPDF } = await loadJsPDF();
+  const ds = { ...DEFAULT_DESIGN, ...(design || {}) };
   const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
   doc.setProperties({ title: pdfSafe(title), subject: kind === "cv" ? "Curriculum vitae" : "Lettre de motivation", author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
   const A = hexRgb(accent);
-  const M = 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
-  let y = 18;
-  const lh = (size) => size * 0.3528 * 1.38;
-  const ensure = (h) => { if (y + h > BOTTOM) { doc.addPage(); y = 18; } };
-  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color); };
+  const FACE = ds.font === "serif" ? "times" : "helvetica";
+  const K = ds.density === "compact" ? 0.9 : 1;
+  const M = ds.density === "compact" ? 15 : 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
+  const TOP = ds.density === "compact" ? 15 : 18;
+  let y = TOP;
+  const lh = (size) => size * K * 0.3528 * (ds.density === "compact" ? 1.32 : 1.38);
+  const ensure = (h) => { if (y + h > BOTTOM) { doc.addPage(); y = TOP; } };
+  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont(FACE, style); doc.setFontSize(size * K); doc.setTextColor(...color); };
+  // Photo (CV) : disque en haut à droite ; l'en-tête se resserre pour ne pas la chevaucher.
+  const PH = 30;
+  const photo = kind === "cv" && ds.photo && ds.photoData ? await circlePhoto(ds.photoData) : null;
+  if (photo) doc.addImage(photo, "JPEG", M + W - PH, TOP - 2, PH, PH);
+  let inHeader = true;
   const write = (txt, { size = 10, style = "normal", color = [45, 45, 45], indent = 0, after = 1.4, align } = {}) => {
     font(size, style, color);
-    const lines = doc.splitTextToSize(pdfSafe(txt), W - indent);
+    const width = (photo && inHeader ? W - PH - 6 : W) - indent;
+    const lines = doc.splitTextToSize(pdfSafe(txt), width);
     for (const line of lines) {
       ensure(lh(size));
       if (align === "right") doc.text(line, M + W, y + lh(size) * 0.78, { align: "right" });
       else doc.text(line, M + indent, y + lh(size) * 0.78);
       y += lh(size);
     }
-    y += after;
+    y += after * K;
+  };
+  const endHeader = () => {
+    if (!inHeader) return;
+    inHeader = false;
+    if (photo) y = Math.max(y, TOP - 2 + PH + 3);
   };
   const blocks = parseDoc(text);
   let seenName = false;
@@ -543,28 +838,32 @@ async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
     }
     else if (b.t === "contact") {
       write(b.text, { size: 9, color: [110, 110, 110], after: 1.6 });
-      if (seenName) { doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5; }
+      if (seenName) { endHeader(); doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5 * K; }
     }
-    else if (b.t === "date") { y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
+    else if (b.t === "date") { endHeader(); y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
     else if (b.t === "h2") {
+      endHeader();
       if (kind === "cv") {
-        ensure(16); y += 2.5;
+        ensure(16); y += 2.5 * K;
         write(b.text.toUpperCase(), { size: 10.5, style: "bold", color: A, after: 0.4 });
-        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6;
+        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6 * K;
       } else { y += 2; write(b.text, { size: 10.5, style: "bold", color: [30, 30, 30], after: 3 }); }
     }
     else if (b.t === "h3") {
+      endHeader();
       const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
       ensure(12); y += 0.8;
       write(parts[0] || "", { size: 10.5, style: "bold", color: [25, 25, 25], after: 0.2 });
       if (parts.length > 1) write(parts.slice(1).join("  ·  "), { size: 9, color: [115, 115, 115], after: 1 });
     }
     else if (b.t === "bullet") {
+      endHeader();
       ensure(lh(10));
       doc.setFillColor(...A); doc.circle(M + 1.3, y + lh(10) * 0.5, 0.65, "F");
       write(b.text, { indent: 4.5, after: 0.7 });
     }
     else if (b.t === "kv") {
+      endHeader();
       font(10, "bold", [30, 30, 30]);
       const label = `${pdfSafe(b.label)} `;
       const lw = doc.getTextWidth(label);
@@ -575,14 +874,140 @@ async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
       font(10); doc.text(first[0] || "", M + lw, y + lh(10) * 0.78);
       y += lh(10);
       const rest = first.slice(1).join(" ");
-      if (rest) write(rest, { after: 0.9 }); else y += 0.9;
+      if (rest) write(rest, { after: 0.9 }); else y += 0.9 * K;
     }
     else if (b.t === "sign") { y += 4; write(b.text, { style: "bold", after: 1 }); }
-    else write(b.text, { after: kind === "cv" ? 1.8 : 3.2 });
+    else { endHeader(); write(b.text, { after: kind === "cv" ? 1.8 : 3.2 }); }
   }
   const pages = doc.getNumberOfPages();
   if (pages > 1) for (let i = 1; i <= pages; i++) { doc.setPage(i); font(8, "normal", [150, 150, 150]); doc.text(`${i} / ${pages}`, M + W, 297 - 9, { align: "right" }); }
-  return doc.output("arraybuffer");
+  return doc;
+}
+async function buildDocPdf(text, opts) {
+  return (await renderDocPdf(text, opts)).output("arraybuffer");
+}
+async function pdfPageCount(text, opts) {
+  return (await renderDocPdf(text, opts)).getNumberOfPages();
+}
+
+/* ── Word (.docx) sans bibliothèque externe : XML WordprocessingML + archive ZIP (stockage sans compression).
+   Mêmes blocs que le PDF ; titres en styles « Titre 1 / Titre 2 » et puces Word natives (lus par les ATS). */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  const d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const data = typeof f.data === "string" ? enc.encode(f.data) : f.data;
+    const crc = crc32(data);
+    const head = new DataView(new ArrayBuffer(30));
+    head.setUint32(0, 0x04034b50, true); head.setUint16(4, 20, true); head.setUint16(6, 0x0800, true); head.setUint16(8, 0, true);
+    head.setUint16(10, dosTime, true); head.setUint16(12, dosDate, true); head.setUint32(14, crc, true);
+    head.setUint32(18, data.length, true); head.setUint32(22, data.length, true); head.setUint16(26, name.length, true); head.setUint16(28, 0, true);
+    parts.push(new Uint8Array(head.buffer), name, data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x0800, true); cd.setUint16(10, 0, true);
+    cd.setUint16(12, dosTime, true); cd.setUint16(14, dosDate, true); cd.setUint32(16, crc, true);
+    cd.setUint32(20, data.length, true); cd.setUint32(24, data.length, true); cd.setUint16(28, name.length, true);
+    cd.setUint32(42, offset, true);
+    central.push(new Uint8Array(cd.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, b) => n + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
+  let p = 0;
+  for (const b of all) { out.set(b, p); p += b.length; }
+  return out;
+}
+const xmlEsc = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+const dataUrlBytes = (u) => { const b = atob(String(u).split(",")[1] || ""); const a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+
+async function buildDocDocx(text, { accent, kind, title, keywords, author, design, lang }) {
+  const ds = { ...DEFAULT_DESIGN, ...(design || {}) };
+  const A = cleanHex(accent).slice(1).toUpperCase();
+  const FONT_NAME = ds.font === "serif" ? "Georgia" : "Arial";
+  const K = ds.density === "compact" ? 0.9 : 1;
+  const hp = (pt) => Math.round(pt * K * 2); // demi-points
+  const tw = (pt) => Math.round(pt * K * 20); // twips
+  const M = ds.density === "compact" ? 850 : 1020; // marges ≈ 15 / 18 mm
+  const photo = kind === "cv" && ds.photo && ds.photoData ? await circlePhoto(ds.photoData) : null;
+  const PH_MM = 28, EMU = Math.round(PH_MM * 36000);
+  const run = (t, { b, color, size, caps } = {}) => `<w:r><w:rPr>${b ? "<w:b/>" : ""}${caps ? "<w:caps/>" : ""}${color ? `<w:color w:val="${color}"/>` : ""}${size ? `<w:sz w:val="${size}"/><w:szCs w:val="${size}"/>` : ""}</w:rPr><w:t xml:space="preserve">${xmlEsc(t)}</w:t></w:r>`;
+  const para = (runs, { style, after = 4, before = 0, align, border, numbered, keepNext } = {}) => `<w:p><w:pPr>${style ? `<w:pStyle w:val="${style}"/>` : ""}${keepNext ? "<w:keepNext/>" : ""}${numbered ? '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>' : ""}${border ? `<w:pBdr><w:bottom w:val="single" w:sz="${border.sz}" w:space="${border.space}" w:color="${border.color}"/></w:pBdr>` : ""}<w:spacing w:before="${tw(before)}" w:after="${tw(after)}"/>${align ? `<w:jc w:val="${align}"/>` : ""}</w:pPr>${runs}</w:p>`;
+  const photoRun = photo ? `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="${EMU}" cy="${EMU}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="left"/><wp:docPr id="1" name="Photo" descr="Photo du candidat"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="photo.jpeg"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdPhoto"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${EMU}" cy="${EMU}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>` : "";
+  const blocks = parseDoc(text);
+  // Hauteur estimée de l'en-tête, pour que le filet passe sous la photo.
+  const headPt = blocks.slice(0, Math.max(0, blocks.findIndex((b) => b.t === "h2"))).reduce((h, b) => {
+    if (b.t === "name") return h + 26 * K;
+    if (b.t === "quote") return h + Math.ceil(b.text.length / 52) * 16 * K;
+    if (b.t === "contact") return h + Math.ceil(b.text.length / 85) * 12 * K + 4;
+    return h;
+  }, 0);
+  const photoPt = PH_MM * 2.835;
+  const body = [];
+  let seenName = false, photoPlaced = false;
+  for (const b of blocks) {
+    if (b.t === "name") {
+      seenName = true;
+      body.push(para((!photoPlaced && photo ? photoRun : "") + run(b.text, { b: true, color: A, size: hp(kind === "cv" ? 22 : 16) }), { style: "Title", after: 1 }));
+      photoPlaced = true;
+    }
+    else if (b.t === "quote") body.push(kind === "cv" ? para(run(b.text, { color: "464646", size: hp(12) }), { after: 2 }) : para(run(b.text), { after: 0 }));
+    else if (b.t === "contact") {
+      const gap = photo ? Math.min(31, Math.max(6, Math.round(photoPt - headPt + 10))) : 4;
+      body.push(para(run(b.text, { color: "6E6E6E", size: hp(9) }), { after: 10, border: seenName ? { sz: 12, space: gap, color: A } : null }));
+    }
+    else if (b.t === "date") body.push(para(run(b.text, { color: "5A5A5A" }), { align: "right", before: 6, after: 10 }));
+    else if (b.t === "h2") body.push(kind === "cv"
+      ? para(run(b.text, { b: true, caps: true, color: A, size: hp(10.5) }), { style: "Heading1", before: 10, after: 4, border: { sz: 4, space: 2, color: "D7D7D7" }, keepNext: true })
+      : para(run(b.text, { b: true }), { before: 6, after: 10 }));
+    else if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      body.push(para(run(parts[0] || "", { b: true, color: "191919" }), { style: "Heading2", before: 5, after: 0, keepNext: true }));
+      if (parts.length > 1) body.push(para(run(parts.slice(1).join("  ·  "), { color: "737373", size: hp(9) }), { after: 2, keepNext: true }));
+    }
+    else if (b.t === "bullet") body.push(para(run(b.text), { numbered: true, after: 2 }));
+    else if (b.t === "kv") body.push(para(run(`${b.label} `, { b: true, color: "1E1E1E" }) + run(b.text), { after: 2 }));
+    else if (b.t === "sign") body.push(para(run(b.text, { b: true }), { before: 12, after: 0 }));
+    else body.push(para(run(b.text), { after: kind === "cv" ? 4 : 9, align: kind === "cv" ? undefined : "both" }));
+  }
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${body.join("")}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="${M}" w:right="${M}" w:bottom="${M}" w:left="${M}" w:header="567" w:footer="567" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${FONT_NAME}" w:hAnsi="${FONT_NAME}" w:eastAsia="${FONT_NAME}" w:cs="${FONT_NAME}"/><w:color w:val="2D2D2D"/><w:sz w:val="${hp(10)}"/><w:szCs w:val="${hp(10)}"/><w:lang w:val="${{ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE"}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="${ds.density === "compact" ? 264 : 276}" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/></w:rPr></w:style></w:styles>`;
+  const numberingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="singleLevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="284" w:hanging="227"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:color w:val="${A}"/></w:rPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>${photo ? '<Relationship Id="rIdPhoto" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/photo.jpeg"/>' : ""}</Relationships>`;
+  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${xmlEsc(title)}</dc:title><dc:subject>${kind === "cv" ? "Curriculum vitae" : "Lettre de motivation"}</dc:subject><dc:creator>${xmlEsc(author || "")}</dc:creator><cp:keywords>${xmlEsc((keywords || []).join(", "))}</cp:keywords><dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified></cp:coreProperties>`;
+  const types = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>`;
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>`;
+  const files = [
+    { name: "[Content_Types].xml", data: types },
+    { name: "_rels/.rels", data: rootRels },
+    { name: "docProps/core.xml", data: core },
+    { name: "word/document.xml", data: documentXml },
+    { name: "word/styles.xml", data: stylesXml },
+    { name: "word/numbering.xml", data: numberingXml },
+    { name: "word/_rels/document.xml.rels", data: rels },
+  ];
+  if (photo) files.push({ name: "word/media/photo.jpeg", data: dataUrlBytes(photo) });
+  return zipStore(files);
 }
 
 async function saveFile(filename, data, mime) {
@@ -937,7 +1362,7 @@ async function askJSON(settings, opts) {
 const SYSTEM_BASE = `Tu es le moteur d'analyse d'une plateforme personnelle de veille emploi, au service d'un candidat en poste qui garde la validation finale.
 Règles absolues :
 - Ne jamais inventer d'offre, d'entreprise, de salaire, de contact, de chiffre ou d'URL. Une information absente de la source vaut null.
-- Rester factuel, sobre, en français (sauf documents rédigés dans la langue de l'annonce).
+- Rester factuel, sobre, en français (sauf documents de candidature, rédigés dans la langue demandée).
 - Répondre UNIQUEMENT avec un objet JSON valide conforme au schéma demandé : aucun texte avant ou après, aucune balise markdown.`;
 
 const SYSTEM_TOOLS = `Tu exécutes une action précise pour l'utilisateur via les outils MCP fournis, exactement comme décrite, sans initiative supplémentaire.
@@ -963,15 +1388,20 @@ function criteriaDigest(c) {
   ].join("\n");
 }
 
+/* Employeur actuel : nommé (libellé exact du profil) ou désigné de façon générique, selon le réglage du profil. */
+const employerRule = (p) => (p?.nameEmployer === false
+  ? "Discrétion : le candidat est en poste. Dans la lettre, les messages et les réponses, désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom."
+  : "Employeur actuel : cite-le par son libellé exact tel qu'il figure dans le profil, y compris dans la lettre, les messages et les réponses.");
+
 function profileDigest(p, full = false) {
   return [
-    `Poste actuel : ${p.headline}`,
+    `Poste actuel (réellement occupé) : ${p.headline}`,
     `Domicile : ${p.home}`,
     `Résumé : ${p.summary}`,
     `Compétences : ${p.skills.join(", ")}`,
     `Expériences clés :\n${p.experiences.map((e) => `- ${e.role} — ${e.org} (${e.period}) : ${e.highlights}`).join("\n")}`,
     `Réalisations chiffrées :\n${p.achievements.map((a) => `- ${a}`).join("\n") || "(aucune renseignée)"}`,
-    `Langues : ${p.languages.map((l) => `${l.lang} (${l.level})`).join(", ")}`,
+    `Langues : ${languagesDigest(p.languages)}`,
     full && p.cvText ? `CV complet (texte) :\n${p.cvText.slice(0, 15000)}` : "",
   ].filter(Boolean).join("\n");
 }
@@ -1063,8 +1493,8 @@ Réponds uniquement avec ce JSON :
 {"scores":[{"id":"","score":0,"confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","breakdown":[{"criterion":"","kind":"indispensable|souhaité|exclusion|alerte","weight":1,"match":0,"note":""}],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
-  dossier(offer, profile, types, instruction) {
-    const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
+  dossier(offer, profile, types, instruction, docLang) {
+    const lang = docLang ? LANG_NAME[docLang] : offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
     return `Mission : préparer des documents de candidature pour l'offre ci-dessous. Le candidat relira, modifiera et validera tout : rien n'est envoyé automatiquement.
 
 OFFRE
@@ -1081,10 +1511,11 @@ ${profileDigest(profile, true)}
 DOCUMENTS DEMANDÉS : ${types.join(", ")}
 
 CONSIGNES
-- Langue : ${lang}.
+- Langue : ${lang}${docLang && offer.language && docLang !== offer.language ? ` (l'annonce est en ${LANG_NAME[offer.language]} : garde l'intitulé exact du poste tel que publié)` : ""}.
+- Le candidat n'occupe PAS le poste visé : il est actuellement « ${profile.headline} ». Parle de son poste actuel au présent ; n'écris jamais rien qui laisse croire qu'il occupe déjà le poste visé.
 - Ton naturel, précis, orienté résultats ; phrases courtes. Aucun cliché ni superlatif (« passionné », « dynamique », « force de proposition », « je me permets », « n'hésitez pas », « fort de », « motivé et rigoureux », « challenge »…).
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
-- Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
+- ${employerRule(profile)}
 - cv : CV adapté en texte brut (titre, accroche de 3 lignes, expériences réordonnées selon le poste, compétences), plus 4 à 6 points clés à mettre en avant.
 - letter : 250 à 350 mots, 3 ou 4 paragraphes, lien concret entre les réalisations et les missions.
 - linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager, personnalisé.
@@ -1096,8 +1527,11 @@ Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
 {"language":"fr|nl|en","cv":{"text":"","highlights":[]},"letter":{"text":""},"linkedin":{"text":""},"answers":{"items":[{"question":"","answer":""}]},"email":{"subject":"","body":""}}`;
   },
 
-  cvPro(offer, profile, parts, instruction) {
-    const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
+  cvPro(offer, profile, parts, instruction, docLang) {
+    const code = docLang || offer.language || null;
+    const lang = code ? LANG_NAME[code] : "celle de l'annonce (détecte-la)";
+    const ST = SECTION_TITLES[code] || SECTION_TITLES.fr;
+    const otherLang = code && offer.language && code !== offer.language;
     const contact = [profile.home, profile.email, profile.phone, profile.linkedinUrl].filter(Boolean).join(" | ") || "[à compléter : coordonnées]";
     return `Mission : produire des documents de candidature PRÊTS À ENVOYER pour l'offre ci-dessous, optimisés à la fois pour les logiciels de tri (ATS) et pour un recruteur humain qui reçoit des centaines de candidatures. Le candidat relira tout avant envoi.
 
@@ -1105,6 +1539,7 @@ OFFRE
 Intitulé : ${offer.title}
 Entreprise : ${show(offer.company)}
 Lieu : ${show(offer.location)} · Contrat : ${show(offer.contract)} · Télétravail : ${show(offer.remote)}
+Langue de l'annonce : ${offer.language ? LANG_NAME[offer.language] : "à détecter"}
 Annonce : ${show(offer.description)}
 
 PROFIL
@@ -1117,37 +1552,52 @@ Certifications : ${(profile.certifications || []).join(" ; ") || "aucune renseig
 DOCUMENTS À PRODUIRE : ${parts.join(", ")}
 
 RÈGLES DE FOND
-- Langue : ${lang}. Titres de sections standard dans cette langue (FR : Profil, Réalisations clés, Expérience professionnelle, Compétences, Langues, Formation, Certifications ; NL : Profiel, Belangrijkste realisaties, Werkervaring, Vaardigheden, Talen, Opleiding ; EN : Profile, Key achievements, Professional experience, Skills, Languages, Education).
+- Langue des documents : ${lang}. Titres de sections standard dans cette langue : ${Object.values(ST).join(", ")}.${otherLang ? `
+- L'annonce est en ${LANG_NAME[offer.language]} : garde l'intitulé exact du poste tel que publié, et les termes techniques ou outils dans leur forme de l'annonce quand ils s'emploient tels quels (CRM, Power Platform, change management…) ; traduis le reste.` : ""}
 - Vérité absolue : uniquement des faits du profil. Aucun chiffre, diplôme, outil ou résultat inventé. Manque → [à compléter : …].
-- ATS : reprends mot pour mot les termes de l'annonce quand le profil les justifie (intitulé, compétences, outils, méthodes), avec acronyme et forme longue (ex. « CRM (Customer Relationship Management) »). Mise en page à une colonne, aucun tableau. L'accroche reprend l'intitulé exact du poste.
-- Humain : proposition de valeur claire en 2 lignes pour CETTE entreprise ; 3 réalisations chiffrées en tête ; puces « verbe d'action + périmètre + résultat » ; zéro cliché ni superlatif ; phrases courtes.
+- POSTE VISÉ ≠ POSTE ACTUEL. Le candidat est actuellement « ${profile.headline} » ; il POSTULE au poste « ${offer.title} » qu'il n'occupe pas. N'écris jamais « en tant que ${offer.title} », ni aucune formule qui laisse croire qu'il occupe ou a occupé ce poste.
+- Temps : poste actuel au PRÉSENT (« Pilote… », « Dirige… »), postes précédents au passé. Dans le CV, style nominal sans « je ».
+- Humain : proposition de valeur claire pour CETTE entreprise ; 3 réalisations chiffrées en tête ; puces « verbe d'action + périmètre + résultat » ; zéro cliché ni superlatif ; phrases courtes.
 - Différenciation : relie explicitement 2 ou 3 exigences de l'annonce à des preuves du profil ; dans la lettre, ouvre sur un élément précis de l'annonce ou du contexte de l'entreprise (seulement ce que l'annonce dit, ou un fait public certain), jamais sur « je me permets de… ».
-- Organisation actuelle : reprends exactement le libellé du profil dans le CV ; dans la lettre, désigne-la de façon générique.
+- Organisation actuelle : reprends exactement le libellé du profil dans le CV. ${employerRule(profile)}
 - Longueur : CV 1 à 2 pages (550 à 800 mots), lettre 230 à 320 mots.
 ${instruction ? `- Consigne de l'utilisateur : ${instruction}` : ""}
+
+EN-TÊTE ET PROFIL DU CV (sans répétition)
+- Ligne « > » = TITRE DE POSITIONNEMENT, pas une phrase : l'intitulé exact du poste visé, puis « | » et 2 ou 3 domaines d'expertise séparés par « · ». Aucun verbe. Ex. « > Digital Transformation Manager | CRM Dynamics 365 · Automatisation · Management d'équipe ».
+- Section « ${ST.profile} » : 3 ou 4 lignes AU PRÉSENT, ancrées dans le poste réellement occupé : ce que le candidat fait aujourd'hui, son périmètre, puis ce qu'il apporte au poste visé. Ne reprend NI la ligne « > », NI les réalisations clés (le profil dit qui il est et ce qu'il apporte, les réalisations le prouvent).
+
+MOTS-CLÉS ATS (méthode objective, vérifiée ensuite automatiquement dans le texte de l'annonce)
+1. Extrais de l'annonce 15 à 25 termes sur lesquels un ATS ou un recruteur filtrerait : intitulé du poste, compétences techniques, outils et logiciels, méthodes et certifications, domaines métier, langues exigées, compétences comportementales explicitement demandées. Recopie-les MOT POUR MOT, tels qu'écrits dans l'annonce (même langue, même orthographe), sans synonyme ni reformulation, 1 à 4 mots chacun.
+2. importance : « exigé » (exigences, profil recherché, ou terme répété) ou « souhaité » (atout, « un plus »).
+3. justified : true seulement si le profil en apporte une preuve (indique-la dans evidence) ; sinon false.
+4. CV : intègre CHAQUE terme justifié, tel quel, au moins une fois, là où se trouve la preuve (profil, réalisation, puce d'expérience ou compétences) ; les termes exigés de préférence dans le profil et les réalisations. Lettre : intègre naturellement les 4 à 6 termes exigés les plus importants. N'intègre JAMAIS un terme non justifié.
+
+SECTION ${ST.languages.toUpperCase()} : recopie exactement ces lignes (calculées depuis le profil, niveaux CECR) :
+${languagesMarkup(profile.languages, code || "fr")}
 
 FORMAT DES DOCUMENTS (balisage léger, une instruction par ligne)
 CV :
 # Prénom Nom
-> Accroche reprenant l'intitulé du poste — proposition de valeur
+> Intitulé du poste visé | domaine · domaine · domaine
 @ ${contact}
-## Profil
-paragraphe de 3-4 lignes
-## Réalisations clés
+## ${ST.profile}
+paragraphe de 3-4 lignes au présent
+## ${ST.achievements}
 - réalisation chiffrée
-## Expérience professionnelle
+## ${ST.experience}
 ### Fonction | Organisation | Lieu | Période
 - puce
-## Compétences
+## ${ST.skills}
 **Groupe :** élément, élément, élément
-## Langues
-**Français :** niveau
-## Formation
+## ${ST.languages}
+**Langue :** niveau
+## ${ST.education}
 ### Diplôme | École | Année
 Lettre :
 # Prénom Nom
 @ coordonnées
-= Lieu, le JJ mois AAAA
+= Lieu, date du jour (${todayStr()}) écrite en toutes lettres dans la langue du document
 > Destinataire (service recrutement / nom si connu)
 > Entreprise
 ## Objet : candidature au poste de …
@@ -1157,7 +1607,127 @@ paragraphes séparés par une ligne vide (accroche, preuves, valeur pour l'entre
 COULEUR : accent = la couleur principale de la charte de l'entreprise en hexadécimal SEULEMENT si tu la connais avec certitude, sinon null.
 
 Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
-{"language":"fr|nl|en","accent":"#RRGGBB ou null","accentSource":"charte connue | null","keywords":{"fromAd":["15 à 25 termes exacts de l'annonce"],"missingInProfile":["termes de l'annonce que le profil ne permet pas de justifier"]},"cv":"<balisage>","letter":"<balisage>","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
+{"language":"fr|nl|en","accent":"#RRGGBB ou null","accentSource":"charte connue | null","keywords":[{"term":"terme exact de l'annonce","category":"intitulé|compétence|outil|méthode|domaine|soft skill|langue","importance":"exigé|souhaité","justified":true,"evidence":"preuve tirée du profil ou null"}],"cv":"<balisage>","letter":"<balisage>","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
+  },
+
+  docContext(offer, profile, code) {
+    return `OFFRE : ${offer.title} — ${show(offer.company)} (annonce en ${offer.language ? LANG_NAME[offer.language] : "langue non précisée"})
+Annonce : ${String(show(offer.description)).slice(0, 6000)}
+
+PROFIL (seule source de faits autorisée)
+${profileDigest(profile, true)}
+Formation : ${(profile.education || []).join(" ; ") || "non renseignée"}
+Certifications : ${(profile.certifications || []).join(" ; ") || "aucune"}
+
+RÈGLES
+- Langue : ${LANG_NAME[code] || "celle du texte fourni"}.
+- Vérité absolue : aucun chiffre, outil, diplôme ou résultat absent du profil. Manque → [à compléter : …].
+- Le candidat est actuellement « ${profile.headline} » et POSTULE au poste « ${offer.title} » qu'il n'occupe pas : jamais de formule qui laisse croire le contraire. Poste actuel au présent.
+- ${employerRule(profile)}
+- Aucun cliché ni superlatif ; phrases courtes ; puces « verbe d'action + périmètre + résultat ».
+- Conserve le balisage léger : # nom · > accroche/destinataire · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature.`;
+  },
+
+  rewriteBlock({ offer, profile, code, kind, fullText, block, instruction, terms }) {
+    return `Mission : réécrire UN SEUL bloc d'un${kind === "cv" ? " CV" : "e lettre de motivation"} selon la consigne, sans toucher au reste.
+
+${P.docContext(offer, profile, code)}
+
+DOCUMENT COMPLET (contexte, à ne pas réécrire)
+<<<
+${fullText}
+>>>
+
+BLOC À RÉÉCRIRE
+<<<
+${block}
+>>>
+
+CONSIGNE : ${instruction}
+${terms?.length ? `Mots-clés de l'annonce justifiés par le profil (à garder tels quels s'ils figurent déjà dans le bloc) : ${terms.join(", ")}` : ""}
+- Garde le même type de bloc (même titre de section s'il y en a un, même balisage), sans répéter ce que disent déjà les autres blocs.
+
+Réponds uniquement {"markup":"<le bloc réécrit, balisage compris>"}`;
+  },
+
+  integrateKeywords({ offer, profile, code, kind, text, terms }) {
+    return `Mission : intégrer dans ce${kind === "cv" ? " CV" : "tte lettre"} les mots-clés de l'annonce listés ci-dessous, pour les logiciels de tri (ATS), sans dégrader la lecture humaine.
+
+${P.docContext(offer, profile, code)}
+
+MOTS-CLÉS À INTÉGRER (termes exacts de l'annonce, chacun justifié par le profil ; preuve entre parenthèses)
+${terms.map((k) => `- ${k.term}${k.evidence ? ` (${k.evidence})` : ""}`).join("\n")}
+
+RÈGLES
+- Chaque terme apparaît au moins une fois, écrit EXACTEMENT comme ci-dessus, là où se trouve sa preuve (profil, réalisation, puce d'expérience, compétences).
+- Modifie le minimum : garde la structure, l'ordre, les faits et le style. Pas de liste de mots-clés plaquée en fin de document.
+- Longueur quasi identique (±10 %).
+
+DOCUMENT
+<<<
+${text}
+>>>
+
+Réponds uniquement {"markup":"<document complet révisé>"}`;
+  },
+
+  translateDoc({ type, text, subject, from, to, offer }) {
+    const isMarkup = type === "cv" || type === "letter";
+    return `Mission : produire la version ${LANG_NAME[to]} de ce document de candidature (${DOC_LABEL[type]}), actuellement en ${LANG_NAME[from] || "langue source"}.
+Poste visé : ${offer?.title || "non précisé"} (annonce en ${offer?.language ? LANG_NAME[offer.language] : "langue non précisée"}).
+
+RÈGLES
+- Traduction professionnelle et idiomatique, telle qu'un natif l'écrirait pour un recruteur belge ; pas de mot à mot.
+- Aucun ajout, aucune suppression de fait : mêmes chiffres, mêmes noms propres, mêmes dates, mêmes [à compléter : …] (traduits).
+- Garde l'intitulé exact du poste visé tel que publié dans l'annonce, ainsi que les noms d'outils, de méthodes et les termes techniques usuels tels quels (CRM, Power Platform, Dynamics 365…).
+${isMarkup ? `- Conserve EXACTEMENT le balisage, ligne par ligne (# > @ = ## ### - ** ~). Titres de sections standard en ${LANG_NAME[to]} : ${Object.values(SECTION_TITLES[to]).join(", ")}.
+- Date de la lettre (ligne « = ») : format usuel en ${LANG_NAME[to]}.` : ""}
+- Formules d'appel et de politesse usuelles en ${LANG_NAME[to]} (vouvoiement : « u » en néerlandais).
+
+${subject ? `OBJET\n<<<\n${subject}\n>>>\n` : ""}TEXTE
+<<<
+${text}
+>>>
+
+Réponds uniquement {"text":"<texte traduit>"${subject ? ',"subject":"<objet traduit>"' : ""}}`;
+  },
+
+  reviewDoc({ offer, profile, code, kind, text, blocks }) {
+    return `Mission : relire ce${kind === "cv" ? " CV" : "tte lettre de motivation"} comme le ferait un recruteur exigeant qui reçoit 200 candidatures pour ce poste, puis proposer des corrections précises et applicables.
+
+${P.docContext(offer, profile, code)}
+
+DOCUMENT (blocs numérotés)
+${blocks.map((b, i) => `[${i}] ${b.label}\n${b.source}`).join("\n\n")}
+
+GRILLE (note 0-100 par critère, commentaire de 20 mots max, factuel)
+- Adéquation à l'annonce : les exigences clés sont-elles couvertes avec des preuves ?
+- Preuves et résultats : réalisations chiffrées, périmètre, impact.
+- Clarté et concision : lecture en 30 secondes, phrases courtes, pas de répétition entre blocs.
+- Positionnement : poste actuel au présent, aucune formule laissant croire que le candidat occupe déjà le poste visé, valeur claire pour CETTE entreprise.
+- Lisibilité ATS : intitulé, termes de l'annonce, titres standard.
+
+SUGGESTIONS : 3 à 6, les plus utiles d'abord. Chacune vise UN bloc (index ci-dessus), décrit le problème et donne une consigne de réécriture directement exécutable. Jamais de suggestion qui demande d'inventer un fait ou un chiffre absent du profil : propose plutôt [à compléter : …].
+
+Réponds uniquement {"score":0,"verdict":"1 phrase","criteria":[{"name":"","score":0,"comment":""}],"suggestions":[{"block":0,"issue":"","instruction":""}]}`;
+  },
+
+  parseCv(cvText) {
+    return `Mission : structurer le CV ci-dessous en fiche profil. Recopie fidèlement, sans rien inventer ni embellir ; information absente → valeur vide.
+
+CV
+<<<
+${cvText.slice(0, 20000)}
+>>>
+
+RÈGLES
+- experiences : du plus récent au plus ancien ; highlights = 1 à 3 phrases factuelles reprenant missions et résultats du CV.
+- achievements : uniquement les réalisations CHIFFRÉES présentes dans le CV, une par entrée, formulées « verbe + périmètre + résultat chiffré ».
+- languages : niveau CECR si le CV le donne ou si le libellé est explicite (langue maternelle → "native", bilingue → "C2", courant → "C1", bon niveau → "B2", intermédiaire → "B1", notions → "A2") ; sinon null.
+- education : « Diplôme | École | Année » ; certifications : intitulé exact.
+- headline : la fonction actuelle telle qu'écrite dans le CV.
+
+Réponds uniquement {"headline":"","summary":"","skills":[],"experiences":[{"role":"","org":"","period":"","highlights":""}],"achievements":[],"education":[],"certifications":[],"languages":[{"lang":"","level":null}]}`;
   },
 
   ratings(companies) {
@@ -1726,7 +2296,7 @@ function Modal({ open, onClose, title, children, footer, wide }) {
   );
 }
 
-function Drawer({ open, onClose, title, subtitle, children, headerExtra }) {
+function Drawer({ open, onClose, title, subtitle, children, headerExtra, wide }) {
   const T = useT();
   const ref = useRef(null);
   useFocusTrap(open, ref, onClose);
@@ -1734,7 +2304,7 @@ function Drawer({ open, onClose, title, subtitle, children, headerExtra }) {
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-label={title}>
       <div className="absolute inset-0" style={{ background: "rgba(12,10,9,0.25)" }} onClick={onClose} />
-      <aside ref={ref} className={`absolute right-0 top-0 h-full w-full sm:max-w-2xl flex flex-col ${T.app}`} style={T.shadow}>
+      <aside ref={ref} className={`absolute right-0 top-0 h-full w-full ${wide ? "sm:max-w-7xl" : "sm:max-w-2xl"} flex flex-col transition-[max-width] duration-200 ${T.app}`} style={T.shadow}>
         <div className={`flex items-start justify-between gap-4 px-6 pt-6 pb-4 border-b ${T.line}`}>
           <div className="min-w-0">
             <h2 className="text-xl font-light tracking-tight leading-snug">{title}</h2>
@@ -1962,7 +2532,7 @@ export default function RadarApp() {
             mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(s.mcpTools || {}) },
             followUp: { ...DEFAULT_SETTINGS.followUp, ...(s.followUp || {}) },
           });
-          if (out.profile) setProfile({ ...DEFAULT_PROFILE, ...out.profile });
+          if (out.profile) setProfile(migrateProfile(out.profile));
           setCriteria(out.criteria?.versions?.length ? out.criteria : makeCriteriaState());
           if (out.sources) {
             const have = new Set(out.sources.map((x) => x.id));
@@ -2525,26 +3095,49 @@ export default function RadarApp() {
   const calTitle = (what, company) => (R.current.settings.discreetCalendarTitles ? `Perso · ${what}` : `${what} – ${company || "entreprise"}`);
 
   /* ── Dossier de candidature ─────────────────────────────────────── */
-  const generateDocs = (appId, types, instruction) => withBusy(`dossier:${appId}`, async () => {
+  const generateDocs = (appId, types, instruction, docLang) => withBusy(`dossier:${appId}`, async () => {
     const { settings: s, profile: p } = R.current;
     const app = R.current.apps.find((a) => a.id === appId);
     const offer = R.current.offers.find((o) => o.id === app?.offerId);
     if (!app || !offer) throw new Error("Candidature introuvable.");
+    const code = docLang || offer.language || null;
     const proParts = types.filter((t) => t === "cv" || t === "letter");
     const otherParts = types.filter((t) => !proParts.includes(t));
     const [pro, rest] = await Promise.all([
-      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction), maxTokens: 16000 }) : null,
-      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction), maxTokens: 12000 }) : null,
+      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction, code), maxTokens: 16000 }) : null,
+      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction, code), maxTokens: 12000 }) : null,
     ]);
     const data = { ...(rest?.data || {}), language: pro?.data?.language || rest?.data?.language };
+    const lang = DOC_LANGS.includes(code) ? code : DOC_LANGS.includes(data.language) ? data.language : "fr";
     const versions = {};
     if (pro?.data) {
       const d = pro.data;
       const accent = cleanHex(d.accent, null);
-      const common = { accent, accentSource: accent ? str(d.accentSource) || "suggérée" : null, keywords: (d.keywords?.fromAd || []).map(String).slice(0, 30), missingInProfile: (d.keywords?.missingInProfile || []).map(String), tips: (d.tips || []).map(String) };
+      // Rétrocompatibilité : ancien schéma { fromAd[], missingInProfile[] }.
+      const rawKw = Array.isArray(d.keywords) ? d.keywords
+        : [...(d.keywords?.fromAd || []).map((term) => ({ term, justified: true })), ...(d.keywords?.missingInProfile || []).map((term) => ({ term, justified: false }))];
+      const kw = checkKeywords(rawKw, offer.description);
+      const common = {
+        accent, accentSource: accent ? str(d.accentSource) || "suggérée" : null,
+        kw, keywords: targetTerms(kw).map((k) => k.term), missingInProfile: kw.filter((k) => !k.justified).map((k) => k.term),
+        tips: (d.tips || []).map(String), lang, design: { ...DEFAULT_DESIGN, photo: photoDefault(p, lang) },
+      };
       for (const t of proParts) {
-        const txt = typeof d[t] === "string" ? d[t].trim() : "";
-        if (txt) versions[t] = { text: txt, format: "markup", ...common, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
+        let txt = typeof d[t] === "string" ? d[t].trim() : "";
+        if (!txt) continue;
+        if (t === "cv") {
+          txt = injectLanguages(txt, p.languages, lang);
+          // Filet de sécurité ATS : un terme justifié absent du CV déclenche une passe d'intégration ciblée.
+          const missing = targetTerms(kw).filter((k) => keywordCoverage(txt, [k.term]).missing.length);
+          if (missing.length) {
+            try {
+              const r = await askJSON(s, { system: SYSTEM_BASE, prompt: P.integrateKeywords({ offer, profile: p, code: lang, kind: "cv", text: txt, terms: missing }), maxTokens: 12000 });
+              const out = str(r.data?.markup);
+              if (out && out.length > txt.length * 0.7) txt = injectLanguages(out, p.languages, lang);
+            } catch { /* le CV initial reste utilisable */ }
+          }
+        }
+        versions[t] = { text: txt, format: "markup", ...common, design: { ...common.design, photo: t === "cv" && common.design.photo }, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
       }
     }
     for (const t of otherParts) {
@@ -2556,24 +3149,93 @@ export default function RadarApp() {
       else if (t === "cv") v = { text: d.text || "", highlights: (d.highlights || []).map(String) };
       else v = { text: d.text || "" };
       if (!v.text) continue;
-      versions[t] = { ...v, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
+      versions[t] = { ...v, lang, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
     }
     if (!Object.keys(versions).length) throw new Error("Aucun document reçu de l'IA.");
     patchApp(appId, (a) => {
       const docs = { ...(a.docs || {}) };
       for (const [t, v] of Object.entries(versions)) docs[t] = [...(docs[t] || []), v];
-      const n = { ...a, docs, docLanguage: data.language || a.docLanguage };
+      const n = { ...a, docs, docLanguage: a.docLanguage || lang };
       if (["new", "retained"].includes(a.stage)) n.stage = "prep";
-      return addLogEntry(n, "doc", `Généré : ${Object.keys(versions).map((t) => DOC_LABEL[t]).join(", ")}`);
+      return addLogEntry(n, "doc", `Généré (${LANG_CODE_LABEL[lang]}) : ${Object.keys(versions).map((t) => DOC_LABEL[t]).join(", ")}`);
     });
     toast("Documents prêts à relire", "ok");
   });
 
-  const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
-    const prev = a.docs?.[type]?.slice(-1)[0];
+  const saveDocVersion = (appId, type, text, subject, extra = {}, baseId) => patchApp(appId, (a) => {
+    const list = a.docs?.[type] || [];
+    const prev = (baseId && list.find((x) => x.id === baseId)) || list.slice(-1)[0];
     const { id: _i, createdAt: _c, origin: _o, instruction: _n, ...keep } = prev || {};
-    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition" };
-    return addLogEntry({ ...a, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
+    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: extra.origin || "édition" };
+    return addLogEntry({ ...a, docs: { ...a.docs, [type]: [...list, v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (${v.origin}${v.lang ? `, ${LANG_CODE_LABEL[v.lang] || v.lang}` : ""})`);
+  });
+
+  /* Version dans une autre langue : traduction fidèle de la version choisie (modifications manuelles comprises). */
+  const translateDoc = (appId, type, baseId, to) => withBusy(`tr:${appId}:${type}`, async () => {
+    const { settings: s, profile: p } = R.current;
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    const base = app?.docs?.[type]?.find((x) => x.id === baseId);
+    if (!base) throw new Error("Version source introuvable.");
+    const from = base.lang || app.docLanguage || offerLang(offer);
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.translateDoc({ type, text: base.text, subject: base.subject, from, to, offer }), maxTokens: 12000 });
+    let text = str(data?.text);
+    if (!text) throw new Error("Aucune traduction reçue.");
+    if (type === "cv" && base.format === "markup") text = injectLanguages(text, p.languages, to);
+    const design = base.design ? { ...base.design, photo: type === "cv" && photoDefault(p, to) } : undefined;
+    saveDocVersion(appId, type, text, type === "email" ? str(data.subject) || base.subject : base.subject, { lang: to, origin: `traduction ${LANG_CODE_LABEL[from] || ""}→${LANG_CODE_LABEL[to]}`, ...(design ? { design } : {}) }, baseId);
+    toast(`Version ${LANG_CODE_LABEL[to]} prête à relire`, "ok");
+  });
+
+  /* Réécriture IA d'un bloc ou intégration de mots-clés : renvoie le texte, appliqué dans l'éditeur (annulable). */
+  const docContextOf = (appId) => {
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    if (!app || !offer) throw new Error("Candidature introuvable.");
+    return { app, offer, profile: R.current.profile, settings: R.current.settings };
+  };
+  const rewriteDocBlock = (appId, { kind, code, fullText, block, instruction, terms }) => withBusy(`blk:${appId}`, async () => {
+    const { offer, profile, settings: s } = docContextOf(appId);
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.rewriteBlock({ offer, profile, code, kind, fullText, block, instruction, terms }), maxTokens: 6000 });
+    const out = str(data?.markup);
+    if (!out) throw new Error("Aucun texte reçu.");
+    return out;
+  });
+  const integrateDocKeywords = (appId, { kind, code, text, terms }) => withBusy(`kw:${appId}`, async () => {
+    const { offer, profile, settings: s } = docContextOf(appId);
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.integrateKeywords({ offer, profile, code, kind, text, terms }), maxTokens: 12000 });
+    const out = str(data?.markup);
+    if (!out || out.length < text.length * 0.6) throw new Error("Révision incomplète : document inchangé.");
+    return kind === "cv" ? injectLanguages(out, profile.languages, code) : out;
+  });
+
+  /* Relecture « recruteur » : grille notée et suggestions applicables bloc par bloc. */
+  const reviewDoc = (appId, { kind, code, text }) => withBusy(`rev:${appId}`, async () => {
+    const { offer, profile, settings: s } = docContextOf(appId);
+    const units = splitBlocks(text, kind);
+    const blocks = units.map((u, i) => ({ label: u.kind === "head" ? "En-tête" : u.kind === "section" ? (kind === "letter" ? "Objet" : `Section « ${u.title} »`) : `Paragraphe ${i}`, source: blockSource(u) }));
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.reviewDoc({ offer, profile, code, kind, text, blocks }), maxTokens: 6000 });
+    const clamp = (x) => Math.max(0, Math.min(100, Math.round(Number(x) || 0)));
+    return {
+      score: clamp(data?.score), verdict: str(data?.verdict),
+      criteria: (data?.criteria || []).map((c) => ({ name: str(c.name) || "", score: clamp(c.score), comment: str(c.comment) || "" })).filter((c) => c.name),
+      suggestions: (data?.suggestions || []).map((x) => ({ block: Number.isInteger(x.block) && x.block >= 0 && x.block < units.length ? x.block : null, issue: str(x.issue) || "", instruction: str(x.instruction) || "" })).filter((x) => x.instruction),
+      textAt: text,
+    };
+  });
+
+  /* Profil structuré depuis le CV collé : proposition à valider champ par champ. */
+  const parseCvProfile = () => withBusy("parse-cv", async () => {
+    const { settings: s, profile: p } = R.current;
+    if (!str(p.cvText) || p.cvText.trim().length < 200) throw new Error("Collez d'abord votre CV complet (texte) dans le profil.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.parseCv(p.cvText), maxTokens: 10000 });
+    const list = (x) => (Array.isArray(x) ? x.map((y) => str(y)).filter(Boolean) : []);
+    return {
+      headline: str(data?.headline), summary: str(data?.summary), skills: list(data?.skills),
+      experiences: (data?.experiences || []).map((e) => ({ id: uid("exp"), role: str(e.role) || "", org: str(e.org) || "", period: str(e.period) || "", highlights: str(e.highlights) || "" })).filter((e) => e.role || e.org),
+      achievements: list(data?.achievements), education: list(data?.education), certifications: list(data?.certifications),
+      languages: normalizeLanguages((data?.languages || []).filter((l) => str(l?.lang)).map((l) => ({ lang: l.lang, level: l.level })), false),
+    };
   });
 
   /* ── Relances ───────────────────────────────────────────────────── */
@@ -2680,7 +3342,7 @@ export default function RadarApp() {
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
-    setProfile({ ...DEFAULT_PROFILE, ...(obj.profile || {}) });
+    setProfile(migrateProfile(obj.profile));
     setCriteria(obj.criteria?.versions?.length ? obj.criteria : makeCriteriaState());
     setSources(obj.sources || DEFAULT_SOURCES);
     setOffers(obj.offers || []);
@@ -2805,7 +3467,7 @@ export default function RadarApp() {
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, translateDoc, rewriteDocBlock, integrateDocKeywords, reviewDoc, parseCvProfile,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
@@ -3993,6 +4655,7 @@ function AppDrawer({ id, tab, setTab, onClose }) {
   return (
     <Drawer
       open
+      wide={tab === "docs" && Object.keys(app.docs || {}).length > 0}
       onClose={onClose}
       title={offer?.title || "Candidature"}
       subtitle={
@@ -4123,14 +4786,26 @@ function TrackPanel({ app, offer }) {
   );
 }
 
+function LangPicker({ value, onChange, auto, label = "Langue des documents" }) {
+  const T = useT();
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className={`text-xs font-medium ${T.muted}`}>{label}</span>
+      <Tabs value={value} onChange={onChange} tabs={[{ id: "auto", label: `Auto${auto ? ` (${LANG_CODE_LABEL[auto]})` : ""}` }, ...DOC_LANGS.map((l) => ({ id: l, label: LANG_CODE_LABEL[l] }))]} />
+    </div>
+  );
+}
+
 function DossierPanel({ app, offer }) {
   const T = useT();
   const { generateDocs, busy } = useApp();
   const [type, setType] = useState("cv");
   const [instruction, setInstruction] = useState("");
+  const [lang, setLang] = useState("auto");
   const docs = app.docs || {};
   const has = Object.keys(docs).length > 0;
   const loading = busy[`dossier:${app.id}`];
+  const adLang = offer?.language || null;
   const all = DOC_TYPES.filter((d) => docs[d.id]?.length).map((d) => {
     const v = docs[d.id].slice(-1)[0];
     return `### ${d.label}\n${v.subject ? `Objet : ${v.subject}\n` : ""}${v.text}`;
@@ -4144,12 +4819,15 @@ function DossierPanel({ app, offer }) {
       {!has ? (
         <Card className="p-6">
           {loading ? <Skeleton lines={6} /> : (
-            <>
-              <div className="text-base font-medium">Générer le dossier complet</div>
-              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV et lettre prêts à envoyer (mis en page aux couleurs de l'entreprise, mots-clés de l'annonce pour les ATS, PDF texte), message LinkedIn, réponses probables au formulaire et e-mail, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
+            <div className="space-y-4">
+              <div>
+                <div className="text-base font-medium">Générer le dossier complet</div>
+                <p className={`text-sm mt-1 ${T.muted}`}>CV et lettre prêts à envoyer (couleurs de l'entreprise, mots-clés de l'annonce vérifiés pour les ATS, PDF texte), message LinkedIn, réponses probables au formulaire et e-mail. Langue par défaut : celle de l'annonce ({adLang ? LANG_NAME[adLang] : "détectée"}). Les autres langues se créent ensuite en un clic. Tout est éditable et versionné.</p>
+              </div>
+              <LangPicker value={lang} onChange={setLang} auto={adLang} />
               <Field label="Consigne facultative"><Input value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Ex. insister sur l'automatisation, ton plus direct…" /></Field>
-              <Btn className="mt-4" variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, DOC_TYPES.map((d) => d.id), instruction)}>Générer</Btn>
-            </>
+              <Btn variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, DOC_TYPES.map((d) => d.id), instruction, lang === "auto" ? null : lang)}>Générer</Btn>
+            </div>
           )}
         </Card>
       ) : (
@@ -4158,41 +4836,56 @@ function DossierPanel({ app, offer }) {
             <div className="overflow-x-auto"><Tabs value={type} onChange={setType} tabs={DOC_TYPES.map((d) => ({ id: d.id, label: d.label, count: docs[d.id]?.length || undefined }))} /></div>
             <CopyBtn text={all} label="Copier tout le dossier" />
           </div>
-          <DocEditor key={`${app.id}-${type}`} app={app} type={type} />
+          <DocEditor key={`${app.id}-${type}`} app={app} offer={offer} type={type} />
         </>
       )}
     </div>
   );
 }
 
-/* Aperçu « papier » : toujours sur fond blanc, comme le PDF. */
-function DocPaper({ text, accent, kind }) {
+/* Aperçu « papier » : toujours sur fond blanc, comme le PDF (même police, densité et photo). */
+function DocPaper({ text, accent, kind, design, photo }) {
   const A = cleanHex(accent);
+  const ds = { ...DEFAULT_DESIGN, ...(design || {}) };
   const blocks = parseDoc(text);
-  let seenContact = false;
+  const compact = ds.density === "compact";
+  const family = ds.font === "serif" ? 'Georgia, "Times New Roman", Times, serif' : '"Inter", Helvetica, Arial, sans-serif';
+  const showPhoto = kind === "cv" && ds.photo && photo;
+  const hasContact = blocks.some((b) => b.t === "contact");
+  const firstH2 = blocks.findIndex((b) => b.t === "h2" || b.t === "h3");
+  const headEnd = kind === "cv" ? (firstH2 < 0 ? blocks.length : firstH2) : 0;
+  const render = (b, i, inHead) => {
+    if (b.t === "name") return <div key={i} style={{ color: A, fontSize: kind === "cv" ? 26 : 19, fontWeight: 700, letterSpacing: "-0.01em", lineHeight: 1.15 }}>{b.text}</div>;
+    if (b.t === "quote") return kind === "cv"
+      ? <div key={i} style={{ fontSize: 14, color: "#4a4a4a", marginTop: 4 }}>{b.text}</div>
+      : <div key={i} style={{ marginTop: 2 }}>{b.text}</div>;
+    if (b.t === "contact") return inHead
+      ? <div key={i} style={{ fontSize: 11, color: "#6b6b6b", marginTop: 4 }}>{b.text}</div>
+      : <div key={i} style={{ fontSize: 11, color: "#6b6b6b", marginTop: 4, paddingBottom: 12, borderBottom: `2px solid ${A}`, marginBottom: 14 }}>{b.text}</div>;
+    if (b.t === "date") return <div key={i} style={{ textAlign: "right", color: "#5a5a5a", margin: "8px 0 14px" }}>{b.text}</div>;
+    if (b.t === "h2") return kind === "cv"
+      ? <div key={i} style={{ color: A, fontWeight: 700, fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", margin: compact ? "12px 0 5px" : "16px 0 6px", paddingBottom: 4, borderBottom: "1px solid #e5e5e5" }}>{b.text}</div>
+      : <div key={i} style={{ fontWeight: 700, margin: "14px 0 12px" }}>{b.text}</div>;
+    if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      return <div key={i} style={{ marginTop: compact ? 6 : 8 }}><div style={{ fontWeight: 700, color: "#1f1f1f" }}>{parts[0]}</div>{parts.length > 1 && <div style={{ fontSize: 11, color: "#777" }}>{parts.slice(1).join("  ·  ")}</div>}</div>;
+    }
+    if (b.t === "bullet") return <div key={i} style={{ display: "flex", gap: 8, marginTop: compact ? 2 : 3 }}><span style={{ width: 5, height: 5, borderRadius: 9, background: A, marginTop: 7, flexShrink: 0 }} /><span>{b.text}</span></div>;
+    if (b.t === "kv") return <div key={i} style={{ marginTop: 3 }}><strong style={{ color: "#1f1f1f" }}>{b.label}</strong> {b.text}</div>;
+    if (b.t === "sign") return <div key={i} style={{ marginTop: 18, fontWeight: 700 }}>{b.text}</div>;
+    return <p key={i} style={{ margin: kind === "cv" ? "4px 0" : "0 0 12px", textAlign: kind === "cv" ? "left" : "justify" }}>{b.text}</p>;
+  };
   return (
     <div className="rounded-2xl overflow-x-auto" style={{ background: "#ffffff", color: "#2d2d2d", border: "1px solid #e7e5e4", boxShadow: "0 12px 32px -18px rgba(0,0,0,.25)" }}>
-      <div style={{ padding: "32px 34px", fontFamily: '"Inter", Helvetica, Arial, sans-serif', fontSize: 12.5, lineHeight: 1.5, minWidth: 320 }}>
-        {blocks.map((b, i) => {
-          if (b.t === "name") return <div key={i} style={{ color: A, fontSize: kind === "cv" ? 26 : 19, fontWeight: 700, letterSpacing: "-0.01em", lineHeight: 1.15 }}>{b.text}</div>;
-          if (b.t === "quote") return kind === "cv"
-            ? <div key={i} style={{ fontSize: 14, color: "#4a4a4a", marginTop: 4 }}>{b.text}</div>
-            : <div key={i} style={{ marginTop: 2 }}>{b.text}</div>;
-          if (b.t === "contact") { seenContact = true; return <div key={i} style={{ fontSize: 11, color: "#6b6b6b", marginTop: 4, paddingBottom: 12, borderBottom: `2px solid ${A}`, marginBottom: 14 }}>{b.text}</div>; }
-          if (b.t === "date") return <div key={i} style={{ textAlign: "right", color: "#5a5a5a", margin: "8px 0 14px" }}>{b.text}</div>;
-          if (b.t === "h2") return kind === "cv"
-            ? <div key={i} style={{ color: A, fontWeight: 700, fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", margin: "16px 0 6px", paddingBottom: 4, borderBottom: "1px solid #e5e5e5" }}>{b.text}</div>
-            : <div key={i} style={{ fontWeight: 700, margin: "14px 0 12px" }}>{b.text}</div>;
-          if (b.t === "h3") {
-            const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-            return <div key={i} style={{ marginTop: 8 }}><div style={{ fontWeight: 700, color: "#1f1f1f" }}>{parts[0]}</div>{parts.length > 1 && <div style={{ fontSize: 11, color: "#777" }}>{parts.slice(1).join("  ·  ")}</div>}</div>;
-          }
-          if (b.t === "bullet") return <div key={i} style={{ display: "flex", gap: 8, marginTop: 3 }}><span style={{ width: 5, height: 5, borderRadius: 9, background: A, marginTop: 7, flexShrink: 0 }} /><span>{b.text}</span></div>;
-          if (b.t === "kv") return <div key={i} style={{ marginTop: 3 }}><strong style={{ color: "#1f1f1f" }}>{b.label}</strong> {b.text}</div>;
-          if (b.t === "sign") return <div key={i} style={{ marginTop: 18, fontWeight: 700 }}>{b.text}</div>;
-          return <p key={i} style={{ margin: kind === "cv" ? "4px 0" : "0 0 12px", textAlign: kind === "cv" ? "left" : "justify" }}>{b.text}</p>;
-        })}
-        {!seenContact && kind === "cv" && blocks.length > 0 && <div style={{ fontSize: 11, color: "#b45309", marginTop: 12 }}>Coordonnées absentes : ajoutez une ligne « @ … » ou complétez votre profil.</div>}
+      <div style={{ padding: compact ? "26px 28px" : "32px 34px", fontFamily: family, fontSize: compact ? 11.5 : 12.5, lineHeight: compact ? 1.42 : 1.5, minWidth: 320 }}>
+        {headEnd > 0 && (
+          <div style={{ display: "flex", gap: 16, alignItems: "flex-start", paddingBottom: hasContact ? 12 : 0, borderBottom: hasContact ? `2px solid ${A}` : "none", marginBottom: 14 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>{blocks.slice(0, headEnd).map((b, i) => render(b, i, true))}</div>
+            {showPhoto && <img src={photo} alt="Photo du candidat" style={{ width: 92, height: 92, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} />}
+          </div>
+        )}
+        {blocks.slice(headEnd).map((b, i) => render(b, i + headEnd, false))}
+        {!hasContact && kind === "cv" && blocks.length > 0 && <div style={{ fontSize: 11, color: "#b45309", marginTop: 12 }}>Coordonnées absentes : ajoutez une ligne « @ … » ou complétez votre profil.</div>}
       </div>
     </div>
   );
@@ -4200,68 +4893,382 @@ function DocPaper({ text, accent, kind }) {
 
 const slugFile = (x) => normText(x || "").replace(/\s+/g, "-").slice(0, 40) || "document";
 
-function ProDocTools({ app, type, v, text, setText, accent, setAccent, dirty, onSave }) {
+const BLOCK_ACTIONS = {
+  cv: ["Raccourcir", "Plus percutant et chiffré", "Mieux cibler l'annonce", "Reformuler sans répétition"],
+  letter: ["Raccourcir", "Plus direct", "Mieux cibler l'annonce", "Accroche plus forte"],
+};
+const blockLabel = (u, kind) => {
+  if (u.kind === "head") return kind === "cv" ? "En-tête (nom, titre visé, coordonnées)" : "En-tête (expéditeur, date, destinataire)";
+  if (u.kind === "section") return kind === "letter" ? "Objet" : u.title || "Section";
+  return "Paragraphe";
+};
+
+/* Éditeur par blocs : chaque section (CV) ou paragraphe (lettre) se modifie, se déplace, se supprime
+   ou se réécrit par l'IA avec une consigne, sans toucher au reste. */
+function BlockEditor({ app, kind, code, text, commit, terms }) {
+  const T = useT();
+  const { rewriteDocBlock, busy, profile } = useApp();
+  const achievements = (profile.achievements || []).filter((a) => str(a) && !/\[à compléter/i.test(a));
+  // État local : la saisie garde ses retours à la ligne ; resynchronisé quand le texte change ailleurs (IA, annuler, texte brut).
+  const [units, setUnits] = useState(() => splitBlocks(text, kind));
+  const emitted = useRef(text);
+  useEffect(() => { if (text !== emitted.current) { emitted.current = text; setUnits(splitBlocks(text, kind)); } }, [text, kind]);
+  const apply = (n, push) => { setUnits(n); const t = joinBlocks(n); emitted.current = t; commit(t, push); };
+  const [aiOpen, setAiOpen] = useState(null);
+  const [instr, setInstr] = useState("");
+  const [working, setWorking] = useState(null);
+  const [addTitle, setAddTitle] = useState("");
+  const update = (i, patch) => apply(units.map((u, j) => (j === i ? { ...u, ...patch } : u)), false);
+  const move = (i, d) => { const n = [...units]; const j = i + d; if (j < 0 || j >= n.length) return; [n[i], n[j]] = [n[j], n[i]]; apply(n, true); };
+  const remove = (i) => apply(units.filter((_, j) => j !== i), true);
+  const ai = async (i, instruction) => {
+    setWorking(i);
+    const out = await rewriteDocBlock(app.id, { kind, code, fullText: text, block: blockSource(units[i]), instruction, terms });
+    setWorking(null);
+    if (!out) return;
+    apply(applyBlockOutput(units, i, out, kind), true);
+    setAiOpen(null); setInstr("");
+  };
+  const standard = Object.values(SECTION_TITLES[code] || SECTION_TITLES.fr).filter((t) => !units.some((u) => u.kind === "section" && normText(u.title) === normText(t)));
+  const addSection = () => {
+    const title = addTitle.trim();
+    if (!title) return;
+    apply([...units, { kind: "section", title, body: "- ", key: uid("blk") }], true);
+    setAddTitle("");
+  };
+  return (
+    <div className="space-y-3">
+      {units.map((u, i) => {
+        const rows = Math.min(16, Math.max(2, u.body.split("\n").length + Math.floor(u.body.length / 90)));
+        const isWorking = working === i && busy[`blk:${app.id}`];
+        return (
+          <div key={u.key} className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+            <div className="flex items-center gap-1">
+              {u.kind === "section"
+                ? <Input value={u.title} onChange={(e) => update(i, { title: e.target.value })} aria-label="Titre de section" className="h-8 font-medium" />
+                : <span className={`flex-1 text-xs font-medium ${T.muted}`}>{blockLabel(u, kind)}</span>}
+              <IconBtn icon={ArrowUp} label="Monter" onClick={() => move(i, -1)} disabled={i === 0} className="w-8 h-8 shrink-0" />
+              <IconBtn icon={ArrowDown} label="Descendre" onClick={() => move(i, 1)} disabled={i === units.length - 1} className="w-8 h-8 shrink-0" />
+              <IconBtn icon={Wand2} label="Réécrire avec l'IA" active={aiOpen === i} onClick={() => setAiOpen(aiOpen === i ? null : i)} className="w-8 h-8 shrink-0" />
+              <IconBtn icon={Trash2} label="Supprimer le bloc" onClick={() => remove(i)} className="w-8 h-8 shrink-0" />
+            </div>
+            {kind === "cv" && u.kind === "section" && achievements.length > 0 && !["profile", "skills", "languages", "education", "certifications"].includes(sectionKind(u.title)) && (
+              <Select value="" onChange={(e) => { if (e.target.value) update(i, { body: `${u.body.trim()}${u.body.trim() ? "\n" : ""}- ${e.target.value}` }); }} aria-label="Insérer une réalisation du profil" className="h-8 text-xs w-full">
+                <option value="">+ Insérer une réalisation de votre profil…</option>
+                {achievements.filter((a) => !u.body.includes(a)).map((a) => <option key={a} value={a}>{a.length > 110 ? `${a.slice(0, 110)}…` : a}</option>)}
+              </Select>
+            )}
+            {!(kind === "letter" && u.kind === "section") && (
+              <Textarea rows={rows} value={u.body} onChange={(e) => update(i, { body: e.target.value })} aria-label={blockLabel(u, kind)} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
+            )}
+            {aiOpen === i && (
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-1.5">
+                  {BLOCK_ACTIONS[kind].map((a) => <Btn key={a} size="sm" variant="ghost" disabled={!!busy[`blk:${app.id}`]} onClick={() => ai(i, a)}>{a}</Btn>)}
+                </div>
+                <div className="flex gap-2">
+                  <Input value={instr} onChange={(e) => setInstr(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && instr.trim()) ai(i, instr.trim()); }} placeholder="Votre consigne pour ce bloc…" aria-label="Consigne pour ce bloc" className="h-8" />
+                  <Btn size="sm" icon={Sparkles} loading={isWorking} disabled={!instr.trim()} onClick={() => ai(i, instr.trim())}>Réécrire</Btn>
+                </div>
+                {isWorking && <p className={`text-xs ${T.faint}`}>Réécriture en cours…</p>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div className="flex flex-wrap gap-2 items-center">
+        {kind === "cv" ? (
+          <>
+            <Input value={addTitle} onChange={(e) => setAddTitle(e.target.value)} list="std-sections" placeholder="Nouvelle section (ex. Certifications)" aria-label="Titre de la nouvelle section" className="h-9 max-w-xs" />
+            <datalist id="std-sections">{standard.map((t) => <option key={t} value={t} />)}</datalist>
+            <Btn size="sm" icon={Plus} disabled={!addTitle.trim()} onClick={addSection}>Ajouter la section</Btn>
+          </>
+        ) : <Btn size="sm" icon={Plus} onClick={() => apply([...units, { kind: "para", title: "", body: "Nouveau paragraphe", key: uid("blk") }], true)}>Ajouter un paragraphe</Btn>}
+      </div>
+    </div>
+  );
+}
+
+function AtsPanel({ app, kind, code, v, text, commit }) {
+  const T = useT();
+  const { integrateDocKeywords, busy, offers } = useApp();
+  const offer = offers.find((o) => o.id === app.offerId);
+  const kw = v.kw || (v.keywords || []).map((term) => ({ term, justified: true, importance: "exigé", inAd: null }));
+  const targets = kind === "cv" ? targetTerms(kw) : targetTerms(kw).filter((k) => k.importance === "exigé").slice(0, 6);
+  const cov = keywordCoverage(text, targets.map((k) => k.term));
+  const missing = targets.filter((k) => cov.missing.includes(k.term));
+  const req = targets.filter((k) => k.importance === "exigé");
+  const reqCov = req.filter((k) => cov.covered.includes(k.term)).length;
+  const notJustified = kw.filter((k) => !k.justified);
+  const notFound = kw.filter((k) => k.justified && k.inAd === false);
+  const otherLang = offer?.language && code && offer.language !== code;
+  const run = async (terms) => {
+    const out = await integrateDocKeywords(app.id, { kind, code, text, terms });
+    if (out) commit(out, true);
+  };
+  if (!kw.length) return null;
+  return (
+    <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Mots-clés ATS {kind === "letter" && <span className={`font-normal ${T.muted}`}>(6 principaux termes exigés)</span>}</div>
+        <div className="flex flex-wrap gap-1.5">
+          {cov.pct !== null && <Chip tone={cov.pct >= 90 ? "ok" : cov.pct >= 60 ? "warn" : "danger"}>{cov.covered.length}/{targets.length} intégrés</Chip>}
+          {kind === "cv" && req.length > 0 && <Chip tone={reqCov === req.length ? "ok" : "warn"}>exigés : {reqCov}/{req.length}</Chip>}
+        </div>
+      </div>
+      <details className={`text-xs ${T.muted}`}>
+        <summary className="cursor-pointer">Comment ces mots-clés sont choisis</summary>
+        <ol className="mt-2 space-y-1 list-decimal pl-4">
+          <li>L'IA relève dans l'annonce les termes sur lesquels un ATS filtre (intitulé, compétences, outils, méthodes, domaines, langues), recopiés mot pour mot.</li>
+          <li>Radar vérifie que chaque terme figure réellement dans le texte de l'annonce{normText(offer?.description).length < 250 ? " (annonce trop courte ici : vérification impossible, collez le texte complet pour l'activer)" : ""}.</li>
+          <li>Seuls les termes que votre profil justifie (preuve indiquée) sont intégrés au document ; les autres sont listés comme écarts, jamais ajoutés.</li>
+          <li>Le CV doit contenir chaque terme justifié ; s'il en manque après rédaction, une passe d'intégration ciblée est lancée automatiquement.</li>
+        </ol>
+      </details>
+      {otherLang && <Notice icon={Info}>Document en {LANG_NAME[code]}, annonce en {LANG_NAME[offer.language]} : la couverture baisse mécaniquement. Pour un dépôt via ATS, privilégiez la version dans la langue de l'annonce.</Notice>}
+      {cov.covered.length > 0 && <div className="flex flex-wrap gap-1.5">{targets.filter((k) => cov.covered.includes(k.term)).map((k) => <Chip key={k.term} tone="ok" title={k.evidence ? `Preuve : ${k.evidence}` : undefined}>{k.term}</Chip>)}</div>}
+      {missing.length > 0 && (
+        <div className="space-y-2">
+          <div className={`text-xs ${T.muted}`}>Justifiés par votre profil mais absents du document :</div>
+          <div className="flex flex-wrap gap-1.5">{missing.map((k) => <Chip key={k.term} tone="warn" title={k.evidence ? `Preuve : ${k.evidence}` : undefined}>{k.term}{k.importance === "exigé" ? " ·  exigé" : ""}</Chip>)}</div>
+          <Btn size="sm" variant="primary" icon={Wand2} loading={busy[`kw:${app.id}`]} onClick={() => run(missing)}>Intégrer ces mots-clés</Btn>
+        </div>
+      )}
+      {kind === "cv" && notJustified.length > 0 && <p className={`text-xs ${T.muted}`}>Demandés par l'annonce, non justifiés par votre profil (non ajoutés, à préparer pour l'entretien) : {notJustified.map((k) => k.term).join(", ")}.</p>}
+      {kind === "cv" && notFound.length > 0 && <p className={`text-xs ${T.faint}`}>Écartés car introuvables tels quels dans l'annonce : {notFound.map((k) => k.term).join(", ")}.</p>}
+    </div>
+  );
+}
+
+function PreflightPanel({ kind, text, offer, code, pages, photo }) {
+  const T = useT();
+  const { profile } = useApp();
+  const checks = useMemo(() => preflightChecks(text, kind, { profile, offer, lang: code, pages }), [text, kind, profile, offer, code, pages]);
+  const issues = checks.filter((c) => c.tone !== "ok").length;
+  const icon = { ok: "✓", warn: "⚠", danger: "✕" };
+  const color = { ok: T.muted, warn: "text-amber-700", danger: "text-rose-600" };
+  return (
+    <div className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Contrôle avant envoi</div>
+        <Chip tone={issues ? "warn" : "ok"}>{issues ? `${issues} point(s) à vérifier` : "prêt"}</Chip>
+      </div>
+      <ul className="text-xs space-y-1">
+        {checks.map((c, i) => <li key={i} className={`flex gap-2 ${color[c.tone]}`}><span aria-hidden="true">{icon[c.tone]}</span><span>{c.text}</span></li>)}
+        {kind === "cv" && <li className={`flex gap-2 ${T.muted}`}><span aria-hidden="true">✓</span><span>Une colonne, titres standard, texte sélectionnable (PDF) et styles Word natifs (.docx) : lisible par les ATS{photo ? " ; la photo est une image séparée, ignorée par les ATS" : ""}.</span></li>}
+      </ul>
+    </div>
+  );
+}
+
+/* Relecture « recruteur » par l'IA : note par critère et suggestions applicables d'un clic au bloc visé. */
+function ReviewPanel({ app, kind, code, text, commit, terms }) {
+  const T = useT();
+  const { reviewDoc, rewriteDocBlock, busy } = useApp();
+  const [rev, setRev] = useState(null);
+  const [applying, setApplying] = useState(null);
+  const [done, setDone] = useState([]);
+  const run = async () => { const r = await reviewDoc(app.id, { kind, code, text }); if (r) { setRev(r); setDone([]); } };
+  const apply = async (sug, k) => {
+    const units = splitBlocks(text, kind);
+    if (sug.block == null || !units[sug.block]) return;
+    setApplying(k);
+    const out = await rewriteDocBlock(app.id, { kind, code, fullText: text, block: blockSource(units[sug.block]), instruction: `${sug.issue ? `${sug.issue} — ` : ""}${sug.instruction}`, terms });
+    setApplying(null);
+    if (!out) return;
+    commit(joinBlocks(applyBlockOutput(units, sug.block, out, kind)), true);
+    setDone((d) => [...d, k]);
+  };
+  const stale = rev && rev.textAt !== text;
+  const tone = (x) => (x >= 75 ? "ok" : x >= 55 ? "warn" : "danger");
+  return (
+    <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Relecture recruteur (IA)</div>
+        <div className="flex items-center gap-2">
+          {rev && <Chip tone={tone(rev.score)}>{rev.score}/100</Chip>}
+          <Btn size="sm" icon={Gauge} loading={busy[`rev:${app.id}`]} onClick={run}>{rev ? "Relire à nouveau" : "Lancer la relecture"}</Btn>
+        </div>
+      </div>
+      {!rev && <p className={`text-xs ${T.muted}`}>Une grille notée (adéquation, preuves, clarté, positionnement, ATS) et 3 à 6 corrections ciblées, applicables d'un clic au bloc concerné. Chaque correction reste annulable.</p>}
+      {rev && (
+        <>
+          {rev.verdict && <p className="text-sm">{rev.verdict}</p>}
+          {stale && <p className={`text-xs ${T.faint}`}>Le document a changé depuis cette relecture.</p>}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {rev.criteria.map((c) => (
+              <div key={c.name} className="text-xs">
+                <div className="flex items-center justify-between gap-2"><span className="font-medium">{c.name}</span><Chip tone={tone(c.score)}>{c.score}</Chip></div>
+                {c.comment && <div className={T.muted}>{c.comment}</div>}
+              </div>
+            ))}
+          </div>
+          {rev.suggestions.length > 0 && (
+            <ol className="space-y-2">
+              {rev.suggestions.map((sug, k) => (
+                <li key={k} className={`rounded-xl p-3 text-sm ${T.surface}`}>
+                  {sug.issue && <div className="font-medium">{sug.issue}</div>}
+                  <div className={`text-xs mt-0.5 ${T.muted}`}>{sug.instruction}</div>
+                  <div className="mt-2">
+                    {done.includes(k) ? <Chip tone="ok">appliquée</Chip>
+                      : <Btn size="sm" variant="ghost" icon={Wand2} disabled={sug.block == null || !!busy[`blk:${app.id}`]} loading={applying === k} onClick={() => apply(sug, k)}>Appliquer</Btn>}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function DiffPanel({ prev, prevLabel, text }) {
+  const T = useT();
+  const [open, setOpen] = useState(false);
+  const diff = useMemo(() => (open ? lineDiff(prev, text) : []), [open, prev, text]);
+  const added = diff.filter((d) => d.t === "add").length, removed = diff.filter((d) => d.t === "del").length;
+  return (
+    <div className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+      <button type="button" onClick={() => setOpen(!open)} className={`text-sm font-medium flex items-center gap-2 ${T.ring} rounded`}>
+        <History className="w-4 h-4" aria-hidden="true" /> Comparer avec {prevLabel} {open && <span className={`text-xs font-normal ${T.muted}`}>+{added} / −{removed} lignes</span>}
+      </button>
+      {open && (
+        <div className="rounded-xl overflow-auto max-h-96 text-xs" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+          {diff.filter((d, i) => d.t !== "same" || diff.slice(Math.max(0, i - 1), i + 2).some((x) => x.t !== "same")).map((d, i) => (
+            <div key={i} className={`px-2 py-0.5 whitespace-pre-wrap ${d.t === "add" ? "bg-emerald-500/15" : d.t === "del" ? "bg-rose-500/15 line-through opacity-80" : T.faint}`}>
+              {d.t === "add" ? "+ " : d.t === "del" ? "− " : "  "}{d.s || " "}
+            </div>
+          ))}
+          {!added && !removed && <div className={`px-2 ${T.muted}`}>Aucune différence.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, setDesign, dirty, onSave, code, prevText, prevLabel }) {
   const T = useT();
   const { offers, profile, toast } = useApp();
-  const [mode, setMode] = useState("preview");
+  const [mode, setMode] = useState("blocks");
   const [pdfBusy, setPdfBusy] = useState(false);
+  const [pages, setPages] = useState(null);
+  const [undo, setUndo] = useState([]);
+  const [redo, setRedo] = useState([]);
+  // Aperçu à côté de l'éditeur dès que la largeur disponible le permet.
+  const boxRef = useRef(null);
+  const [side, setSide] = useState(false);
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(([e]) => setSide(e.contentRect.width >= 940));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const offer = offers.find((o) => o.id === app.offerId);
-  const cov = useMemo(() => keywordCoverage(text, v.keywords), [text, v.keywords]);
-  const placeholders = (text.match(/\[à compléter/gi) || []).length;
   const words = docPlainText(text).split(/\s+/).filter(Boolean).length;
+  const ds = { ...DEFAULT_DESIGN, ...design };
+  const pdfOpts = { accent, kind: type, design: { ...ds, photoData: profile.photo }, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: v.keywords, author: profile.name };
+  // Historique : chaque opération structurelle (IA, déplacement, suppression) est annulable.
+  const lastPush = useRef(0);
+  const commit = (next, force = false) => {
+    if (next === text) return;
+    const now = Date.now();
+    if (force || now - lastPush.current > 1500) { setUndo((u) => [...u.slice(-29), text]); setRedo([]); }
+    lastPush.current = force ? 0 : now;
+    setText(next);
+  };
+  const doUndo = () => { if (!undo.length) return; setRedo((r) => [...r, text]); setText(undo[undo.length - 1]); setUndo((u) => u.slice(0, -1)); };
+  const doRedo = () => { if (!redo.length) return; setUndo((u) => [...u, text]); setText(redo[redo.length - 1]); setRedo((r) => r.slice(0, -1)); };
+  // Nombre de pages réel, calculé sur le PDF (différé pendant la saisie).
+  const pdfKey = `${text}|${accent}|${ds.font}|${ds.density}|${ds.photo}|${(profile.photo || "").length}`;
+  useEffect(() => {
+    let off = false;
+    const t = setTimeout(() => { pdfPageCount(text, pdfOpts).then((n) => { if (!off) setPages(n); }).catch(() => { if (!off) setPages(null); }); }, 900);
+    return () => { off = true; clearTimeout(t); };
+  }, [pdfKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const maxPages = type === "cv" ? 2 : 1;
+  const [docxBusy, setDocxBusy] = useState(false);
+  const baseName = `${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}_${(code || "fr").toUpperCase()}`;
+  const downloadDocx = async () => {
+    setDocxBusy(true);
+    try {
+      const bytes = await buildDocDocx(text, { ...pdfOpts, lang: code });
+      const r = await saveFile(`${baseName}.docx`, bytes.buffer, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      if (r === "saved") toast("Fichier Word prêt", "ok");
+    } catch (e) {
+      toast(`Word impossible : ${e.message}`, "danger");
+    } finally { setDocxBusy(false); }
+  };
   const downloadPdf = async () => {
     setPdfBusy(true);
     try {
-      const data = await buildDocPdf(text, { accent, kind: type, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: v.keywords, author: profile.name });
-      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}.pdf`, data, "application/pdf");
+      const data = await buildDocPdf(text, pdfOpts);
+      const r = await saveFile(`${baseName}.pdf`, data, "application/pdf");
       if (r === "saved") toast("PDF prêt", "ok");
     } catch (e) {
       toast(`PDF impossible : ${e.message}`, "danger");
     } finally { setPdfBusy(false); }
   };
+  const editor = mode === "blocks"
+    ? <BlockEditor app={app} kind={type} code={code} text={text} commit={commit} terms={targetTerms(v.kw).map((k) => k.term)} />
+    : (
+      <div className="space-y-2">
+        <Textarea rows={26} value={text} onChange={(e) => commit(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
+        <p className={`text-xs ${T.faint}`}># nom · &gt; titre visé (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
+      </div>
+    );
+  const paper = <DocPaper text={text} accent={accent} kind={type} design={ds} photo={profile.photo} />;
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" ref={boxRef}>
       <div className="flex flex-wrap items-center gap-2">
-        <Tabs value={mode} onChange={setMode} tabs={[{ id: "preview", label: "Aperçu" }, { id: "edit", label: "Modifier le texte" }]} />
-        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}>
+        <Tabs value={mode} onChange={setMode} tabs={[{ id: "blocks", label: "Éditer par blocs" }, { id: "raw", label: "Texte brut" }, { id: "preview", label: "Aperçu" }]} />
+        <IconBtn icon={Undo2} label="Annuler" onClick={doUndo} disabled={!undo.length} className="disabled:opacity-40" />
+        <IconBtn icon={Redo2} label="Rétablir" onClick={doRedo} disabled={!redo.length} className="disabled:opacity-40" />
+        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots</span>
+        {pages !== null && <Chip tone={pages > maxPages ? "warn" : "neutral"}>{pages} page{pages > 1 ? "s" : ""}{pages > maxPages ? ` (max. ${maxPages})` : ""}</Chip>}
+      </div>
+      <div className={`flex flex-wrap items-center gap-x-4 gap-y-2 text-xs ${T.muted}`}>
+        <label className="inline-flex items-center gap-2">
           <Palette className="w-4 h-4" aria-hidden="true" /> Couleur
           <input type="color" value={cleanHex(accent)} onChange={(e) => setAccent(e.target.value)} aria-label="Couleur d'accent" style={{ width: 32, height: 24, border: "none", background: "transparent" }} />
+          {v.accentSource && <span className={T.faint}>({v.accentSource})</span>}
         </label>
-        {v.accentSource && <span className={`text-xs ${T.faint}`}>({v.accentSource})</span>}
-        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots</span>
+        <label className="inline-flex items-center gap-2">Police
+          <Select value={ds.font} onChange={(e) => setDesign({ ...ds, font: e.target.value })} className="h-8 text-xs" aria-label="Police">
+            <option value="sans">Sans serif (moderne)</option>
+            <option value="serif">Serif (classique)</option>
+          </Select>
+        </label>
+        <label className="inline-flex items-center gap-2">Densité
+          <Select value={ds.density} onChange={(e) => setDesign({ ...ds, density: e.target.value })} className="h-8 text-xs" aria-label="Densité">
+            <option value="normal">Aérée</option>
+            <option value="compact">Compacte</option>
+          </Select>
+        </label>
+        {type === "cv" && (
+          <label className="inline-flex items-center gap-2" title={profile.photo ? "" : "Ajoutez une photo dans Profil & critères"}>
+            <input type="checkbox" checked={!!ds.photo && !!profile.photo} disabled={!profile.photo} onChange={(e) => setDesign({ ...ds, photo: e.target.checked })} />
+            Photo {!profile.photo && <span className={T.faint}>(aucune dans le profil)</span>}
+          </label>
+        )}
       </div>
-      {mode === "preview" ? <DocPaper text={text} accent={accent} kind={type} /> : (
-        <>
-          <Textarea rows={22} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
-          <p className={`text-xs ${T.faint}`}># nom · &gt; accroche ou destinataire · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
-        </>
-      )}
+      {mode === "preview" ? paper : side ? (
+        <div className="grid grid-cols-2 gap-4 items-start">
+          <div className="min-w-0">{editor}</div>
+          <div className="sticky top-0 max-h-[80vh] overflow-auto">{paper}</div>
+        </div>
+      ) : editor}
       <div className="flex flex-wrap gap-2">
         <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={onSave}>Enregistrer une version</Btn>
         <Btn icon={Download} loading={pdfBusy} onClick={downloadPdf}>Télécharger le PDF</Btn>
+        <Btn icon={FileText} loading={docxBusy} onClick={downloadDocx}>Word (.docx)</Btn>
         <CopyBtn text={docPlainText(text)} label="Copier le texte (formulaires, ATS)" size="md" />
       </div>
-      {type === "cv" && (
-        <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-sm font-medium">Analyse ATS</div>
-            {cov.pct !== null && <Chip tone={cov.pct >= 75 ? "ok" : cov.pct >= 50 ? "warn" : "danger"}>{cov.pct} % des mots-clés de l'annonce</Chip>}
-          </div>
-          {cov.covered.length > 0 && <div className="flex flex-wrap gap-1.5">{cov.covered.map((k) => <Chip key={k} tone="ok">{k}</Chip>)}</div>}
-          {cov.missing.length > 0 && (
-            <div>
-              <div className={`text-xs mb-1 ${T.muted}`}>Absents du CV — ajoutez-les seulement si c'est vrai :</div>
-              <div className="flex flex-wrap gap-1.5">{cov.missing.map((k) => <Chip key={k} tone="warn">{k}</Chip>)}</div>
-            </div>
-          )}
-          {v.missingInProfile?.length > 0 && <p className={`text-xs ${T.muted}`}>Exigences non couvertes par votre profil : {v.missingInProfile.join(", ")}. À préparer pour l'entretien.</p>}
-          <ul className={`text-xs space-y-1 ${T.muted}`}>
-            <li>{placeholders ? `⚠ ${placeholders} élément(s) [à compléter] avant envoi.` : "✓ Aucun élément à compléter."}</li>
-            <li>✓ Une colonne, titres standard, texte sélectionnable dans le PDF : lisible par les ATS.</li>
-            <li>{words > 900 ? "⚠ Plus de 900 mots : visez 2 pages maximum." : "✓ Longueur adaptée (1 à 2 pages)."}</li>
-          </ul>
-        </div>
-      )}
+      <PreflightPanel kind={type} text={text} offer={offer} code={code} pages={pages} photo={!!ds.photo} />
+      <ReviewPanel app={app} kind={type} code={code} text={text} commit={commit} terms={targetTerms(v.kw).map((k) => k.term)} />
+      {prevText != null && <DiffPanel prev={prevText} prevLabel={prevLabel} text={text} />}
+      <AtsPanel app={app} kind={type} code={code} v={v} text={text} commit={commit} />
       {v.tips?.length > 0 && (
         <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
           <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
@@ -4272,30 +5279,41 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, dirty, on
   );
 }
 
-function DocEditor({ app, type }) {
+function DocEditor({ app, offer, type }) {
   const T = useT();
-  const { saveDocVersion, generateDocs, busy, settings, createGmailDraft, contacts } = useApp();
+  const { saveDocVersion, generateDocs, translateDoc, busy, settings, createGmailDraft, contacts, profile: prof } = useApp();
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
   const v = versions[idx];
+  const langOf = (x) => x?.lang || app.docLanguage || offerLang(offer);
+  const code = langOf(v);
+  const [wanted, setWanted] = useState(null);
   const [text, setText] = useState(v?.text || "");
   const [subject, setSubject] = useState(v?.subject || "");
   const [instr, setInstr] = useState("");
   const linked = contacts.filter((c) => (app.contactIds || []).includes(c.id) && c.email);
   const [to, setTo] = useState(linked[0]?.email || "");
-  useEffect(() => { setIdx(versions.length - 1); }, [versions.length]);
+  useEffect(() => { setIdx(versions.length - 1); setWanted(null); }, [versions.length]);
   const isPro = (type === "cv" || type === "letter") && v?.format === "markup";
   const [accent, setAccent] = useState(cleanHex(v?.accent));
-  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); setAccent(cleanHex(v?.accent)); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [design, setDesign] = useState({ ...DEFAULT_DESIGN, ...(v?.design || {}) });
+  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); setAccent(cleanHex(v?.accent)); setDesign({ ...DEFAULT_DESIGN, ...(v?.design || {}) }); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const loading = busy[`dossier:${app.id}`];
-  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")) || (isPro && accent !== cleanHex(v.accent)));
-  const warn = mentionsEmployer(`${subject}\n${text}`, settings.employerNames);
+  const translating = busy[`tr:${app.id}:${type}`];
+  const designChanged = isPro && JSON.stringify({ ...DEFAULT_DESIGN, ...(v.design || {}) }) !== JSON.stringify(design);
+  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")) || (isPro && accent !== cleanHex(v.accent)) || designChanged);
+  const warn = prof.nameEmployer === false ? mentionsEmployer(`${subject}\n${text}`, settings.employerNames) : [];
+  const byLang = Object.fromEntries(DOC_LANGS.map((l) => [l, versions.map((x, i) => [x, i]).filter(([x]) => langOf(x) === l).map(([, i]) => i)]));
+  const pickLang = (l) => {
+    if (byLang[l].length) { setIdx(byLang[l][byLang[l].length - 1]); setWanted(null); }
+    else setWanted(l);
+  };
 
   if (!v) {
     return (
       <Card className="p-6">
         {loading ? <Skeleton lines={5} /> : (
-          <Empty icon={FileText} title={`${DOC_LABEL[type]} non généré`} action={<Btn variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, [type])}>Générer ce document</Btn>} />
+          <Empty icon={FileText} title={`${DOC_LABEL[type]} non généré`} action={<Btn variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, [type], undefined, app.docLanguage || null)}>Générer ce document</Btn>} />
         )}
       </Card>
     );
@@ -4303,18 +5321,41 @@ function DocEditor({ app, type }) {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
-        <Select value={idx} onChange={(e) => setIdx(Number(e.target.value))} aria-label="Version" className="h-8 text-xs">
-          {versions.map((x, i) => <option key={x.id} value={i}>v{i + 1} · {x.origin} · {fmtDate(x.createdAt, { time: true })}</option>)}
+        <div role="tablist" aria-label="Langue du document" className={`inline-flex gap-1 p-1 rounded-2xl ${T.sub}`}>
+          {DOC_LANGS.map((l) => {
+            const active = (wanted || code) === l;
+            return (
+              <button key={l} type="button" role="tab" aria-selected={active} onClick={() => pickLang(l)}
+                className={`px-3 h-8 rounded-xl text-sm ${active ? `${T.navActive} font-medium` : T.muted} ${T.ring}`} style={active ? T.shadow : undefined}
+                title={byLang[l].length ? `${byLang[l].length} version(s) en ${LANG_NAME[l]}` : `Créer la version en ${LANG_NAME[l]}`}>
+                {LANG_CODE_LABEL[l]}{!byLang[l].length && <span className={T.faint}> +</span>}
+              </button>
+            );
+          })}
+        </div>
+        <Select value={idx} onChange={(e) => { setIdx(Number(e.target.value)); setWanted(null); }} aria-label="Version" className="h-8 text-xs">
+          {versions.map((x, i) => <option key={x.id} value={i}>v{i + 1} · {LANG_CODE_LABEL[langOf(x)] || "?"} · {x.origin} · {fmtDate(x.createdAt, { time: true })}</option>)}
         </Select>
         {v.instruction && <Chip>consigne : {v.instruction}</Chip>}
         {dirty && <Chip tone="warn">modifications non enregistrées</Chip>}
       </div>
+      {wanted && (
+        <Card className="p-5 space-y-3">
+          <div className="text-sm font-medium">Version {LANG_NAME[wanted]} — pas encore créée</div>
+          <p className={`text-sm ${T.muted}`}>Traduire reprend fidèlement la version affichée (v{idx + 1}, {LANG_NAME[code]}), modifications manuelles comprises. Générer repart de votre profil et de l'annonce.{dirty ? " Enregistrez d'abord vos modifications pour qu'elles soient traduites." : ""}</p>
+          <div className="flex flex-wrap gap-2">
+            <Btn variant="primary" icon={Languages} loading={translating} disabled={dirty} onClick={() => translateDoc(app.id, type, v.id, wanted)}>Traduire la v{idx + 1} en {LANG_CODE_LABEL[wanted]}</Btn>
+            <Btn icon={Sparkles} loading={loading} onClick={() => generateDocs(app.id, [type], instr, wanted)}>Générer en {LANG_CODE_LABEL[wanted]}</Btn>
+            <Btn variant="ghost" onClick={() => setWanted(null)}>Annuler</Btn>
+          </div>
+        </Card>
+      )}
       {warn.length > 0 && <Notice tone="danger" icon={AlertTriangle}>Ce document mentionne votre employeur actuel ({warn.join(", ")}). Vérifiez que c'est voulu avant toute diffusion.</Notice>}
       {isPro && !loading && (
-        <ProDocTools app={app} type={type} v={v} text={text} setText={setText} accent={accent} setAccent={setAccent} dirty={dirty}
-          onSave={() => saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource })} />
+        <ProDocTools key={v.id} app={app} type={type} v={v} code={code} prevText={idx > 0 ? versions[idx - 1].text : null} prevLabel={idx > 0 ? `v${idx} (${LANG_CODE_LABEL[langOf(versions[idx - 1])] || "?"}, ${versions[idx - 1].origin})` : ""} text={text} setText={setText} accent={accent} setAccent={setAccent} design={design} setDesign={setDesign} dirty={dirty}
+          onSave={() => saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource, design, lang: code }, v.id)} />
       )}
-      {(type === "cv" || type === "letter") && !isPro && <Notice icon={Info}>Ancien format : régénérez ce document pour obtenir la version mise en page (aperçu, analyse ATS et PDF).</Notice>}
+      {(type === "cv" || type === "letter") && !isPro && <Notice icon={Info}>Ancien format : régénérez ce document pour obtenir la version mise en page (éditeur par blocs, aperçu, analyse ATS et PDF).</Notice>}
       {type === "cv" && !isPro && v.highlights?.length > 0 && (
         <div className={`rounded-2xl p-4 ${T.sub}`}>
           <div className={`text-xs font-medium mb-2 ${T.muted}`}>Points clés à mettre en avant</div>
@@ -4337,13 +5378,13 @@ function DocEditor({ app, type }) {
         <p className={`text-xs ${text.length > 300 ? "text-rose-600" : T.faint}`}>{text.length} / 300 caractères (limite d'une invitation). Envoi manuel depuis LinkedIn : aucune automatisation possible.</p>
       )}
       {!isPro && <div className="flex flex-wrap gap-2">
-        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={() => saveDocVersion(app.id, type, text, type === "email" ? subject : undefined)}>Enregistrer une version</Btn>
+        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={() => saveDocVersion(app.id, type, text, type === "email" ? subject : undefined, { lang: code }, v.id)}>Enregistrer une version</Btn>
         <CopyBtn text={type === "email" ? `Objet : ${subject}\n\n${text}` : text} size="md" />
         {type === "email" && <Btn icon={Mail} loading={busy["gmail-draft"]} onClick={() => createGmailDraft({ to, subject, body: text, appId: app.id })}>Créer le brouillon Gmail</Btn>}
       </div>}
       <div className={`flex flex-col sm:flex-row gap-2 pt-4 border-t ${T.line}`}>
-        <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Consigne de régénération (facultatif) : plus court, plus orienté résultats…" aria-label="Consigne de régénération" />
-        <Btn icon={RefreshCw} loading={loading} onClick={() => generateDocs(app.id, [type], instr)}>Régénérer</Btn>
+        <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder={`Consigne de régénération complète en ${LANG_CODE_LABEL[code]} (facultatif) : plus court, plus orienté résultats…`} aria-label="Consigne de régénération" />
+        <Btn icon={RefreshCw} loading={loading} onClick={() => generateDocs(app.id, [type], instr, code)}>Régénérer</Btn>
       </div>
     </div>
   );
@@ -4560,7 +5601,7 @@ function AssistantView() {
           <SectionTitle>Ce que l'assistant fait — et ne fait pas</SectionTitle>
           <ul className="space-y-3 text-sm">
             {[
-              [true, "CV adapté, lettre, message LinkedIn, réponses au formulaire, e-mail — dans la langue de l'annonce"],
+              [true, "CV adapté, lettre, message LinkedIn, réponses au formulaire, e-mail — dans la langue de l'annonce, puis en FR, NL ou EN en un clic"],
               [true, "Brouillon Gmail (jamais envoyé) et rappels Google Calendar, après confirmation"],
               [true, "Versions éditables et régénérables, alerte si l'employeur actuel est cité"],
               [false, "Soumettre un formulaire sur le site de l'employeur ou d'un job board"],
@@ -5063,6 +6104,144 @@ function CriteriaEditor() {
   );
 }
 
+/* Langues : niveau CECR (référence européenne) ; le CV affiche le libellé correspondant dans sa langue. */
+function LanguagesEditor({ languages, onChange }) {
+  const T = useT();
+  const list = languages || [];
+  const up = (i, patch) => onChange(list.map((l, j) => (j === i ? { ...l, ...patch } : l)));
+  return (
+    <Card className="p-6 space-y-4">
+      <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => onChange([...list, { lang: "", code: null, level: "B2" }])}>Ajouter</Btn>}>Langues</SectionTitle>
+      <p className={`text-xs ${T.muted}`}>Niveaux du Cadre européen commun de référence (CECR). Dans chaque CV, le niveau est traduit dans la langue du document.</p>
+      <div className="space-y-2">
+        {list.map((l, i) => (
+          <div key={i} className="flex flex-wrap items-center gap-2">
+            <Select value={l.code || "other"} onChange={(e) => up(i, e.target.value === "other" ? { code: null } : { code: e.target.value, lang: LANG_NAMES[e.target.value].fr })} aria-label="Langue">
+              {Object.entries(LANG_NAMES).map(([c, n]) => <option key={c} value={c}>{n.fr}</option>)}
+              <option value="other">Autre…</option>
+            </Select>
+            {!l.code && <Input value={l.lang} onChange={(e) => up(i, { lang: e.target.value })} placeholder="Langue" aria-label="Nom de la langue" className="w-36" />}
+            <Select value={l.level || ""} onChange={(e) => up(i, { level: e.target.value || null })} aria-label="Niveau">
+              {!l.level && <option value="">Niveau…</option>}
+              {CEFR.map((c) => <option key={c} value={c}>{c === "native" ? "Langue maternelle" : `${c} · ${CEFR_HINT[c]}`}</option>)}
+            </Select>
+            <IconBtn icon={X} label="Retirer" onClick={() => onChange(list.filter((_, j) => j !== i))} />
+          </div>
+        ))}
+      </div>
+      {list.length > 0 && (
+        <div className={`rounded-2xl p-3 text-xs space-y-1 ${T.sub}`}>
+          <div className={`font-medium ${T.muted}`}>Rendu dans le CV</div>
+          {DOC_LANGS.map((c) => <div key={c}><span className={T.faint}>{LANG_CODE_LABEL[c]} · </span>{languagesMarkup(list, c).replace(/\*\*/g, "").split("\n").join(" · ")}</div>)}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/* Photo : facultative en Belgique ; usage courant en FR/NL, absente des CV anglo-saxons. */
+function PhotoEditor() {
+  const T = useT();
+  const { profile, setProfile, toast } = useApp();
+  const inputRef = useRef(null);
+  const set = (k, v) => setProfile((p) => ({ ...p, [k]: v }));
+  const onFile = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    try { set("photo", await fileToPhoto(f)); toast("Photo ajoutée", "ok"); } catch (err) { toast(err.message, "danger"); }
+  };
+  return (
+    <Card className="p-6 space-y-4">
+      <SectionTitle>Photo du CV</SectionTitle>
+      <div className="flex items-center gap-4">
+        {profile.photo
+          ? <img src={profile.photo} alt="Votre photo" className="w-20 h-20 rounded-full object-cover shrink-0" />
+          : <div className={`w-20 h-20 rounded-full shrink-0 flex items-center justify-center ${T.sub}`}><User className={`w-8 h-8 ${T.faint}`} aria-hidden="true" /></div>}
+        <div className="flex flex-wrap gap-2">
+          <Btn size="sm" icon={ImagePlus} onClick={() => inputRef.current?.click()}>{profile.photo ? "Remplacer" : "Ajouter une photo"}</Btn>
+          {profile.photo && <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => set("photo", null)}>Retirer</Btn>}
+          <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={onFile} className="hidden" />
+        </div>
+      </div>
+      <Field label="Quand l'inclure" hint="Modifiable ensuite CV par CV.">
+        <Select value={profile.photoPolicy || "auto"} onChange={(e) => set("photoPolicy", e.target.value)}>
+          <option value="auto">Automatique : CV en français ou néerlandais oui, en anglais non</option>
+          <option value="always">Toujours</option>
+          <option value="never">Jamais</option>
+        </Select>
+      </Field>
+      <div className={`text-xs space-y-1 ${T.muted}`}>
+        <p>Recommandation : en Belgique, la photo est facultative et un recruteur ne peut pas l'exiger (loi antidiscrimination de 2007). Elle aide à se faire reconnaître après un entretien, mais seuls ~2 % des recruteurs la regardent en premier (Robert Half) ; votre LinkedIn sera consulté de toute façon. Mettez-la si elle est professionnelle (fond neutre, récente, cadrage épaules) ; retirez-la pour une entreprise anglo-saxonne ou un processus à CV anonyme.</p>
+        <p>Côté ATS : la photo est une image séparée du texte dans le PDF, sans effet sur la lecture des mots-clés.</p>
+      </div>
+    </Card>
+  );
+}
+
+/* Remplit le profil à partir du CV collé : l'IA structure, vous choisissez champ par champ ce qui est repris. */
+const CV_FIELDS = [
+  { id: "headline", label: "Poste actuel" }, { id: "summary", label: "Résumé" }, { id: "skills", label: "Compétences" },
+  { id: "experiences", label: "Expériences" }, { id: "achievements", label: "Réalisations chiffrées" },
+  { id: "education", label: "Formation" }, { id: "certifications", label: "Certifications" }, { id: "languages", label: "Langues" },
+];
+function CvImport() {
+  const T = useT();
+  const { parseCvProfile, setProfile, busy, toast } = useApp();
+  const [prop, setProp] = useState(null);
+  const [pick, setPick] = useState({});
+  const run = async () => {
+    const r = await parseCvProfile();
+    if (!r) return;
+    setProp(r);
+    setPick(Object.fromEntries(CV_FIELDS.map((f) => [f.id, Array.isArray(r[f.id]) ? r[f.id].length > 0 : !!r[f.id]])));
+  };
+  const preview = (id, v) => {
+    if (id === "experiences") return v.map((e) => `${e.role} — ${e.org} (${e.period || "?"})`).join(" · ");
+    if (id === "languages") return languagesDigest(v);
+    return Array.isArray(v) ? v.join(" · ") : v;
+  };
+  const apply = () => {
+    setProfile((p) => {
+      const n = { ...p };
+      for (const f of CV_FIELDS) if (pick[f.id] && prop[f.id] && (!Array.isArray(prop[f.id]) || prop[f.id].length)) n[f.id] = prop[f.id];
+      return n;
+    });
+    toast("Profil mis à jour depuis votre CV", "ok");
+    setProp(null);
+  };
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Btn icon={Wand2} loading={busy["parse-cv"]} onClick={run}>Structurer mon profil depuis ce CV</Btn>
+        <span className={`text-xs ${T.muted}`}>L'IA recopie sans inventer ; vous choisissez ce qui remplace votre profil actuel.</span>
+      </div>
+      {prop && (
+        <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+          <div className="text-sm font-medium">Proposition à valider</div>
+          {CV_FIELDS.map((f) => {
+            const v = prop[f.id];
+            const empty = !v || (Array.isArray(v) && !v.length);
+            return (
+              <label key={f.id} className={`flex gap-3 items-start text-sm ${empty ? "opacity-50" : ""}`}>
+                <input type="checkbox" className="mt-1" disabled={empty} checked={!!pick[f.id] && !empty} onChange={(e) => setPick({ ...pick, [f.id]: e.target.checked })} />
+                <span className="min-w-0">
+                  <span className="font-medium">{f.label}</span>{Array.isArray(v) && !empty && <span className={T.faint}> ({v.length})</span>}
+                  <span className={`block text-xs ${T.muted} line-clamp-3`}>{empty ? "rien trouvé dans le CV" : preview(f.id, v)}</span>
+                </span>
+              </label>
+            );
+          })}
+          <div className="flex gap-2">
+            <Btn variant="primary" icon={Check} onClick={apply} disabled={!Object.values(pick).some(Boolean)}>Remplacer les champs cochés</Btn>
+            <Btn variant="ghost" onClick={() => setProp(null)}>Annuler</Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProfileEditor() {
   const T = useT();
   const { profile, setProfile } = useApp();
@@ -5081,15 +6260,13 @@ function ProfileEditor() {
           <Field label="Téléphone"><Input value={profile.phone || ""} onChange={(e) => set("phone", e.target.value)} /></Field>
           <Field label="URL LinkedIn"><Input value={profile.linkedinUrl || ""} onChange={(e) => set("linkedinUrl", e.target.value)} /></Field>
         </div>
+        <Toggle checked={profile.nameEmployer !== false} onChange={(v) => set("nameEmployer", v)} label="Nommer mon employeur actuel dans la lettre et les messages"
+          description="Désactivé : il est désigné de façon générique (« une fédération patronale belge ») et une alerte signale toute mention de son nom. Le CV reprend toujours le libellé de vos expériences." />
         <Field label="Résumé"><Textarea rows={5} value={profile.summary} onChange={(e) => set("summary", e.target.value)} /></Field>
         <Field label="Compétences"><ChipInput values={profile.skills} onChange={(v) => set("skills", v)} placeholder="Ajouter une compétence…" /></Field>
-        <Field label="Langues" hint="Format : langue (niveau), séparées par des virgules">
-          <Input
-            value={profile.languages.map((l) => `${l.lang} (${l.level})`).join(", ")}
-            onChange={(e) => set("languages", e.target.value.split(",").map((s) => s.trim()).filter(Boolean).map((s) => { const m = s.match(/^(.*?)\s*\((.*)\)\s*$/); return m ? { lang: m[1], level: m[2] } : { lang: s, level: NC }; }))}
-          />
-        </Field>
       </Card>
+      <LanguagesEditor languages={profile.languages} onChange={(v) => set("languages", v)} />
+      <PhotoEditor />
       <Card className="p-6 space-y-4">
         <SectionTitle>Réalisations chiffrées</SectionTitle>
         <p className={`text-xs ${T.muted}`}>Base factuelle de tous les documents générés : l'IA n'invente aucun chiffre, elle marque les manques « [à compléter] ».</p>
@@ -5120,9 +6297,10 @@ function ProfileEditor() {
           );
         })}
       </Card>
-      <Card className="p-6 lg:col-span-2">
+      <Card className="p-6 lg:col-span-2 space-y-4">
         <SectionTitle>CV complet (texte collé)</SectionTitle>
         <Textarea rows={14} value={profile.cvText} onChange={(e) => set("cvText", e.target.value)} placeholder="Collez ici votre CV en texte brut. Il sert de base aux CV adaptés, lettres et exemples STAR." />
+        <CvImport />
       </Card>
     </div>
   );
