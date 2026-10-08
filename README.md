@@ -32,22 +32,30 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 | Scoring IA | Score 0-100, décomposition par critère, points forts, écarts, questions, drapeaux rouges avec preuve textuelle, niveau de confiance. Plafonds appliqués côté client (indispensable manquant ≤ 45, exclusion ≤ 20). Recalcul automatique quand une nouvelle version de critères est enregistrée. |
 | Vue d'ensemble | KPIs, « À faire aujourd'hui » (repriorisable par l'IA), meilleures offres, entonnoir, volume par source, score moyen par semaine. |
 | Pipeline | Kanban en 8 colonnes, glisser-déposer (ou sélecteur d'étape au clavier), clôture avec issue et motif, journal horodaté. |
-| Assistant candidature | CV adapté + points clés, lettre, message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
+| Assistant candidature | CV et lettre prêts à envoyer, message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. **Éditeur par blocs** (chaque section du CV ou paragraphe de la lettre se modifie, se déplace, se supprime ou se réécrit par l'IA avec une consigne), aperçu côte à côte, annuler / rétablir, police, densité, couleur, photo, nombre de pages réel du PDF. **Versions FR / NL / EN** : langue choisie à la génération (par défaut celle de l'annonce), puis traduction fidèle d'une version (modifications comprises) ou génération directe dans une autre langue. Chaque document est versionné par langue. |
 | Relances & agenda | Règles J+7 / J+14 après envoi et J+2 après entretien (paramétrables). Rédaction IA, brouillon Gmail, rappel dans l'agenda. **Détection des réponses des recruteurs dans Gmail** (lecture seule) : chaque réponse est proposée avec une action (journal, entretien, offre, refus) à valider ; les relances devenues inutiles sont annulées. Fiche de préparation d'entretien sourcée (web_search), STAR, questions, négociation. |
 | Contacts | Recruteurs, cabinets, hiring managers et réseau, liés aux candidatures (destinataires des brouillons). |
 | Confidentialité & données | Mode discret (aperçu + confirmation avant toute écriture Google), alerte si l'employeur actuel est cité, titres d'agenda neutres, écran masquable, export/import JSON, réinitialisation. |
+
+### CV et lettre : règles de rédaction
+
+- **En-tête sans répétition** : la ligne sous le nom est un titre de positionnement (intitulé exact du poste visé + 2 ou 3 domaines), jamais une phrase. La section *Profil* est rédigée **au présent**, à partir du poste réellement occupé ; elle ne reprend ni ce titre ni les réalisations. Une alerte s'affiche si le profil cite l'intitulé visé (risque de laisser croire que vous occupez déjà ce poste).
+- **Mots-clés ATS, méthode objective** : l'IA relève dans l'annonce 15 à 25 termes recopiés mot pour mot (intitulé, compétences, outils, méthodes, domaines, langues), classés *exigé* / *souhaité*, avec la preuve tirée du profil. Radar **vérifie** que chaque terme figure dans le texte de l'annonce (sinon il est écarté). Seuls les termes justifiés par le profil sont intégrés : tous dans le CV (une passe d'intégration ciblée est lancée automatiquement s'il en manque), les 6 principaux exigés dans la lettre. Les autres sont listés comme écarts, jamais ajoutés.
+- **Langues** : niveau CECR stocké en code (*langue maternelle*, C2 à A1). La section *Langues* du CV est recalculée depuis le profil et libellée dans la langue du document (ex. FR « langue maternelle », « courant (C1) » ; NL « moedertaal », « zeer goed (C1) » ; EN « native », « fluent (C1) »). À la migration, un niveau C2 unique devient *langue maternelle*.
+- **Photo** : facultative. Recadrée à l'import (360 px, JPEG), affichée en disque dans l'aperçu et le PDF. Politique par défaut « automatique » : oui pour un CV en français ou en néerlandais (usage belge courant), non en anglais (usage anglo-saxon). Modifiable CV par CV. La photo est une image séparée du texte : sans effet sur la lecture ATS.
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
 ```
 radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, lastWatchAt, … }
-radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText }
+radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[{lang,code,level}], photo, photoPolicy, cvText }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,
                    description, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
 radar:apps      [{ id, offerId, stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
+                 docs.cv|letter[] = { text, format:"markup", lang, design{font,density,photo}, accent, kw[{term,category,importance,justified,evidence,inAd}], keywords[], tips[], origin, … }
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
 ```
 
@@ -63,7 +71,10 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `gmail` | MCP Gmail, outils de lecture uniquement | `{offers[], messagesRead}` |
 | `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
-| `dossier` | aucun | `{language, cv, letter, linkedin, answers, email}` |
+| `cvPro` | aucun | `{language, accent, keywords[{term,category,importance,justified,evidence}], cv, letter, tips}` |
+| `dossier` | aucun | `{language, linkedin, answers, email}` |
+| `integrateKeywords`, `rewriteBlock` | aucun | `{markup}` |
+| `translateDoc` | aucun | `{text, subject}` |
 | `followUp` | aucun | `{subject, body}` |
 | `prep` | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
 | `gmailDraft` | MCP Gmail, `create_draft` uniquement | `{created, draftId}` |
