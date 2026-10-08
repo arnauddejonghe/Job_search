@@ -42,13 +42,16 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 - **En-tête sans répétition** : la ligne sous le nom est un titre de positionnement (intitulé exact du poste visé + 2 ou 3 domaines), jamais une phrase. La section *Profil* est rédigée **au présent**, à partir du poste réellement occupé ; elle ne reprend ni ce titre ni les réalisations. Une alerte s'affiche si le profil cite l'intitulé visé (risque de laisser croire que vous occupez déjà ce poste).
 - **Mots-clés ATS, méthode objective** : l'IA relève dans l'annonce 15 à 25 termes recopiés mot pour mot (intitulé, compétences, outils, méthodes, domaines, langues), classés *exigé* / *souhaité*, avec la preuve tirée du profil. Radar **vérifie** que chaque terme figure dans le texte de l'annonce (sinon il est écarté). Seuls les termes justifiés par le profil sont intégrés : tous dans le CV (une passe d'intégration ciblée est lancée automatiquement s'il en manque), les 6 principaux exigés dans la lettre. Les autres sont listés comme écarts, jamais ajoutés.
 - **Langues** : niveau CECR stocké en code (*langue maternelle*, C2 à A1). La section *Langues* du CV est recalculée depuis le profil et libellée dans la langue du document (ex. FR « langue maternelle », « courant (C1) » ; NL « moedertaal », « zeer goed (C1) » ; EN « native », « fluent (C1) »). À la migration, un niveau C2 unique devient *langue maternelle*.
+- **Style** : CV en style nominal, sans « je » (« Pilote… », « Dirige… »), poste actuel au présent.
+- **Employeur actuel** : nommé par son libellé exact dans la lettre, les messages et les réponses (réglage du profil, activé par défaut). Désactivé, il est désigné de façon générique et une alerte signale toute mention de son nom.
+- **Exports** : PDF texte (jsPDF) et **Word (.docx)** généré dans le navigateur, sans bibliothèque externe (XML WordprocessingML + archive ZIP). Le .docx reprend la mise en page (couleur, police, densité, photo), utilise les styles Word natifs (Titre 1 / Titre 2, puces) lisibles par les ATS, et reste modifiable dans Word.
 - **Photo** : facultative. Recadrée à l'import (360 px, JPEG), affichée en disque dans l'aperçu et le PDF. Politique par défaut « automatique » : oui pour un CV en français ou en néerlandais (usage belge courant), non en anglais (usage anglo-saxon). Modifiable CV par CV. La photo est une image séparée du texte : sans effet sur la lecture ATS.
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
 ```
 radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, lastWatchAt, … }
-radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[{lang,code,level}], photo, photoPolicy, cvText }
+radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[{lang,code,level}], photo, photoPolicy, nameEmployer, cvText }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,

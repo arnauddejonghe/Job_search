@@ -143,6 +143,7 @@ const DEFAULT_PROFILE = {
   langV2: true,
   photo: null,
   photoPolicy: "auto",
+  nameEmployer: true,
   cvText: "",
 };
 
@@ -802,6 +803,126 @@ async function pdfPageCount(text, opts) {
   return (await renderDocPdf(text, opts)).getNumberOfPages();
 }
 
+/* ── Word (.docx) sans bibliothèque externe : XML WordprocessingML + archive ZIP (stockage sans compression).
+   Mêmes blocs que le PDF ; titres en styles « Titre 1 / Titre 2 » et puces Word natives (lus par les ATS). */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  const d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const data = typeof f.data === "string" ? enc.encode(f.data) : f.data;
+    const crc = crc32(data);
+    const head = new DataView(new ArrayBuffer(30));
+    head.setUint32(0, 0x04034b50, true); head.setUint16(4, 20, true); head.setUint16(6, 0x0800, true); head.setUint16(8, 0, true);
+    head.setUint16(10, dosTime, true); head.setUint16(12, dosDate, true); head.setUint32(14, crc, true);
+    head.setUint32(18, data.length, true); head.setUint32(22, data.length, true); head.setUint16(26, name.length, true); head.setUint16(28, 0, true);
+    parts.push(new Uint8Array(head.buffer), name, data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x0800, true); cd.setUint16(10, 0, true);
+    cd.setUint16(12, dosTime, true); cd.setUint16(14, dosDate, true); cd.setUint32(16, crc, true);
+    cd.setUint32(20, data.length, true); cd.setUint32(24, data.length, true); cd.setUint16(28, name.length, true);
+    cd.setUint32(42, offset, true);
+    central.push(new Uint8Array(cd.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, b) => n + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
+  let p = 0;
+  for (const b of all) { out.set(b, p); p += b.length; }
+  return out;
+}
+const xmlEsc = (t) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+const dataUrlBytes = (u) => { const b = atob(String(u).split(",")[1] || ""); const a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+
+async function buildDocDocx(text, { accent, kind, title, keywords, author, design, lang }) {
+  const ds = { ...DEFAULT_DESIGN, ...(design || {}) };
+  const A = cleanHex(accent).slice(1).toUpperCase();
+  const FONT_NAME = ds.font === "serif" ? "Georgia" : "Arial";
+  const K = ds.density === "compact" ? 0.9 : 1;
+  const hp = (pt) => Math.round(pt * K * 2); // demi-points
+  const tw = (pt) => Math.round(pt * K * 20); // twips
+  const M = ds.density === "compact" ? 850 : 1020; // marges ≈ 15 / 18 mm
+  const photo = kind === "cv" && ds.photo && ds.photoData ? await circlePhoto(ds.photoData) : null;
+  const PH_MM = 28, EMU = Math.round(PH_MM * 36000);
+  const run = (t, { b, color, size, caps } = {}) => `<w:r><w:rPr>${b ? "<w:b/>" : ""}${caps ? "<w:caps/>" : ""}${color ? `<w:color w:val="${color}"/>` : ""}${size ? `<w:sz w:val="${size}"/><w:szCs w:val="${size}"/>` : ""}</w:rPr><w:t xml:space="preserve">${xmlEsc(t)}</w:t></w:r>`;
+  const para = (runs, { style, after = 4, before = 0, align, border, numbered, keepNext } = {}) => `<w:p><w:pPr>${style ? `<w:pStyle w:val="${style}"/>` : ""}${keepNext ? "<w:keepNext/>" : ""}${numbered ? '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>' : ""}${border ? `<w:pBdr><w:bottom w:val="single" w:sz="${border.sz}" w:space="${border.space}" w:color="${border.color}"/></w:pBdr>` : ""}<w:spacing w:before="${tw(before)}" w:after="${tw(after)}"/>${align ? `<w:jc w:val="${align}"/>` : ""}</w:pPr>${runs}</w:p>`;
+  const photoRun = photo ? `<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="0"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="${EMU}" cy="${EMU}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="left"/><wp:docPr id="1" name="Photo" descr="Photo du candidat"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="photo.jpeg"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdPhoto"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${EMU}" cy="${EMU}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>` : "";
+  const blocks = parseDoc(text);
+  // Hauteur estimée de l'en-tête, pour que le filet passe sous la photo.
+  const headPt = blocks.slice(0, Math.max(0, blocks.findIndex((b) => b.t === "h2"))).reduce((h, b) => {
+    if (b.t === "name") return h + 26 * K;
+    if (b.t === "quote") return h + Math.ceil(b.text.length / 52) * 16 * K;
+    if (b.t === "contact") return h + Math.ceil(b.text.length / 85) * 12 * K + 4;
+    return h;
+  }, 0);
+  const photoPt = PH_MM * 2.835;
+  const body = [];
+  let seenName = false, photoPlaced = false;
+  for (const b of blocks) {
+    if (b.t === "name") {
+      seenName = true;
+      body.push(para((!photoPlaced && photo ? photoRun : "") + run(b.text, { b: true, color: A, size: hp(kind === "cv" ? 22 : 16) }), { style: "Title", after: 1 }));
+      photoPlaced = true;
+    }
+    else if (b.t === "quote") body.push(kind === "cv" ? para(run(b.text, { color: "464646", size: hp(12) }), { after: 2 }) : para(run(b.text), { after: 0 }));
+    else if (b.t === "contact") {
+      const gap = photo ? Math.min(31, Math.max(6, Math.round(photoPt - headPt + 10))) : 4;
+      body.push(para(run(b.text, { color: "6E6E6E", size: hp(9) }), { after: 10, border: seenName ? { sz: 12, space: gap, color: A } : null }));
+    }
+    else if (b.t === "date") body.push(para(run(b.text, { color: "5A5A5A" }), { align: "right", before: 6, after: 10 }));
+    else if (b.t === "h2") body.push(kind === "cv"
+      ? para(run(b.text, { b: true, caps: true, color: A, size: hp(10.5) }), { style: "Heading1", before: 10, after: 4, border: { sz: 4, space: 2, color: "D7D7D7" }, keepNext: true })
+      : para(run(b.text, { b: true }), { before: 6, after: 10 }));
+    else if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      body.push(para(run(parts[0] || "", { b: true, color: "191919" }), { style: "Heading2", before: 5, after: 0, keepNext: true }));
+      if (parts.length > 1) body.push(para(run(parts.slice(1).join("  ·  "), { color: "737373", size: hp(9) }), { after: 2, keepNext: true }));
+    }
+    else if (b.t === "bullet") body.push(para(run(b.text), { numbered: true, after: 2 }));
+    else if (b.t === "kv") body.push(para(run(`${b.label} `, { b: true, color: "1E1E1E" }) + run(b.text), { after: 2 }));
+    else if (b.t === "sign") body.push(para(run(b.text, { b: true }), { before: 12, after: 0 }));
+    else body.push(para(run(b.text), { after: kind === "cv" ? 4 : 9, align: kind === "cv" ? undefined : "both" }));
+  }
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${body.join("")}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="${M}" w:right="${M}" w:bottom="${M}" w:left="${M}" w:header="567" w:footer="567" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${FONT_NAME}" w:hAnsi="${FONT_NAME}" w:eastAsia="${FONT_NAME}" w:cs="${FONT_NAME}"/><w:color w:val="2D2D2D"/><w:sz w:val="${hp(10)}"/><w:szCs w:val="${hp(10)}"/><w:lang w:val="${{ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE"}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="${ds.density === "compact" ? 264 : 276}" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/></w:rPr></w:style></w:styles>`;
+  const numberingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="singleLevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="284" w:hanging="227"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:color w:val="${A}"/></w:rPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>${photo ? '<Relationship Id="rIdPhoto" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/photo.jpeg"/>' : ""}</Relationships>`;
+  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${xmlEsc(title)}</dc:title><dc:subject>${kind === "cv" ? "Curriculum vitae" : "Lettre de motivation"}</dc:subject><dc:creator>${xmlEsc(author || "")}</dc:creator><cp:keywords>${xmlEsc((keywords || []).join(", "))}</cp:keywords><dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified></cp:coreProperties>`;
+  const types = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>`;
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>`;
+  const files = [
+    { name: "[Content_Types].xml", data: types },
+    { name: "_rels/.rels", data: rootRels },
+    { name: "docProps/core.xml", data: core },
+    { name: "word/document.xml", data: documentXml },
+    { name: "word/styles.xml", data: stylesXml },
+    { name: "word/numbering.xml", data: numberingXml },
+    { name: "word/_rels/document.xml.rels", data: rels },
+  ];
+  if (photo) files.push({ name: "word/media/photo.jpeg", data: dataUrlBytes(photo) });
+  return zipStore(files);
+}
+
 async function saveFile(filename, data, mime) {
   if (RT.mode === "published") {
     if (!RT.downloads) throw new Error("Téléchargement indisponible dans cette vue.");
@@ -1180,6 +1301,11 @@ function criteriaDigest(c) {
   ].join("\n");
 }
 
+/* Employeur actuel : nommé (libellé exact du profil) ou désigné de façon générique, selon le réglage du profil. */
+const employerRule = (p) => (p?.nameEmployer === false
+  ? "Discrétion : le candidat est en poste. Dans la lettre, les messages et les réponses, désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom."
+  : "Employeur actuel : cite-le par son libellé exact tel qu'il figure dans le profil, y compris dans la lettre, les messages et les réponses.");
+
 function profileDigest(p, full = false) {
   return [
     `Poste actuel (réellement occupé) : ${p.headline}`,
@@ -1302,7 +1428,7 @@ CONSIGNES
 - Le candidat n'occupe PAS le poste visé : il est actuellement « ${profile.headline} ». Parle de son poste actuel au présent ; n'écris jamais rien qui laisse croire qu'il occupe déjà le poste visé.
 - Ton naturel, précis, orienté résultats ; phrases courtes. Aucun cliché ni superlatif (« passionné », « dynamique », « force de proposition », « je me permets », « n'hésitez pas », « fort de », « motivé et rigoureux », « challenge »…).
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
-- Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
+- ${employerRule(profile)}
 - cv : CV adapté en texte brut (titre, accroche de 3 lignes, expériences réordonnées selon le poste, compétences), plus 4 à 6 points clés à mettre en avant.
 - letter : 250 à 350 mots, 3 ou 4 paragraphes, lien concret entre les réalisations et les missions.
 - linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager, personnalisé.
@@ -1346,7 +1472,7 @@ RÈGLES DE FOND
 - Temps : poste actuel au PRÉSENT (« Pilote… », « Dirige… »), postes précédents au passé. Dans le CV, style nominal sans « je ».
 - Humain : proposition de valeur claire pour CETTE entreprise ; 3 réalisations chiffrées en tête ; puces « verbe d'action + périmètre + résultat » ; zéro cliché ni superlatif ; phrases courtes.
 - Différenciation : relie explicitement 2 ou 3 exigences de l'annonce à des preuves du profil ; dans la lettre, ouvre sur un élément précis de l'annonce ou du contexte de l'entreprise (seulement ce que l'annonce dit, ou un fait public certain), jamais sur « je me permets de… ».
-- Organisation actuelle : reprends exactement le libellé du profil dans le CV ; dans la lettre, désigne-la de façon générique.
+- Organisation actuelle : reprends exactement le libellé du profil dans le CV. ${employerRule(profile)}
 - Longueur : CV 1 à 2 pages (550 à 800 mots), lettre 230 à 320 mots.
 ${instruction ? `- Consigne de l'utilisateur : ${instruction}` : ""}
 
@@ -1410,6 +1536,7 @@ RÈGLES
 - Langue : ${LANG_NAME[code] || "celle du texte fourni"}.
 - Vérité absolue : aucun chiffre, outil, diplôme ou résultat absent du profil. Manque → [à compléter : …].
 - Le candidat est actuellement « ${profile.headline} » et POSTULE au poste « ${offer.title} » qu'il n'occupe pas : jamais de formule qui laisse croire le contraire. Poste actuel au présent.
+- ${employerRule(profile)}
 - Aucun cliché ni superlatif ; phrases courtes ; puces « verbe d'action + périmètre + résultat ».
 - Conserve le balisage léger : # nom · > accroche/destinataire · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature.`;
   },
@@ -4804,11 +4931,23 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
   }, [pdfKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const maxPages = type === "cv" ? 2 : 1;
   const claim = type === "cv" && titleClaimRisk(text, offer?.title, profile.headline);
+  const [docxBusy, setDocxBusy] = useState(false);
+  const baseName = `${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}_${(code || "fr").toUpperCase()}`;
+  const downloadDocx = async () => {
+    setDocxBusy(true);
+    try {
+      const bytes = await buildDocDocx(text, { ...pdfOpts, lang: code });
+      const r = await saveFile(`${baseName}.docx`, bytes.buffer, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      if (r === "saved") toast("Fichier Word prêt", "ok");
+    } catch (e) {
+      toast(`Word impossible : ${e.message}`, "danger");
+    } finally { setDocxBusy(false); }
+  };
   const downloadPdf = async () => {
     setPdfBusy(true);
     try {
       const data = await buildDocPdf(text, pdfOpts);
-      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}_${(code || "fr").toUpperCase()}.pdf`, data, "application/pdf");
+      const r = await saveFile(`${baseName}.pdf`, data, "application/pdf");
       if (r === "saved") toast("PDF prêt", "ok");
     } catch (e) {
       toast(`PDF impossible : ${e.message}`, "danger");
@@ -4867,6 +5006,7 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
       <div className="flex flex-wrap gap-2">
         <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={onSave}>Enregistrer une version</Btn>
         <Btn icon={Download} loading={pdfBusy} onClick={downloadPdf}>Télécharger le PDF</Btn>
+        <Btn icon={FileText} loading={docxBusy} onClick={downloadDocx}>Word (.docx)</Btn>
         <CopyBtn text={docPlainText(text)} label="Copier le texte (formulaires, ATS)" size="md" />
       </div>
       <ul className={`text-xs space-y-1 ${T.muted}`}>
@@ -4887,7 +5027,7 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
 
 function DocEditor({ app, offer, type }) {
   const T = useT();
-  const { saveDocVersion, generateDocs, translateDoc, busy, settings, createGmailDraft, contacts } = useApp();
+  const { saveDocVersion, generateDocs, translateDoc, busy, settings, createGmailDraft, contacts, profile: prof } = useApp();
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
   const v = versions[idx];
@@ -4908,7 +5048,7 @@ function DocEditor({ app, offer, type }) {
   const translating = busy[`tr:${app.id}:${type}`];
   const designChanged = isPro && JSON.stringify({ ...DEFAULT_DESIGN, ...(v.design || {}) }) !== JSON.stringify(design);
   const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")) || (isPro && accent !== cleanHex(v.accent)) || designChanged);
-  const warn = mentionsEmployer(`${subject}\n${text}`, settings.employerNames);
+  const warn = prof.nameEmployer === false ? mentionsEmployer(`${subject}\n${text}`, settings.employerNames) : [];
   const byLang = Object.fromEntries(DOC_LANGS.map((l) => [l, versions.map((x, i) => [x, i]).filter(([x]) => langOf(x) === l).map(([, i]) => i)]));
   const pickLang = (l) => {
     if (byLang[l].length) { setIdx(byLang[l][byLang[l].length - 1]); setWanted(null); }
@@ -5803,6 +5943,8 @@ function ProfileEditor() {
           <Field label="Téléphone"><Input value={profile.phone || ""} onChange={(e) => set("phone", e.target.value)} /></Field>
           <Field label="URL LinkedIn"><Input value={profile.linkedinUrl || ""} onChange={(e) => set("linkedinUrl", e.target.value)} /></Field>
         </div>
+        <Toggle checked={profile.nameEmployer !== false} onChange={(v) => set("nameEmployer", v)} label="Nommer mon employeur actuel dans la lettre et les messages"
+          description="Désactivé : il est désigné de façon générique (« une fédération patronale belge ») et une alerte signale toute mention de son nom. Le CV reprend toujours le libellé de vos expériences." />
         <Field label="Résumé"><Textarea rows={5} value={profile.summary} onChange={(e) => set("summary", e.target.value)} /></Field>
         <Field label="Compétences"><ChipInput values={profile.skills} onChange={(v) => set("skills", v)} placeholder="Ajouter une compétence…" /></Field>
       </Card>
