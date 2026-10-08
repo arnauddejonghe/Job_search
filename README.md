@@ -42,6 +42,11 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 - **En-tête sans répétition** : la ligne sous le nom est un titre de positionnement (intitulé exact du poste visé + 2 ou 3 domaines), jamais une phrase. La section *Profil* est rédigée **au présent**, à partir du poste réellement occupé ; elle ne reprend ni ce titre ni les réalisations. Une alerte s'affiche si le profil cite l'intitulé visé (risque de laisser croire que vous occupez déjà ce poste).
 - **Mots-clés ATS, méthode objective** : l'IA relève dans l'annonce 15 à 25 termes recopiés mot pour mot (intitulé, compétences, outils, méthodes, domaines, langues), classés *exigé* / *souhaité*, avec la preuve tirée du profil. Radar **vérifie** que chaque terme figure dans le texte de l'annonce (sinon il est écarté). Seuls les termes justifiés par le profil sont intégrés : tous dans le CV (une passe d'intégration ciblée est lancée automatiquement s'il en manque), les 6 principaux exigés dans la lettre. Les autres sont listés comme écarts, jamais ajoutés.
 - **Langues** : niveau CECR stocké en code (*langue maternelle*, C2 à A1). La section *Langues* du CV est recalculée depuis le profil et libellée dans la langue du document (ex. FR « langue maternelle », « courant (C1) » ; NL « moedertaal », « zeer goed (C1) » ; EN « native », « fluent (C1) »). À la migration, un niveau C2 unique devient *langue maternelle*.
+- **Contrôle avant envoi** (sans IA, recalculé à chaque frappe) : éléments [à compléter], **chiffres absents de votre profil** (garde-fou anti-invention : tout pourcentage ou montant du document doit figurer dans vos réalisations, expériences ou CV collé), formules toutes faites (FR/NL/EN), coordonnées, intitulé visé cité dans le profil, longueur, entreprise citée et signature (lettre), nombre de pages.
+- **Relecture recruteur (IA)** : note sur 100 et grille (adéquation, preuves, clarté, positionnement, ATS), puis 3 à 6 corrections ciblées, chacune applicable d'un clic au bloc visé et annulable.
+- **Comparaison de versions** : différences ligne à ligne avec la version précédente (édition, traduction, régénération).
+- **Réalisations du profil** insérables d'un clic dans un bloc du CV.
+- **Profil depuis le CV collé** : l'IA structure le CV (poste, résumé, compétences, expériences, réalisations chiffrées, formation, certifications, langues CECR) ; vous cochez les champs à remplacer.
 - **Style** : CV en style nominal, sans « je » (« Pilote… », « Dirige… »), poste actuel au présent.
 - **Employeur actuel** : nommé par son libellé exact dans la lettre, les messages et les réponses (réglage du profil, activé par défaut). Désactivé, il est désigné de façon générique et une alerte signale toute mention de son nom.
 - **Exports** : PDF texte (jsPDF) et **Word (.docx)** généré dans le navigateur, sans bibliothèque externe (XML WordprocessingML + archive ZIP). Le .docx reprend la mise en page (couleur, police, densité, photo), utilise les styles Word natifs (Titre 1 / Titre 2, puces) lisibles par les ATS, et reste modifiable dans Word.
@@ -78,6 +83,8 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `dossier` | aucun | `{language, linkedin, answers, email}` |
 | `integrateKeywords`, `rewriteBlock` | aucun | `{markup}` |
 | `translateDoc` | aucun | `{text, subject}` |
+| `reviewDoc` | aucun | `{score, verdict, criteria[{name,score,comment}], suggestions[{block,issue,instruction}]}` |
+| `parseCv` | aucun | `{headline, summary, skills[], experiences[], achievements[], education[], certifications[], languages[]}` |
 | `followUp` | aucun | `{subject, body}` |
 | `prep` | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
 | `gmailDraft` | MCP Gmail, `create_draft` uniquement | `{created, draftId}` |

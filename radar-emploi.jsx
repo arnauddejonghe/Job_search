@@ -645,6 +645,93 @@ const titleClaimRisk = (text, offerTitle, headline) => {
   return !!prof && t.length > 3 && normText(prof.body).includes(t);
 };
 
+/* Contrôle avant envoi : vérifications objectives, sans IA. */
+const CLICHES = {
+  fr: ["passionné", "dynamique", "force de proposition", "je me permets", "n'hésitez pas", "fort de", "motivé et rigoureux", "challenge", "esprit d'équipe", "polyvalent", "proactif", "orienté client", "véritable", "idéalement placé"],
+  nl: ["gepassioneerd", "dynamisch", "teamplayer", "proactief", "aarzel niet", "uitdaging", "stressbestendig", "flexibel ingesteld", "resultaatgericht ingesteld"],
+  en: ["passionate", "dynamic", "go-getter", "team player", "results-driven", "self-starter", "hard-working", "think outside the box", "synergy", "do not hesitate", "detail-oriented"],
+};
+/* Chiffres du document absents du profil : « 30 % », « 1 200 », « 4 personnes »… (années, téléphone et dates exclus). */
+function numbersNotInProfile(text, profile) {
+  const corpus = [
+    profile.summary, profile.headline, profile.cvText,
+    ...(profile.achievements || []), ...(profile.skills || []), ...(profile.education || []), ...(profile.certifications || []),
+    ...(profile.experiences || []).flatMap((e) => [e.role, e.org, e.period, e.highlights]),
+  ].filter(Boolean).join(" ");
+  const norm = (x) => String(x).replace(/[\s  .']/g, "").replace(",", ".");
+  const have = new Set((corpus.match(/\d[\d\s  .,']*\d|\d/g) || []).map(norm));
+  const body = parseDoc(text).filter((b) => !["contact", "date", "name"].includes(b.t)).map((b) => `${b.label || ""} ${b.text}`).join(" \n ");
+  const found = new Set();
+  for (const m of body.matchAll(/(\d[\d\s  .,']*\d|\d)(\s?%)?/g)) {
+    const raw = m[0].trim(), n = norm(m[1]);
+    if (/^(19|20)\d\d$/.test(n)) continue; // années
+    if (n.length >= 9) continue; // téléphone, identifiants
+    if (!m[2] && n.length < 2) continue; // petits nombres isolés (« 3 réalisations »)
+    if (!have.has(n)) found.add(raw);
+  }
+  return [...found];
+}
+function preflightChecks(text, kind, { profile, offer, lang, pages }) {
+  const out = [];
+  const plain = docPlainText(text);
+  const words = plain.split(/\s+/).filter(Boolean).length;
+  const ph = (text.match(/\[à compléter|\[te vervolledigen|\[to complete/gi) || []).length;
+  out.push(ph ? { tone: "danger", text: `${ph} élément(s) [à compléter] à remplir avant envoi.` } : { tone: "ok", text: "Aucun élément à compléter." });
+  const nums = numbersNotInProfile(text, profile);
+  out.push(nums.length
+    ? { tone: "warn", text: `Chiffres absents de votre profil : ${nums.slice(0, 8).join(", ")}${nums.length > 8 ? "…" : ""}. Vérifiez qu'ils sont exacts, ou ajoutez-les à vos réalisations.` }
+    : { tone: "ok", text: "Tous les chiffres figurent dans votre profil." });
+  const hay = ` ${normText(plain)} `;
+  const cl = (CLICHES[lang] || CLICHES.fr).filter((c) => hay.includes(` ${normText(c)} `));
+  if (cl.length) out.push({ tone: "warn", text: `Formules toutes faites : ${cl.join(", ")}. Remplacez-les par un fait.` });
+  const blocks = parseDoc(text);
+  if (kind === "cv") {
+    const contact = blocks.find((b) => b.t === "contact")?.text || "";
+    out.push(/@/.test(contact) && /\d{6,}|\+\d/.test(contact.replace(/[\s.]/g, "")) ? { tone: "ok", text: "E-mail et téléphone présents dans l'en-tête." } : { tone: "warn", text: "En-tête : e-mail ou téléphone manquant (complétez votre profil)." });
+    if (titleClaimRisk(text, offer?.title, profile.headline)) out.push({ tone: "warn", text: `Le profil cite l'intitulé visé « ${offer?.title} » : vérifiez qu'il ne laisse pas croire que vous occupez déjà ce poste.` });
+    out.push(words > 900 ? { tone: "warn", text: `${words} mots : visez 550 à 800.` } : words < 350 ? { tone: "warn", text: `${words} mots : CV un peu court, ajoutez des preuves chiffrées.` } : { tone: "ok", text: `${words} mots.` });
+  } else {
+    out.push(words > 360 ? { tone: "warn", text: `${words} mots : visez 230 à 320.` } : words < 180 ? { tone: "warn", text: `${words} mots : lettre un peu courte.` } : { tone: "ok", text: `${words} mots.` });
+    if (offer?.company && !hay.includes(` ${normText(offer.company)} `)) out.push({ tone: "warn", text: `L'entreprise (${offer.company}) n'est pas citée dans la lettre.` });
+    if (!blocks.some((b) => b.t === "sign")) out.push({ tone: "warn", text: "Signature absente (ligne « ~ Prénom Nom »)." });
+  }
+  const maxPages = kind === "cv" ? 2 : 1;
+  if (pages) out.push(pages > maxPages ? { tone: "warn", text: `${pages} pages : visez ${maxPages} maximum (densité compacte, ou raccourcir un bloc).` } : { tone: "ok", text: `${pages} page${pages > 1 ? "s" : ""}.` });
+  return out;
+}
+
+/* Différence ligne à ligne entre deux versions (plus longue sous-séquence commune). */
+function lineDiff(a, b) {
+  const A = String(a || "").split("\n"), B = String(b || "").split("\n");
+  const n = A.length, m = B.length;
+  const L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) { out.push({ t: "same", s: A[i] }); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) out.push({ t: "del", s: A[i++] });
+    else out.push({ t: "add", s: B[j++] });
+  }
+  while (i < n) out.push({ t: "del", s: A[i++] });
+  while (j < m) out.push({ t: "add", s: B[j++] });
+  return out;
+}
+
+/* Remplace un bloc par la réécriture de l'IA (titre de section conservé ou mis à jour). */
+function applyBlockOutput(units, i, out, kind) {
+  const u = units[i];
+  const sec = splitBlocks(out, "cv").find((x) => x.kind === "section");
+  const n = [...units];
+  if (u.kind === "section") {
+    n[i] = kind === "letter"
+      ? { ...u, title: sec?.title || out.replace(/^##\s*/, "").split("\n")[0].trim() || u.title }
+      : { ...u, title: sec?.title || u.title, body: sec ? sec.body : out.trim() };
+  } else n[i] = { ...u, body: out.replace(/^##\s.*\n?/, "").trim() };
+  return n;
+}
+const blockSource = (u) => (u.kind === "section" ? `## ${u.title}${u.body ? `\n${u.body}` : ""}` : u.body);
+
 /* Photo : recadrage carré à l'import, puis disque sur fond blanc pour l'aperçu et le PDF. */
 function loadImage(src) {
   return new Promise((resolve, reject) => { const im = new Image(); im.onload = () => resolve(im); im.onerror = () => reject(new Error("Image illisible.")); im.src = src; });
@@ -1603,6 +1690,44 @@ ${text}
 >>>
 
 Réponds uniquement {"text":"<texte traduit>"${subject ? ',"subject":"<objet traduit>"' : ""}}`;
+  },
+
+  reviewDoc({ offer, profile, code, kind, text, blocks }) {
+    return `Mission : relire ce${kind === "cv" ? " CV" : "tte lettre de motivation"} comme le ferait un recruteur exigeant qui reçoit 200 candidatures pour ce poste, puis proposer des corrections précises et applicables.
+
+${P.docContext(offer, profile, code)}
+
+DOCUMENT (blocs numérotés)
+${blocks.map((b, i) => `[${i}] ${b.label}\n${b.source}`).join("\n\n")}
+
+GRILLE (note 0-100 par critère, commentaire de 20 mots max, factuel)
+- Adéquation à l'annonce : les exigences clés sont-elles couvertes avec des preuves ?
+- Preuves et résultats : réalisations chiffrées, périmètre, impact.
+- Clarté et concision : lecture en 30 secondes, phrases courtes, pas de répétition entre blocs.
+- Positionnement : poste actuel au présent, aucune formule laissant croire que le candidat occupe déjà le poste visé, valeur claire pour CETTE entreprise.
+- Lisibilité ATS : intitulé, termes de l'annonce, titres standard.
+
+SUGGESTIONS : 3 à 6, les plus utiles d'abord. Chacune vise UN bloc (index ci-dessus), décrit le problème et donne une consigne de réécriture directement exécutable. Jamais de suggestion qui demande d'inventer un fait ou un chiffre absent du profil : propose plutôt [à compléter : …].
+
+Réponds uniquement {"score":0,"verdict":"1 phrase","criteria":[{"name":"","score":0,"comment":""}],"suggestions":[{"block":0,"issue":"","instruction":""}]}`;
+  },
+
+  parseCv(cvText) {
+    return `Mission : structurer le CV ci-dessous en fiche profil. Recopie fidèlement, sans rien inventer ni embellir ; information absente → valeur vide.
+
+CV
+<<<
+${cvText.slice(0, 20000)}
+>>>
+
+RÈGLES
+- experiences : du plus récent au plus ancien ; highlights = 1 à 3 phrases factuelles reprenant missions et résultats du CV.
+- achievements : uniquement les réalisations CHIFFRÉES présentes dans le CV, une par entrée, formulées « verbe + périmètre + résultat chiffré ».
+- languages : niveau CECR si le CV le donne ou si le libellé est explicite (langue maternelle → "native", bilingue → "C2", courant → "C1", bon niveau → "B2", intermédiaire → "B1", notions → "A2") ; sinon null.
+- education : « Diplôme | École | Année » ; certifications : intitulé exact.
+- headline : la fonction actuelle telle qu'écrite dans le CV.
+
+Réponds uniquement {"headline":"","summary":"","skills":[],"experiences":[{"role":"","org":"","period":"","highlights":""}],"achievements":[],"education":[],"certifications":[],"languages":[{"lang":"","level":null}]}`;
   },
 
   ratings(companies) {
@@ -3084,6 +3209,35 @@ export default function RadarApp() {
     return kind === "cv" ? injectLanguages(out, profile.languages, code) : out;
   });
 
+  /* Relecture « recruteur » : grille notée et suggestions applicables bloc par bloc. */
+  const reviewDoc = (appId, { kind, code, text }) => withBusy(`rev:${appId}`, async () => {
+    const { offer, profile, settings: s } = docContextOf(appId);
+    const units = splitBlocks(text, kind);
+    const blocks = units.map((u, i) => ({ label: u.kind === "head" ? "En-tête" : u.kind === "section" ? (kind === "letter" ? "Objet" : `Section « ${u.title} »`) : `Paragraphe ${i}`, source: blockSource(u) }));
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.reviewDoc({ offer, profile, code, kind, text, blocks }), maxTokens: 6000 });
+    const clamp = (x) => Math.max(0, Math.min(100, Math.round(Number(x) || 0)));
+    return {
+      score: clamp(data?.score), verdict: str(data?.verdict),
+      criteria: (data?.criteria || []).map((c) => ({ name: str(c.name) || "", score: clamp(c.score), comment: str(c.comment) || "" })).filter((c) => c.name),
+      suggestions: (data?.suggestions || []).map((x) => ({ block: Number.isInteger(x.block) && x.block >= 0 && x.block < units.length ? x.block : null, issue: str(x.issue) || "", instruction: str(x.instruction) || "" })).filter((x) => x.instruction),
+      textAt: text,
+    };
+  });
+
+  /* Profil structuré depuis le CV collé : proposition à valider champ par champ. */
+  const parseCvProfile = () => withBusy("parse-cv", async () => {
+    const { settings: s, profile: p } = R.current;
+    if (!str(p.cvText) || p.cvText.trim().length < 200) throw new Error("Collez d'abord votre CV complet (texte) dans le profil.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.parseCv(p.cvText), maxTokens: 10000 });
+    const list = (x) => (Array.isArray(x) ? x.map((y) => str(y)).filter(Boolean) : []);
+    return {
+      headline: str(data?.headline), summary: str(data?.summary), skills: list(data?.skills),
+      experiences: (data?.experiences || []).map((e) => ({ id: uid("exp"), role: str(e.role) || "", org: str(e.org) || "", period: str(e.period) || "", highlights: str(e.highlights) || "" })).filter((e) => e.role || e.org),
+      achievements: list(data?.achievements), education: list(data?.education), certifications: list(data?.certifications),
+      languages: normalizeLanguages((data?.languages || []).filter((l) => str(l?.lang)).map((l) => ({ lang: l.lang, level: l.level })), false),
+    };
+  });
+
   /* ── Relances ───────────────────────────────────────────────────── */
   const setFollowUp = (appId, fuId, patch) => patchApp(appId, (a) => ({ ...a, followUps: (a.followUps || []).map((f) => (f.id === fuId ? { ...f, ...patch } : f)) }));
   const draftFollowUp = (appId, fuId) => withBusy(`fu:${fuId}`, async () => {
@@ -3313,7 +3467,7 @@ export default function RadarApp() {
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, translateDoc, rewriteDocBlock, integrateDocKeywords,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, translateDoc, rewriteDocBlock, integrateDocKeywords, reviewDoc, parseCvProfile,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
@@ -4753,7 +4907,8 @@ const blockLabel = (u, kind) => {
    ou se réécrit par l'IA avec une consigne, sans toucher au reste. */
 function BlockEditor({ app, kind, code, text, commit, terms }) {
   const T = useT();
-  const { rewriteDocBlock, busy } = useApp();
+  const { rewriteDocBlock, busy, profile } = useApp();
+  const achievements = (profile.achievements || []).filter((a) => str(a) && !/\[à compléter/i.test(a));
   // État local : la saisie garde ses retours à la ligne ; resynchronisé quand le texte change ailleurs (IA, annuler, texte brut).
   const [units, setUnits] = useState(() => splitBlocks(text, kind));
   const emitted = useRef(text);
@@ -4767,20 +4922,11 @@ function BlockEditor({ app, kind, code, text, commit, terms }) {
   const move = (i, d) => { const n = [...units]; const j = i + d; if (j < 0 || j >= n.length) return; [n[i], n[j]] = [n[j], n[i]]; apply(n, true); };
   const remove = (i) => apply(units.filter((_, j) => j !== i), true);
   const ai = async (i, instruction) => {
-    const u = units[i];
-    const block = u.kind === "section" ? `## ${u.title}${u.body ? `\n${u.body}` : ""}` : u.body;
     setWorking(i);
-    const out = await rewriteDocBlock(app.id, { kind, code, fullText: text, block, instruction, terms });
+    const out = await rewriteDocBlock(app.id, { kind, code, fullText: text, block: blockSource(units[i]), instruction, terms });
     setWorking(null);
     if (!out) return;
-    const sec = splitBlocks(out, "cv").find((x) => x.kind === "section");
-    const n = [...units];
-    if (u.kind === "section") {
-      n[i] = kind === "letter"
-        ? { ...u, title: sec?.title || out.replace(/^##\s*/, "").split("\n")[0].trim() || u.title }
-        : { ...u, title: sec?.title || u.title, body: sec ? sec.body : out.trim() };
-    } else n[i] = { ...u, body: out.replace(/^##\s.*\n?/, "").trim() };
-    apply(n, true);
+    apply(applyBlockOutput(units, i, out, kind), true);
     setAiOpen(null); setInstr("");
   };
   const standard = Object.values(SECTION_TITLES[code] || SECTION_TITLES.fr).filter((t) => !units.some((u) => u.kind === "section" && normText(u.title) === normText(t)));
@@ -4806,6 +4952,12 @@ function BlockEditor({ app, kind, code, text, commit, terms }) {
               <IconBtn icon={Wand2} label="Réécrire avec l'IA" active={aiOpen === i} onClick={() => setAiOpen(aiOpen === i ? null : i)} className="w-8 h-8 shrink-0" />
               <IconBtn icon={Trash2} label="Supprimer le bloc" onClick={() => remove(i)} className="w-8 h-8 shrink-0" />
             </div>
+            {kind === "cv" && u.kind === "section" && achievements.length > 0 && !["profile", "skills", "languages", "education", "certifications"].includes(sectionKind(u.title)) && (
+              <Select value="" onChange={(e) => { if (e.target.value) update(i, { body: `${u.body.trim()}${u.body.trim() ? "\n" : ""}- ${e.target.value}` }); }} aria-label="Insérer une réalisation du profil" className="h-8 text-xs w-full">
+                <option value="">+ Insérer une réalisation de votre profil…</option>
+                {achievements.filter((a) => !u.body.includes(a)).map((a) => <option key={a} value={a}>{a.length > 110 ? `${a.slice(0, 110)}…` : a}</option>)}
+              </Select>
+            )}
             {!(kind === "letter" && u.kind === "section") && (
               <Textarea rows={rows} value={u.body} onChange={(e) => update(i, { body: e.target.value })} aria-label={blockLabel(u, kind)} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
             )}
@@ -4888,7 +5040,114 @@ function AtsPanel({ app, kind, code, v, text, commit }) {
   );
 }
 
-function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, setDesign, dirty, onSave, code }) {
+function PreflightPanel({ kind, text, offer, code, pages, photo }) {
+  const T = useT();
+  const { profile } = useApp();
+  const checks = useMemo(() => preflightChecks(text, kind, { profile, offer, lang: code, pages }), [text, kind, profile, offer, code, pages]);
+  const issues = checks.filter((c) => c.tone !== "ok").length;
+  const icon = { ok: "✓", warn: "⚠", danger: "✕" };
+  const color = { ok: T.muted, warn: "text-amber-700", danger: "text-rose-600" };
+  return (
+    <div className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Contrôle avant envoi</div>
+        <Chip tone={issues ? "warn" : "ok"}>{issues ? `${issues} point(s) à vérifier` : "prêt"}</Chip>
+      </div>
+      <ul className="text-xs space-y-1">
+        {checks.map((c, i) => <li key={i} className={`flex gap-2 ${color[c.tone]}`}><span aria-hidden="true">{icon[c.tone]}</span><span>{c.text}</span></li>)}
+        {kind === "cv" && <li className={`flex gap-2 ${T.muted}`}><span aria-hidden="true">✓</span><span>Une colonne, titres standard, texte sélectionnable (PDF) et styles Word natifs (.docx) : lisible par les ATS{photo ? " ; la photo est une image séparée, ignorée par les ATS" : ""}.</span></li>}
+      </ul>
+    </div>
+  );
+}
+
+/* Relecture « recruteur » par l'IA : note par critère et suggestions applicables d'un clic au bloc visé. */
+function ReviewPanel({ app, kind, code, text, commit, terms }) {
+  const T = useT();
+  const { reviewDoc, rewriteDocBlock, busy } = useApp();
+  const [rev, setRev] = useState(null);
+  const [applying, setApplying] = useState(null);
+  const [done, setDone] = useState([]);
+  const run = async () => { const r = await reviewDoc(app.id, { kind, code, text }); if (r) { setRev(r); setDone([]); } };
+  const apply = async (sug, k) => {
+    const units = splitBlocks(text, kind);
+    if (sug.block == null || !units[sug.block]) return;
+    setApplying(k);
+    const out = await rewriteDocBlock(app.id, { kind, code, fullText: text, block: blockSource(units[sug.block]), instruction: `${sug.issue ? `${sug.issue} — ` : ""}${sug.instruction}`, terms });
+    setApplying(null);
+    if (!out) return;
+    commit(joinBlocks(applyBlockOutput(units, sug.block, out, kind)), true);
+    setDone((d) => [...d, k]);
+  };
+  const stale = rev && rev.textAt !== text;
+  const tone = (x) => (x >= 75 ? "ok" : x >= 55 ? "warn" : "danger");
+  return (
+    <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Relecture recruteur (IA)</div>
+        <div className="flex items-center gap-2">
+          {rev && <Chip tone={tone(rev.score)}>{rev.score}/100</Chip>}
+          <Btn size="sm" icon={Gauge} loading={busy[`rev:${app.id}`]} onClick={run}>{rev ? "Relire à nouveau" : "Lancer la relecture"}</Btn>
+        </div>
+      </div>
+      {!rev && <p className={`text-xs ${T.muted}`}>Une grille notée (adéquation, preuves, clarté, positionnement, ATS) et 3 à 6 corrections ciblées, applicables d'un clic au bloc concerné. Chaque correction reste annulable.</p>}
+      {rev && (
+        <>
+          {rev.verdict && <p className="text-sm">{rev.verdict}</p>}
+          {stale && <p className={`text-xs ${T.faint}`}>Le document a changé depuis cette relecture.</p>}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {rev.criteria.map((c) => (
+              <div key={c.name} className="text-xs">
+                <div className="flex items-center justify-between gap-2"><span className="font-medium">{c.name}</span><Chip tone={tone(c.score)}>{c.score}</Chip></div>
+                {c.comment && <div className={T.muted}>{c.comment}</div>}
+              </div>
+            ))}
+          </div>
+          {rev.suggestions.length > 0 && (
+            <ol className="space-y-2">
+              {rev.suggestions.map((sug, k) => (
+                <li key={k} className={`rounded-xl p-3 text-sm ${T.surface}`}>
+                  {sug.issue && <div className="font-medium">{sug.issue}</div>}
+                  <div className={`text-xs mt-0.5 ${T.muted}`}>{sug.instruction}</div>
+                  <div className="mt-2">
+                    {done.includes(k) ? <Chip tone="ok">appliquée</Chip>
+                      : <Btn size="sm" variant="ghost" icon={Wand2} disabled={sug.block == null || !!busy[`blk:${app.id}`]} loading={applying === k} onClick={() => apply(sug, k)}>Appliquer</Btn>}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function DiffPanel({ prev, prevLabel, text }) {
+  const T = useT();
+  const [open, setOpen] = useState(false);
+  const diff = useMemo(() => (open ? lineDiff(prev, text) : []), [open, prev, text]);
+  const added = diff.filter((d) => d.t === "add").length, removed = diff.filter((d) => d.t === "del").length;
+  return (
+    <div className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+      <button type="button" onClick={() => setOpen(!open)} className={`text-sm font-medium flex items-center gap-2 ${T.ring} rounded`}>
+        <History className="w-4 h-4" aria-hidden="true" /> Comparer avec {prevLabel} {open && <span className={`text-xs font-normal ${T.muted}`}>+{added} / −{removed} lignes</span>}
+      </button>
+      {open && (
+        <div className="rounded-xl overflow-auto max-h-96 text-xs" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+          {diff.filter((d, i) => d.t !== "same" || diff.slice(Math.max(0, i - 1), i + 2).some((x) => x.t !== "same")).map((d, i) => (
+            <div key={i} className={`px-2 py-0.5 whitespace-pre-wrap ${d.t === "add" ? "bg-emerald-500/15" : d.t === "del" ? "bg-rose-500/15 line-through opacity-80" : T.faint}`}>
+              {d.t === "add" ? "+ " : d.t === "del" ? "− " : "  "}{d.s || " "}
+            </div>
+          ))}
+          {!added && !removed && <div className={`px-2 ${T.muted}`}>Aucune différence.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, setDesign, dirty, onSave, code, prevText, prevLabel }) {
   const T = useT();
   const { offers, profile, toast } = useApp();
   const [mode, setMode] = useState("blocks");
@@ -4907,7 +5166,6 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
     return () => ro.disconnect();
   }, []);
   const offer = offers.find((o) => o.id === app.offerId);
-  const placeholders = (text.match(/\[à compléter/gi) || []).length;
   const words = docPlainText(text).split(/\s+/).filter(Boolean).length;
   const ds = { ...DEFAULT_DESIGN, ...design };
   const pdfOpts = { accent, kind: type, design: { ...ds, photoData: profile.photo }, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: v.keywords, author: profile.name };
@@ -4930,7 +5188,6 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
     return () => { off = true; clearTimeout(t); };
   }, [pdfKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const maxPages = type === "cv" ? 2 : 1;
-  const claim = type === "cv" && titleClaimRisk(text, offer?.title, profile.headline);
   const [docxBusy, setDocxBusy] = useState(false);
   const baseName = `${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}_${(code || "fr").toUpperCase()}`;
   const downloadDocx = async () => {
@@ -4996,7 +5253,6 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
           </label>
         )}
       </div>
-      {claim && <Notice tone="warn" icon={AlertTriangle}>Le profil cite l'intitulé visé « {offer?.title} » : vérifiez qu'il ne laisse pas croire que vous occupez déjà ce poste (vous êtes {profile.headline}).</Notice>}
       {mode === "preview" ? paper : side ? (
         <div className="grid grid-cols-2 gap-4 items-start">
           <div className="min-w-0">{editor}</div>
@@ -5009,11 +5265,9 @@ function ProDocTools({ app, type, v, text, setText, accent, setAccent, design, s
         <Btn icon={FileText} loading={docxBusy} onClick={downloadDocx}>Word (.docx)</Btn>
         <CopyBtn text={docPlainText(text)} label="Copier le texte (formulaires, ATS)" size="md" />
       </div>
-      <ul className={`text-xs space-y-1 ${T.muted}`}>
-        <li>{placeholders ? `⚠ ${placeholders} élément(s) [à compléter] avant envoi.` : "✓ Aucun élément à compléter."}</li>
-        {type === "cv" && <li>✓ Une colonne, titres standard, texte sélectionnable dans le PDF : lisible par les ATS{ds.photo ? " (la photo est une image séparée, ignorée par les ATS)" : ""}.</li>}
-        {pages !== null && <li>{pages > maxPages ? `⚠ ${pages} pages : visez ${maxPages} maximum (densité compacte, ou raccourcir un bloc).` : `✓ ${pages} page${pages > 1 ? "s" : ""}.`}</li>}
-      </ul>
+      <PreflightPanel kind={type} text={text} offer={offer} code={code} pages={pages} photo={!!ds.photo} />
+      <ReviewPanel app={app} kind={type} code={code} text={text} commit={commit} terms={targetTerms(v.kw).map((k) => k.term)} />
+      {prevText != null && <DiffPanel prev={prevText} prevLabel={prevLabel} text={text} />}
       <AtsPanel app={app} kind={type} code={code} v={v} text={text} commit={commit} />
       {v.tips?.length > 0 && (
         <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
@@ -5098,7 +5352,7 @@ function DocEditor({ app, offer, type }) {
       )}
       {warn.length > 0 && <Notice tone="danger" icon={AlertTriangle}>Ce document mentionne votre employeur actuel ({warn.join(", ")}). Vérifiez que c'est voulu avant toute diffusion.</Notice>}
       {isPro && !loading && (
-        <ProDocTools key={v.id} app={app} type={type} v={v} code={code} text={text} setText={setText} accent={accent} setAccent={setAccent} design={design} setDesign={setDesign} dirty={dirty}
+        <ProDocTools key={v.id} app={app} type={type} v={v} code={code} prevText={idx > 0 ? versions[idx - 1].text : null} prevLabel={idx > 0 ? `v${idx} (${LANG_CODE_LABEL[langOf(versions[idx - 1])] || "?"}, ${versions[idx - 1].origin})` : ""} text={text} setText={setText} accent={accent} setAccent={setAccent} design={design} setDesign={setDesign} dirty={dirty}
           onSave={() => saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource, design, lang: code }, v.id)} />
       )}
       {(type === "cv" || type === "letter") && !isPro && <Notice icon={Info}>Ancien format : régénérez ce document pour obtenir la version mise en page (éditeur par blocs, aperçu, analyse ATS et PDF).</Notice>}
@@ -5925,6 +6179,69 @@ function PhotoEditor() {
   );
 }
 
+/* Remplit le profil à partir du CV collé : l'IA structure, vous choisissez champ par champ ce qui est repris. */
+const CV_FIELDS = [
+  { id: "headline", label: "Poste actuel" }, { id: "summary", label: "Résumé" }, { id: "skills", label: "Compétences" },
+  { id: "experiences", label: "Expériences" }, { id: "achievements", label: "Réalisations chiffrées" },
+  { id: "education", label: "Formation" }, { id: "certifications", label: "Certifications" }, { id: "languages", label: "Langues" },
+];
+function CvImport() {
+  const T = useT();
+  const { parseCvProfile, setProfile, busy, toast } = useApp();
+  const [prop, setProp] = useState(null);
+  const [pick, setPick] = useState({});
+  const run = async () => {
+    const r = await parseCvProfile();
+    if (!r) return;
+    setProp(r);
+    setPick(Object.fromEntries(CV_FIELDS.map((f) => [f.id, Array.isArray(r[f.id]) ? r[f.id].length > 0 : !!r[f.id]])));
+  };
+  const preview = (id, v) => {
+    if (id === "experiences") return v.map((e) => `${e.role} — ${e.org} (${e.period || "?"})`).join(" · ");
+    if (id === "languages") return languagesDigest(v);
+    return Array.isArray(v) ? v.join(" · ") : v;
+  };
+  const apply = () => {
+    setProfile((p) => {
+      const n = { ...p };
+      for (const f of CV_FIELDS) if (pick[f.id] && prop[f.id] && (!Array.isArray(prop[f.id]) || prop[f.id].length)) n[f.id] = prop[f.id];
+      return n;
+    });
+    toast("Profil mis à jour depuis votre CV", "ok");
+    setProp(null);
+  };
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Btn icon={Wand2} loading={busy["parse-cv"]} onClick={run}>Structurer mon profil depuis ce CV</Btn>
+        <span className={`text-xs ${T.muted}`}>L'IA recopie sans inventer ; vous choisissez ce qui remplace votre profil actuel.</span>
+      </div>
+      {prop && (
+        <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+          <div className="text-sm font-medium">Proposition à valider</div>
+          {CV_FIELDS.map((f) => {
+            const v = prop[f.id];
+            const empty = !v || (Array.isArray(v) && !v.length);
+            return (
+              <label key={f.id} className={`flex gap-3 items-start text-sm ${empty ? "opacity-50" : ""}`}>
+                <input type="checkbox" className="mt-1" disabled={empty} checked={!!pick[f.id] && !empty} onChange={(e) => setPick({ ...pick, [f.id]: e.target.checked })} />
+                <span className="min-w-0">
+                  <span className="font-medium">{f.label}</span>{Array.isArray(v) && !empty && <span className={T.faint}> ({v.length})</span>}
+                  <span className={`block text-xs ${T.muted} line-clamp-3`}>{empty ? "rien trouvé dans le CV" : preview(f.id, v)}</span>
+                </span>
+              </label>
+            );
+          })}
+          <div className="flex gap-2">
+            <Btn variant="primary" icon={Check} onClick={apply} disabled={!Object.values(pick).some(Boolean)}>Remplacer les champs cochés</Btn>
+            <Btn variant="ghost" onClick={() => setProp(null)}>Annuler</Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProfileEditor() {
   const T = useT();
   const { profile, setProfile } = useApp();
@@ -5980,9 +6297,10 @@ function ProfileEditor() {
           );
         })}
       </Card>
-      <Card className="p-6 lg:col-span-2">
+      <Card className="p-6 lg:col-span-2 space-y-4">
         <SectionTitle>CV complet (texte collé)</SectionTitle>
         <Textarea rows={14} value={profile.cvText} onChange={(e) => set("cvText", e.target.value)} placeholder="Collez ici votre CV en texte brut. Il sert de base aux CV adaptés, lettres et exemples STAR." />
+        <CvImport />
       </Card>
     </div>
   );
