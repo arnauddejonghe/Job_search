@@ -32,10 +32,37 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 | Scoring IA | Score 0-100, décomposition par critère, points forts, écarts, questions, drapeaux rouges avec preuve textuelle, niveau de confiance. Plafonds appliqués côté client (indispensable manquant ≤ 45, exclusion ≤ 20). Recalcul automatique quand une nouvelle version de critères est enregistrée. |
 | Vue d'ensemble | KPIs, « À faire aujourd'hui » (repriorisable par l'IA), meilleures offres, entonnoir, volume par source, score moyen par semaine. |
 | Pipeline | Kanban en 8 colonnes, glisser-déposer (ou sélecteur d'étape au clavier), clôture avec issue et motif, journal horodaté. |
-| Assistant candidature | CV adapté + points clés, lettre, message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
+| Assistant candidature | **Studio CV & lettre plein écran** (voir ci-dessous), message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
 | Relances & agenda | Règles J+7 / J+14 après envoi et J+2 après entretien (paramétrables). Rédaction IA, brouillon Gmail, rappel dans l'agenda. **Détection des réponses des recruteurs dans Gmail** (lecture seule) : chaque réponse est proposée avec une action (journal, entretien, offre, refus) à valider ; les relances devenues inutiles sont annulées. Fiche de préparation d'entretien sourcée (web_search), STAR, questions, négociation. |
 | Contacts | Recruteurs, cabinets, hiring managers et réseau, liés aux candidatures (destinataires des brouillons). |
 | Confidentialité & données | Mode discret (aperçu + confirmation avant toute écriture Google), alerte si l'employeur actuel est cité, titres d'agenda neutres, écran masquable, export/import JSON, réinitialisation. |
+
+### Studio CV & lettre
+
+Ouvert depuis la fiche candidature (onglet *Dossier*), l'Assistant, la palette `⌘K` ou « À faire aujourd'hui ». Il occupe tout l'écran.
+
+| Zone | Rôle |
+|---|---|
+| Éditeur structuré | En-tête (nom, **ligne de positionnement** sous le nom, coordonnées ; destinataire, lieu et date pour la lettre), puis une carte par section : paragraphes, puces, postes (Fonction · Organisation · Lieu · Période + puces), libellés (« Compétences : … »). Entrée crée la puce suivante, un collage multiligne est découpé, outils flottants pour monter / descendre / supprimer. Sections ajoutables (Profil, Réalisations clés, Certifications…). |
+| Aperçu A4 | Mêmes métriques que le PDF (Helvetica, tailles en points, marges en mm, pagination par blocs sans titre orphelin). Nombre de pages en direct, zoom, couleur d'accent. Un clic sur un passage ouvre la section correspondante dans l'éditeur. Les « [à compléter] » sont surlignés. |
+| Optimisation | Score /100 (mots-clés ATS, impact ou pertinence, lisibilité) et statut « prêt à envoyer ». **Contrôles** instantanés et sans IA : titre sous le nom qui annonce le poste visé, profil rédigé comme si le poste était déjà occupé, intitulé exact absent, pronoms, clichés, affirmations non prouvées, puces sans chiffre ou à formule faible, répétitions, longueur, pages, sections manquantes, coordonnées, employeur actuel cité ; pour la lettre : objet, entreprise citée, demande d'entretien, phrases en « Je ». **Mots-clés** : couverture pondérée par importance, variantes tolérées (pluriel, accents, tirets, acronymes), section où chaque terme apparaît, « Intégrer » ou « Je l'ai » (ajout au profil). **IA** : relecture recruteur et corrections ciblées présentées en avant / après, appliquées une à une ou toutes. **Annonce** : texte complet modifiable et analyse (exigences, preuves, écarts). |
+| Versions | Brouillon enregistré automatiquement (rien n'est perdu en fermant), annuler / rétablir, `⌘S` pour enregistrer une version, régénération avec réglages (langue, ton, profil avec ou sans « je », 1 ou 2 pages, consigne). |
+
+Mise en page : *Édition*, *Côte à côte* ou *Aperçu* ; le panneau d'optimisation s'ouvre depuis le score dans la barre. Sur mobile, trois onglets (Éditer, Aperçu, Optimiser).
+
+**Sans offre : candidature spontanée ou CV de base**
+
+Bouton « CV ou lettre sans offre » (Assistant), « Candidature spontanée » (Pipeline) ou `⌘K`. On part d'un **rôle visé** :
+- *Candidature spontanée* : entreprise ciblée, site, interlocuteur et contexte facultatifs (« pourquoi cette entreprise », seule source de faits sur elle). Elle entre dans le pipeline (étape « En préparation », badge « spontanée ») avec relances et contacts. Documents par défaut : CV, lettre, message LinkedIn, e-mail.
+- *CV de base* : aucun employeur cité, document réutilisable (cabinet, LinkedIn, point de départ). Rangé dans l'Assistant, hors pipeline.
+
+L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots-clés habituels des annonces belges et les attentes du rôle, confrontés au profil. La lettre spontanée est plus courte (200 à 300 mots), ne mentionne jamais d'annonce et demande un échange de 20 à 30 minutes ; en mode CV de base, elle devient un modèle avec emplacements « [à compléter] ». Ces cibles sont exclues de la veille, du scoring, du dédoublonnage et des statistiques d'offres.
+
+**Génération en trois étapes**
+
+1. **Analyse de l'annonce** (`adAnalysis`), sur le texte complet collé ou importé (`offer.fullText`, à défaut le résumé) : intitulé exact et équivalents, 20 à 35 mots-clés ATS classés (catégorie, importance 1-3, variantes) et confrontés au profil (prouvé, transférable, absent, avec la preuve), exigences clés, angle de l'employeur, ligne de positionnement proposée, écarts. Mise en cache tant que l'annonce et le profil ne changent pas.
+2. **Rédaction** du CV et de la lettre en parallèle (`cvWrite`, `letterWrite`) à partir de cette matrice : sous le nom, la fonction **réelle** et 2-3 expertises (jamais l'intitulé visé comme s'il était occupé) ; profil en trois temps (qui je suis aujourd'hui, preuves, le poste visé cité comme **objectif**) ; poste actuel au présent, postes passés au passé ; chaque mot-clé prouvé ou transférable d'importance 2-3 placé dans une phrase où il est démontré, pas seulement dans une liste ; aucun mot-clé « absent ».
+3. **Contrôle qualité** local puis **corrections ciblées** (`fixDoc`) sur les points détectés : remplacements courts dont le texte d'origine doit exister à l'identique, sinon ignorés.
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
@@ -44,9 +71,12 @@ radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], mode
 radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
-radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,
-                   description, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
-radar:apps      [{ id, offerId, stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
+radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, publishedApprox, deadline,
+                   description, fullText, spontaneous ("company" | "base" | absent), contactName, collectedAt, seenAt, link{state,evidence,at,method}, autoReason, autoRule, dismissedBy, userKept,
+                   sources[{name,url,collectedAt,via,verified}], status, score{method:2,value,wishAvg,mustAvg,fit,confidence,breakdown[{id,…}],caps,criteriaVersionId}, demo }]
+radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
+                   analysis{jobTitle, titleVariants[], keywords[{term,category,importance,variants[],status,evidence}], requirements[], angle, positioning{…}, gaps[], sig},
+                   drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
 ```
@@ -63,7 +93,11 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `gmail` | MCP Gmail, outils de lecture uniquement | `{offers[], messagesRead}` |
 | `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
-| `dossier` | aucun | `{language, cv, letter, linkedin, answers, email}` |
+| `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
+| `cvWrite`, `letterWrite` / `letterSpontaneous` | aucun | `{cv, accent, accentSource, tips}` ; `{letter}` (balisage léger) |
+| `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
+| `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
+| `dossier` | aucun | `{language, linkedin, answers, email}` |
 | `followUp` | aucun | `{subject, body}` |
 | `prep` | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
 | `gmailDraft` | MCP Gmail, `create_draft` uniquement | `{created, draftId}` |
@@ -80,7 +114,7 @@ Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du 
 - Recherche multi-sources via `web_search`, normalisation, estimation du trajet depuis Ohain, dédoublonnage et fusion des sources.
 - Extraction des offres depuis les alertes e-mail Gmail.
 - Scoring expliqué, recalcul quand les critères changent, priorisation du jour.
-- Rédaction de tout le dossier, des relances et de la fiche d'entretien.
+- Analyse de l'annonce, rédaction du dossier en trois étapes, contrôle qualité continu, relances et fiche d'entretien.
 - Création de brouillons Gmail et d'événements Google Calendar, **après votre clic** (et confirmation en mode discret).
 - Planification des relances selon les règles.
 
@@ -92,6 +126,37 @@ Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du 
 - **Veille planifiée** : un artefact ne tourne pas en arrière-plan. La veille se lance à la main, ou automatiquement à l'ouverture si l'option est activée. Une veille produite ailleurs (tâche planifiée) peut être importée en JSON.
 - **Réponses des recruteurs** : détectées automatiquement, mais appliquées seulement après votre validation (une mauvaise interprétation ne doit pas clôturer une candidature).
 - **Temps de trajet** : ordre de grandeur (table locale ou estimation IA), pas un calcul d'itinéraire.
+
+## Version 3 — fiabilité, tri et qualité de la veille
+
+### Données : fin du blocage « Lecture des données impossible »
+- **Cause** : en v1, chaque collection était découpée en tranches de 180 000 caractères réécrites sur place. Une écriture interrompue (onglet fermé, quota, deux onglets ouverts) laissait une tranche neuve à côté d'anciennes, d'où `Expected ',' or ']' … position 180000` et l'enregistrement suspendu.
+- **Offres** : un document par offre (`data/users/<id>/radar_offers_v2/items/<offerId>`). Seules les offres modifiées sont réécrites (synchronisation par différence).
+- **Autres collections** : écriture atomique par génération (`<clé>__<gen>_<i>`), puis bascule du `__meta` avec somme de contrôle, puis suppression de l'ancienne génération.
+- **Réparation automatique** : une collection illisible est récupérée élément par élément (197 offres sur 197 récupérées sur les données réelles), une copie brute est conservée et l'enregistrement reprend. Un incident réseau ne bloque plus que le temps de « Réessayer ».
+
+### Tri
+- Onglets **À traiter · Non lues · Arrivées (depuis la dernière visite, groupées par jour) · Échéances · Pipeline · Écartées · Expirées · Toutes**, avec compteurs.
+- Statut **lu / non lu** (pastille), bandeau « Depuis votre dernière visite » sur la vue d'ensemble.
+- **Actions de masse** : sélection multiple (Maj+clic pour une plage, « tout sélectionner » sur le filtre), puis écarter, expirées, remettre à traiter, lues, pipeline, scorer, vérifier les liens, fusionner, supprimer. Chaque action est **annulable**.
+- Actions rapides par ligne (retenir, écarter, expirée) et bouton « Lien mort (404) » dans la fiche.
+
+### Règles de tri automatique (modifiables, avec aperçu)
+Appliquées à chaque arrivée et à chaque ouverture, aux seules offres « à traiter » (jamais au pipeline ni aux offres restaurées) :
+intitulé exclu (junior, stage…), pas de poste de management, hors périmètre (digital / IT / CRM / transformation, complété par les postes visés), date limite dépassée, annonce clôturée, publiée depuis plus de 30 jours, date inconnue et collectée depuis plus de 21 jours, trajet trop long, score < 40. La raison est affichée sur l'offre, qui reste restaurable.
+
+### Scoring systématique
+L'IA évalue **chaque critère** de la version active (identifiants M1, W1, X1, A1…) sur une grille fixe ; le score est **calculé par la page**, toujours avec la même formule : 55 % souhaités pondérés + 45 % indispensables, −5 par signal d'alerte (max −15), plafond 45 si un indispensable n'est pas rempli, plafond 20 si une exclusion est présente. Toute offre à traiter est scorée automatiquement dès son arrivée.
+
+### Doublons systématiques
+- Local, à chaque ouverture et arrivée : même URL, même identifiant d'annonce (LinkedIn, Indeed, StepStone, Glassdoor, Jobat), ou même entreprise + intitulé nettoyé (sans « (m/f/x) », lieu…). Fusion automatique, annulable.
+- IA, après chaque arrivée : confiance haute fusionnée directement (annulable), confiance moyenne à valider.
+
+### Offres mortes, dates de publication et dates limites
+- Champs `publishedAt` (date réelle, ou date de l'alerte e-mail marquée « ≈ ») et `deadline` (date limite de candidature) extraits partout ; colonnes, tri, onglet « Échéances » et carte « Dates limites proches ».
+- **Routine réécrite** : qualité avant quantité, filtre de pertinence avant dépôt, chaque candidate est ouverte (WebFetch) ou recherchée pour confirmer qu'elle est ouverte ; les annonces clôturées ne sont plus déposées.
+- **Vérification des offres suivies** : la page entretient `veille/verify_queue` (40 offres actives au plus) ; à chaque passage la Routine les vérifie et écrit `veille_verify/verify-*`. Les annonces clôturées passent en « Expirées ». Vérification à la demande depuis la sélection ou la fiche.
+- Limite : l'environnement de la Routine est en accès réseau « de confiance » ; WebFetch y est refusé pour les sites d'emploi et la vérification se replie sur la recherche web. Ajouter les domaines d'emploi aux domaines autorisés de l'environnement rend la vérification directe.
 
 ## Réalisé en version 2
 
