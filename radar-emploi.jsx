@@ -6810,7 +6810,7 @@ function AssistantView() {
         <Card className="p-6 lg:col-span-2">
           <SectionTitle>Candidatures à préparer</SectionTitle>
           {inPrep.length === 0 ? (
-            <Empty icon={Sparkles} title="Rien en préparation" text="Retenez une offre pour générer son dossier." action={<Btn onClick={() => go("offers")}>Voir les offres</Btn>} />
+            <Empty icon={Sparkles} title="Rien en préparation" text="Retenez une offre, ou partez d'un rôle visé sans offre (candidature spontanée, CV de base)." action={<div className="flex flex-wrap justify-center gap-2"><Btn variant="primary" icon={Plus} onClick={() => setSpontOpen(true)}>CV ou lettre sans offre</Btn><Btn onClick={() => go("offers")}>Voir les offres</Btn></div>} />
           ) : (
             <ul className="space-y-2">
               {inPrep.map((a) => {
