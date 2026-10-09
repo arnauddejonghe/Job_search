@@ -354,7 +354,7 @@ function mergeOffers(existing, incoming) {
   const list = existing.map((o) => ({ ...o }));
   const added = [], merged = [];
   for (const inc of incoming) {
-    const hit = list.find((o) => sameOffer(o, inc));
+    const hit = list.find((o) => !o.spontaneous && sameOffer(o, inc));
     if (hit) {
       const srcs = [...(hit.sources || [])];
       for (const s of inc.sources) if (!srcs.some((x) => canonicalUrl(x.url) === canonicalUrl(s.url) && x.name === s.name)) srcs.push(s);
@@ -439,7 +439,7 @@ function veilleConfig(version, sources, settings, sourceIds) {
 
 /* Une offre « active » : ni écartée, ni expirée, ni liée à une candidature clôturée. */
 const INACTIVE = ["dismissed", "expired", "closed"];
-const isActiveOffer = (o) => !INACTIVE.includes(o.status);
+const isActiveOffer = (o) => !o.spontaneous && !INACTIVE.includes(o.status);
 const isOldOffer = (o, days) => {
   if (!days || o.status === "pipeline") return false;
   const ref = o.publishedAt && !isNaN(new Date(o.publishedAt)) ? o.publishedAt : o.lastSeenAt || o.collectedAt;
@@ -797,7 +797,7 @@ function analyzeDoc(text, kind, ctx = {}) {
       const pw = pt.split(/\s+/).filter(Boolean).length;
       const firstSentence = pt.split(/[.!?]\s/)[0] || "";
       if (claims(firstSentence.split(/\s+/).slice(0, 9).join(" "))) add("block", "fiabilite", "prof-claim", "Le profil se présente avec l'intitulé visé", "La première phrase doit décrire votre fonction réelle ; l'intitulé visé vient en fin de profil, comme objectif.", { sec: prof, autoFix: true });
-      if (titleForms.length && !titleIn(secHay[prof])) add("warn", "ats", "prof-title", "L'intitulé exact du poste n'apparaît pas dans le profil", `Citez « ${ctx.jobTitle} » comme objectif (« … en tant que ${ctx.jobTitle} ») : les ATS comparent l'intitulé.`, { sec: prof, autoFix: true });
+      if (titleForms.length && !titleIn(secHay[prof])) add("warn", "ats", "prof-title", ctx.spontaneous ? "Le rôle visé n'apparaît pas dans le profil" : "L'intitulé exact du poste n'apparaît pas dans le profil", `Citez « ${ctx.jobTitle} » comme objectif (« … dans un rôle de ${ctx.jobTitle} ») : les ATS et les recruteurs comparent l'intitulé.`, { sec: prof, autoFix: true });
       if (ctx.voice !== "je" && PRONOUNS[lang]?.test(pt)) add("warn", "style", "prof-pron", "Pronoms personnels dans le profil", "Style CV : phrases sans « je / mon » (ou choisissez la 1re personne dans les réglages).", { sec: prof, autoFix: true });
       if (pw > 110) add("info", "format", "prof-long", `Profil long (${pw} mots)`, "Visez 55 à 90 mots.", { sec: prof });
       if (pw < 30) add("warn", "format", "prof-short", `Profil court (${pw} mots)`, "Visez 55 à 90 mots.", { sec: prof });
@@ -829,7 +829,8 @@ function analyzeDoc(text, kind, ctx = {}) {
     const bodyText = o.sections.map((s, i) => secText[i]).join("\n");
     const bodyHay = hayOf(bodyText);
     if (!subj) add("warn", "format", "subject", "Objet absent", "Ajoutez « Objet : candidature au poste de … ».");
-    else if (titleForms.length && !titleIn(hayOf(subj))) add("warn", "ats", "subject-title", "L'objet ne reprend pas l'intitulé exact du poste", `Reprenez « ${ctx.jobTitle} ».`, { sec: o.sections.findIndex((s) => s.title === subj), autoFix: true });
+    else if (titleForms.length && !titleIn(hayOf(subj))) add("warn", "ats", "subject-title", ctx.spontaneous ? "L'objet ne mentionne pas le rôle visé" : "L'objet ne reprend pas l'intitulé exact du poste", `Reprenez « ${ctx.jobTitle} »${ctx.spontaneous ? " (« Candidature spontanée — … »)" : ""}.`, { sec: o.sections.findIndex((s) => s.title === subj), autoFix: true });
+    if (ctx.spontaneous && /(votre annonce|votre offre|poste à pourvoir|vacature|your (job )?(ad|posting|offer))/i.test(bodyText)) add("block", "fiabilite", "no-ad", "La lettre fait référence à une annonce", "Candidature spontanée : aucune offre n'existe. Retirez « votre annonce », « le poste à pourvoir »…", { autoFix: true });
     const ck = companyKey(ctx.company || "");
     const companyIn = !ck || ck.length < 3 || bodyHay.includes(` ${ck} `) || bodyHay.includes(ck);
     if (!companyIn) add("warn", "impact", "company", `La lettre ne cite pas ${ctx.company}`, "Nommez l'entreprise au moins une fois : une lettre générique se repère immédiatement.", { autoFix: true });
@@ -845,8 +846,9 @@ function analyzeDoc(text, kind, ctx = {}) {
     const nums = /\d/.test(bodyText.replace(/\b(19|20)\d{2}\b/g, ""));
     if (!nums) add("info", "impact", "nums", "Aucun résultat chiffré dans la lettre", "Une preuve chiffrée rend la candidature crédible.");
     impact = 100 - (companyIn ? 0 : 25) - (cta ? 0 : 10) - (nums ? 0 : 15) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - Math.max(0, je - 4) * 4 - cl.length * 8;
-    if (words < 220) { add("info", "format", "short", `Lettre courte (${words} mots)`, "Visez 260 à 340 mots."); read -= 10; }
-    if (words > 420) { add("warn", "format", "long", `Lettre longue (${words} mots)`, "Une page maximum : visez 260 à 340 mots."); read -= 15; }
+    const [minW, maxW] = ctx.spontaneous ? [200, 300] : [260, 340];
+    if (words < minW - 40) { add("info", "format", "short", `Lettre courte (${words} mots)`, `Visez ${minW} à ${maxW} mots.`); read -= 10; }
+    if (words > maxW + 80) { add("warn", "format", "long", `Lettre longue (${words} mots)`, `Une page maximum : visez ${minW} à ${maxW} mots.`); read -= 15; }
     if (pages && pages > 1) { add("warn", "format", "pages", `La lettre tient sur ${pages} pages`, "Une page maximum."); read -= 20; }
   }
   read -= reps.length * 4;
@@ -1393,6 +1395,29 @@ const profileBlock = (p) => [
 ].join("\n");
 const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
 const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
+
+/* Cible de rédaction : offre publiée, candidature spontanée (entreprise ciblée, sans offre) ou CV de base (ni offre ni entreprise). */
+const SPONT_LABEL = { company: "Candidature spontanée", base: "CV de base" };
+function targetInfo(offer, a) {
+  const mode = offer?.spontaneous || "offer";
+  return { mode, spont: mode !== "offer", base: mode === "base", role: a?.jobTitle || offer?.title || "le poste visé", company: offer?.company || null };
+}
+function targetBlock(offer, a) {
+  const t = targetInfo(offer, a);
+  if (!t.spont) return `OFFRE\nIntitulé : ${offer.title} · Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)}`;
+  return [
+    t.base ? "CV DE BASE : aucune offre et aucune entreprise ciblée (document réutilisable pour ce type de rôle)" : "CANDIDATURE SPONTANÉE : aucune offre n'a été publiée",
+    `Rôle visé : ${offer.title}`,
+    t.base ? "" : `Entreprise ciblée : ${show(offer.company)}`,
+    offer.location ? `Lieu souhaité : ${offer.location}` : "",
+    offer.contactName ? `Interlocuteur : ${offer.contactName}` : "",
+    `Contexte fourni par le candidat (seule source d'information sur l'entreprise) : ${adTextOf(offer) || "aucun"}`,
+  ].filter(Boolean).join("\n");
+}
+const targetLine = (offer, a) => {
+  const t = targetInfo(offer, a);
+  return t.base ? `CV de base pour un rôle de ${t.role} (aucune entreprise ciblée)` : t.spont ? `candidature spontanée chez ${show(t.company)} pour un rôle de ${t.role}` : `${t.role} chez ${show(offer.company)}`;
+};
 function hashStr(s) {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
@@ -1447,7 +1472,7 @@ function normalizeAnalysis(d, offer) {
 }
 
 const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords }) => ({
-  lang, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
+  lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
   jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
   company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
 });
@@ -1551,16 +1576,20 @@ Réponds uniquement avec ce JSON :
 
   dossier(offer, profile, types, instruction, analysis) {
     const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
-    return `Mission : préparer des documents de candidature pour l'offre ci-dessous. Le candidat relira, modifiera et validera tout : rien n'est envoyé automatiquement.
-
-OFFRE
+    const head = offer.spontaneous
+      ? `${targetBlock(offer, analysis)}
+Règle : aucune offre n'existe, jamais « suite à votre annonce ». linkedin = prise de contact avec un décideur ou un recruteur de l'entreprise pour proposer un échange ; email = candidature spontanée courte qui demande un échange de 20 à 30 minutes ; answers = questions probables lors d'un premier échange, avec réponses.`
+      : `OFFRE
 Intitulé : ${offer.title}
 Entreprise : ${show(offer.company)}
 Lieu : ${show(offer.location)}
 Contrat : ${show(offer.contract)} · Télétravail : ${show(offer.remote)}
 Annonce : ${adTextOf(offer).slice(0, 6000)}
-URL : ${show(offer.sources?.[0]?.url)}
-${analysis ? `\nANALYSE DE L'ANNONCE\n${analysisDigest(analysis)}\n` : ""}
+URL : ${show(offer.sources?.[0]?.url)}`;
+    return `Mission : préparer des documents de candidature pour la cible ci-dessous. Le candidat relira, modifiera et validera tout : rien n'est envoyé automatiquement.
+
+${head}
+${analysis ? `\nANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}\n${analysisDigest(analysis, offer)}\n` : ""}
 PROFIL
 ${profileDigest(profile, true)}
 
@@ -1617,6 +1646,39 @@ Réponds uniquement avec ce JSON :
 {"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
   },
 
+  targetAnalysis(offer, profile) {
+    const base = offer.spontaneous === "base";
+    const lang = LANG_NAME[offer.language] || "français";
+    return `Mission : préparer ${base ? "un CV de base (aucune offre ni entreprise ciblée)" : "une candidature SPONTANÉE (aucune offre publiée)"}. Déduis ce qu'un recruteur et un logiciel de tri (ATS) attendent pour le rôle visé sur le marché belge, puis confronte-le au profil du candidat. Cette analyse pilotera la rédaction.
+
+CIBLE
+${targetBlock(offer)}
+
+PROFIL DU CANDIDAT (seule source de preuves)
+${profileBlock(profile)}
+
+À PRODUIRE
+1. jobTitle : l'intitulé le plus courant pour ce rôle dans les annonces belges, en ${lang}. titleVariants : 2 à 4 intitulés équivalents (FR/NL/EN, abréviations).
+2. language : "${offer.language || "fr"}".
+3. keywords : 20 à 30 termes que les annonces pour ce rôle contiennent habituellement (responsabilités, compétences métier, outils, méthodes, savoir-être, langues, secteur), priorisés selon le contexte fourni. Pour chacun :
+   - category : titre | competence | outil | methode | soft | langue | secteur | diplome
+   - importance : 3 = cœur du rôle ; 2 = fréquent ; 1 = atout
+   - variants : 0 à 3 formes équivalentes (pluriel, acronyme et forme longue, traduction)
+   - status : "prouvé" si le profil le démontre directement ; "transférable" si une expérience proche permet de l'affirmer honnêtement ; "absent" sinon
+   - evidence : l'élément précis du profil qui le justifie, null si absent
+4. requirements : 5 à 8 attentes typiques du rôle, une ligne chacune, avec importance (1-3) et proof (preuve tirée du profil, ou null).
+5. angle : en 2 phrases, ${base ? "ce qu'une organisation cherche en général en recrutant ce rôle" : "ce que l'entreprise pourrait gagner à recruter ce profil, d'après le contexte fourni (sinon d'après le rôle)"}, formulé comme une hypothèse.
+6. companyFacts : uniquement les faits présents dans le contexte fourni (aucun fait extérieur, aucune supposition).
+7. positioning :
+   - currentTitle : le titre réel actuel du candidat, tel que dans le profil.
+   - headline : la ligne sous son nom sur le CV : son titre RÉEL (ou une expertise vraie), puis 2 ou 3 domaines d'expertise qui recoupent le rôle visé, séparés par « | » ou « · », 85 caractères maximum. Jamais le rôle visé présenté comme déjà occupé.
+   - pitch : une phrase : ce que le candidat apporte concrètement dans ce rôle${base ? "" : " pour cette entreprise"}, appuyé sur ses preuves.
+8. gaps : attentes sans preuve dans le profil, chacune avec une façon honnête de l'aborder.
+
+Réponds uniquement avec ce JSON :
+{"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
+  },
+
   cvWrite(offer, profile, a, prefs, instruction) {
     const lang = LANG_NAME[docLang(offer, prefs, a)] || "celle de l'annonce";
     const contact = profileContact(profile);
@@ -1624,12 +1686,17 @@ Réponds uniquement avec ce JSON :
     const voice = prefs.voice === "je"
       ? "à la première personne (« je »), phrases courtes"
       : "sans pronom personnel, style CV (verbes sans sujet ou phrases nominales : « Pilote… », « Responsable du CRM… »)";
-    return `Mission : rédiger le CV du candidat, adapté à l'offre ci-dessous et prêt à envoyer après relecture.
+    const tg = targetInfo(offer, a);
+    const projection = tg.base
+      ? `c) la projection : le type de rôle recherché (« ${target} ») comme OBJECTIF, sans nommer d'entreprise.`
+      : tg.spont
+        ? `c) la projection : ce qu'il veut apporter à ${show(offer.company)} dans un rôle de « ${target} », formulé comme un OBJECTIF (aucune offre n'existe : jamais « en réponse à votre annonce »).`
+        : `c) la projection : ce qu'il veut apporter, en citant l'intitulé exact « ${target} » comme OBJECTIF (par ex. « … souhaite mettre cette expérience au service de ${show(offer.company)} en tant que ${target} »), jamais comme une fonction déjà exercée.`;
+    return `Mission : rédiger le CV du candidat, adapté à la cible ci-dessous et prêt à envoyer après relecture.
 
-OFFRE
-Intitulé : ${offer.title} · Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)}
+${targetBlock(offer, a)}
 
-ANALYSE DE L'ANNONCE (déjà confrontée au profil)
+ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (déjà confrontée au profil)
 ${analysisDigest(a, offer)}
 
 PROFIL (seule source de faits)
@@ -1643,8 +1710,8 @@ Langue : ${lang}. Titres de sections standard dans cette langue (FR : Profil, R�
 2. Profil : 3 ou 4 phrases, 55 à 90 mots, ${voice}. Construction :
    a) qui est le candidat AUJOURD'HUI : fonction réelle, périmètre (équipe, outils, domaine), années d'expérience seulement si elles figurent dans le profil ;
    b) 1 ou 2 preuves fortes, chiffrées si le profil contient des chiffres ;
-   c) la projection : ce qu'il veut apporter, en citant l'intitulé exact « ${target} » comme OBJECTIF (par ex. « … souhaite mettre cette expérience au service de ${show(offer.company)} en tant que ${target} »), jamais comme une fonction déjà exercée.
-   Ne décris pas les missions de l'annonce comme si le candidat les exerçait déjà.
+   ${projection}
+   Ne décris pas les missions du rôle visé comme si le candidat les exerçait déjà.
 3. Réalisations clés : 3 ou 4 puces choisies pour les exigences clés, chiffrées si le profil le permet, au format « verbe d'action + périmètre + résultat ».
 4. Expérience professionnelle, du plus récent au plus ancien : « ### Fonction | Organisation | Lieu | Période » puis 3 à 6 puces (2 à 4 pour les postes anciens). Verbes d'action au présent pour le poste actuel, au passé pour les précédents. Aucune puce ne commence par « Responsable de », « En charge de », « Participation à ». Une idée par puce, 2 lignes maximum.
 5. Compétences : 3 ou 4 groupes « **Groupe :** élément, élément » (ex. Transformation & pilotage, Outils & plateformes, Méthodes, Management), avec les termes exacts de l'annonce quand le profil les justifie.
@@ -1691,6 +1758,7 @@ Réponds uniquement avec ce JSON :
     const target = a?.jobTitle || offer.title;
     const city = String(profile.home || "").split(/[(,]/)[0].trim() || "[à compléter : ville]";
     const dateLine = code === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(code)}`;
+    if (offer.spontaneous) return P.letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine });
     return `Mission : rédiger la lettre de motivation du candidat pour l'offre ci-dessous, prête à envoyer après relecture.
 
 OFFRE
@@ -1736,6 +1804,52 @@ Réponds uniquement avec ce JSON :
 {"letter":"<balisage>"}`;
   },
 
+  letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine }) {
+    const base = offer.spontaneous === "base";
+    const company = base ? "[à compléter : entreprise]" : show(offer.company);
+    return `Mission : rédiger ${base ? "une lettre de candidature spontanée MODÈLE, réutilisable : l'entreprise et son contexte restent à compléter" : "une lettre de candidature SPONTANÉE"} pour un rôle de « ${target} », prête à envoyer après relecture.
+
+${targetBlock(offer, a)}
+
+ANALYSE DU RÔLE VISÉ (déjà confrontée au profil)
+${analysisDigest(a, offer)}
+
+PROFIL (seule source de faits)
+Nom : ${profile.name || "[à compléter : prénom nom]"}
+Coordonnées : ${profileContact(profile)}
+${profileBlock(profile)}
+
+CONSIGNES
+Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}. Corps de 220 à 300 mots : une page, plus court qu'une réponse à une annonce.
+Aucune offre n'existe : n'écris jamais « suite à votre annonce », « le poste à pourvoir » ni « votre offre ».
+Corps, paragraphes séparés par une ligne vide :
+1. Formule d'appel (FR : « Madame, Monsieur, » ; si un interlocuteur est nommé avec sa civilité, adresse-toi à lui ; NL : « Geachte mevrouw, geachte heer, » ; EN : « Dear … »).
+2. Pourquoi ${base ? "cette entreprise" : show(offer.company)} (2-3 phrases) : ${base ? "laisse un emplacement « [à compléter : un fait précis sur l'entreprise] »" : "uniquement à partir du contexte fourni par le candidat ; s'il est vide, parle du rôle et du secteur sans inventer de fait sur l'entreprise"}. Puis qui est le candidat aujourd'hui en une phrase (fonction réelle, périmètre).
+3. Preuves (3-4 phrases) : 2 ou 3 réalisations concrètes et chiffrées du profil, reliées aux attentes du rôle.
+4. Apport (2 phrases) : ce que le candidat pourrait apporter, formulé comme une proposition (« je pourrais », « je serais heureux de contribuer à »), jamais comme une certitude sur leurs besoins.
+5. Demande (1-2 phrases) : un échange de 20 à 30 minutes pour présenter son parcours, même sans poste ouvert.
+6. Formule de politesse sobre adaptée à la langue.
+Règles :
+- Intègre naturellement 5 à 8 mots-clés « prouvés » ou « transférables », sans énumération.
+- Au plus 3 phrases commençant par « Je ».
+- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique.
+- Aucun cliché, aucun fait inventé.
+${instruction ? `- Consigne du candidat : ${instruction}` : ""}
+
+FORMAT (balisage léger, une instruction par ligne)
+# Prénom Nom
+@ coordonnées
+= ${dateLine}
+> ${offer.contactName || "Destinataire (direction ou service des ressources humaines)"}
+> ${company}
+## Objet : candidature spontanée — ${target}
+paragraphes séparés par une ligne vide
+~ Prénom Nom
+
+Réponds uniquement avec ce JSON :
+{"letter":"<balisage>"}`;
+  },
+
   fixDoc({ kind, text, issues, analysis, profile, offer }) {
     return `Mission : corriger ${kind === "cv" ? "le CV" : "la lettre de motivation"} ci-dessous sur les seuls points listés, par des remplacements ciblés. Ne touche à rien d'autre.
 
@@ -1748,7 +1862,7 @@ POINTS À CORRIGER
 ${issues.map((i, n) => `${n + 1}. ${i.title}${i.detail ? ` — ${i.detail}` : ""}`).join("\n")}
 
 RÉFÉRENCES
-Poste visé : ${analysis?.jobTitle || offer.title} chez ${show(offer.company)}
+Cible : ${targetLine(offer, analysis)}
 Fonction réelle actuelle du candidat : ${profile.headline || "non renseignée"}
 ${analysisDigest(analysis, offer)}
 
@@ -1767,14 +1881,20 @@ Réponds uniquement avec ce JSON :
   },
 
   review({ kind, text, analysis, profile, offer }) {
-    return `Mission : relire ${kind === "cv" ? "ce CV" : "cette lettre de motivation"} comme un recruteur exigeant qui reçoit 200 candidatures pour le poste « ${analysis?.jobTitle || offer.title} » chez ${show(offer.company)}, puis proposer des corrections ciblées.
+    const tg = targetInfo(offer, analysis);
+    const reader = tg.base
+      ? `un recruteur exigeant qui cherche un profil de « ${tg.role} »`
+      : tg.spont
+        ? `un dirigeant de ${show(offer.company)} qui reçoit cette candidature spontanée pour un rôle de « ${tg.role} » sans avoir publié d'offre`
+        : `un recruteur exigeant qui reçoit 200 candidatures pour le poste « ${tg.role} » chez ${show(offer.company)}`;
+    return `Mission : relire ${kind === "cv" ? "ce CV" : "cette lettre de motivation"} comme ${reader}, puis proposer des corrections ciblées.
 
 DOCUMENT (balisage)
 <<<
 ${text}
 >>>
 
-ANALYSE DE L'ANNONCE
+ANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
 ${analysisDigest(analysis, offer)}
 
 PROFIL (faits autorisés)
@@ -1809,7 +1929,7 @@ DOCUMENT COMPLET (contexte, à ne pas réécrire)
 ${text}
 >>>
 
-POSTE VISÉ : ${analysis?.jobTitle || offer.title} chez ${show(offer.company)}
+CIBLE : ${targetLine(offer, analysis)}
 ${analysisDigest(analysis, offer)}
 
 PROFIL (faits autorisés)
@@ -1825,12 +1945,12 @@ Réponds uniquement avec ce JSON :
   },
 
   headlines({ analysis, profile, offer, lang }) {
-    return `Propose 4 lignes de positionnement à placer sous le nom du candidat, en tête de son CV, pour sa candidature au poste « ${analysis?.jobTitle || offer.title} » chez ${show(offer.company)}.
+    return `Propose 4 lignes de positionnement à placer sous le nom du candidat, en tête de son CV. Cible : ${targetLine(offer, analysis)}.
 
 PROFIL
 ${profileBlock(profile)}
 
-ANALYSE DE L'ANNONCE
+ANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
 ${analysisDigest(analysis, offer)}
 
 Règles : chaque ligne part de la fonction RÉELLE du candidat (« ${profile.headline || "fonction actuelle"} ») ou d'une expertise vraie, puis 2 ou 3 domaines d'expertise qui recoupent l'annonce, séparés par « | » ou « · » ; 85 caractères maximum ; langue : ${LANG_NAME[lang] || "celle de l'annonce"} ; aucune ligne ne présente le candidat comme occupant déjà le poste visé ; aucun cliché. Varie les angles (technique, management, transformation, résultats).
@@ -2585,6 +2705,7 @@ export default function RadarApp() {
   const [replyProposals, setReplyProposals] = useState(null);
   const [genStatus, setGenStatus] = useState({});
   const [studio, setStudio] = useState(null);
+  const [spontOpen, setSpontOpen] = useState(false);
   const [veille, setVeille] = useState({ routine: null, status: null, configSig: null, configLoaded: false });
   const veilleRef = useRef(veille);
   veilleRef.current = veille;
@@ -2715,10 +2836,39 @@ export default function RadarApp() {
   const patchOffer = (id, patch) => setOffers((l) => l.map((o) => (o.id === id ? { ...o, ...(typeof patch === "function" ? patch(o) : patch) } : o)));
   const patchSource = (id, patch) => setSources((l) => l.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   /* Texte complet de l'annonce (base de l'analyse ATS) : mis à jour aussi dans la référence courante pour une génération immédiate. */
-  const setOfferAdText = (offerId, text) => {
-    const t = String(text || "").trim().slice(0, 20000) || null;
-    R.current.offers = R.current.offers.map((o) => (o.id === offerId ? { ...o, fullText: t } : o));
-    patchOffer(offerId, { fullText: t });
+  const patchOfferNow = (offerId, patch) => {
+    R.current.offers = R.current.offers.map((o) => (o.id === offerId ? { ...o, ...patch } : o));
+    patchOffer(offerId, patch);
+  };
+  const setOfferAdText = (offerId, text) => patchOfferNow(offerId, { fullText: String(text || "").trim().slice(0, 20000) || null });
+
+  /* Candidature spontanée (entreprise ciblée, sans offre) ou CV de base (ni offre ni entreprise) : une « cible » rédigée comme une offre,
+     hors veille, scoring et statistiques. La candidature spontanée entre dans le pipeline ; le CV de base reste dans l'Assistant. */
+  const createSpontaneous = (d) => {
+    const t = nowISO();
+    const base = d.mode === "base";
+    const site = str(d.website);
+    const offer = {
+      id: uid("off"), spontaneous: base ? "base" : "company",
+      title: str(d.role) || "Rôle à préciser", company: base ? null : str(d.company), location: str(d.location),
+      commute: base ? null : estimateCommute(d.location), contract: null, seniority: null, salary: null, remote: null,
+      language: /^(fr|nl|en)$/.test(d.language) ? d.language : "fr", publishedAt: null,
+      description: str(d.context), fullText: str(d.context) ? String(d.context).trim().slice(0, 20000) : null, contactName: str(d.contactName),
+      collectedAt: t, lastSeenAt: t,
+      sources: [{ name: SPONT_LABEL[base ? "base" : "company"], url: site ? (/^https?:\/\//i.test(site) ? site : `https://${site}`) : null, collectedAt: t, via: "manuel", verified: null }],
+      status: "pipeline", score: null, demo: false,
+    };
+    const app = {
+      id: uid("app"), offerId: offer.id, kind: base ? "base" : "spontaneous", stage: "prep", createdAt: t, updatedAt: t, sentAt: null, closed: null,
+      docs: {}, prep: null, contactIds: [], interviews: [], followUps: [], demo: false,
+      log: [{ id: uid("log"), at: t, type: "stage", text: base ? `CV de base créé : ${offer.title}` : `Candidature spontanée créée : ${offer.title} — ${offer.company || NC}` }],
+    };
+    R.current.offers = [offer, ...R.current.offers];
+    R.current.apps = [app, ...R.current.apps];
+    setOffers((l) => [offer, ...l]);
+    setApps((l) => [app, ...l]);
+    setStudio({ appId: app.id, type: "cv" });
+    return app.id;
   };
   const addLogEntry = (a, type, text) => ({ ...a, updatedAt: nowISO(), log: [...(a.log || []), { id: uid("log"), at: nowISO(), type, text }] });
   const patchApp = (id, fn) => setApps((l) => l.map((a) => (a.id === id ? fn(a) : a)));
@@ -2734,7 +2884,7 @@ export default function RadarApp() {
   const scoreOffers = (ids) => withBusy("score", async () => {
     const { settings: s, profile: p, criteria: c } = R.current;
     const ver = activeVersion(c);
-    const targets = R.current.offers.filter((o) => ids.includes(o.id));
+    const targets = R.current.offers.filter((o) => ids.includes(o.id) && !o.spontaneous);
     if (!targets.length) return;
     setProgress({ label: "Scoring", done: 0, total: targets.length });
     let ok = 0, failed = 0;
@@ -3228,11 +3378,11 @@ export default function RadarApp() {
     const { settings: s, profile: p } = R.current;
     const { app, offer } = appAndOffer(appId);
     const adText = adTextOf(offer);
-    if (adText.length < 40) throw new Error("Annonce trop courte pour être analysée : collez son texte complet.");
-    const sig = hashStr(`${adText}§${JSON.stringify(p)}`);
+    if (offer.spontaneous ? !str(offer.title) : adText.length < 40) throw new Error(offer.spontaneous ? "Indiquez le rôle visé." : "Annonce trop courte pour être analysée : collez son texte complet.");
+    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify(p)}`);
     if (!force && app.analysis?.sig === sig) return app.analysis;
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.adAnalysis(offer, adText, p), maxTokens: 9000 });
-    const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.fullText, adChars: adText.length };
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000 });
+    const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.spontaneous && !offer.fullText, adChars: adText.length, spontaneous: offer.spontaneous || null };
     if (!analysis.keywords.length) throw new Error("L'analyse n'a renvoyé aucun mot-clé.");
     R.current.apps = R.current.apps.map((a) => (a.id === appId ? { ...a, analysis } : a));
     patchApp(appId, (a) => ({ ...a, analysis }));
@@ -3252,7 +3402,7 @@ export default function RadarApp() {
       const prefs = { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}), ...(prefsIn || {}) };
       const pro = types.filter((t) => t === "cv" || t === "letter");
       const other = types.filter((t) => !pro.includes(t));
-      setGen(appId, { step: 1, label: "Analyse de l'annonce et confrontation à votre profil…" });
+      setGen(appId, { step: 1, label: offer.spontaneous ? "Analyse du rôle visé et confrontation à votre profil…" : "Analyse de l'annonce et confrontation à votre profil…" });
       let analysis = null;
       try { analysis = await analyzeAd(appId); } catch (e) { toast(`Analyse de l'annonce impossible (${e.message}) : rédaction à partir de l'annonce seule.`, "warn"); }
       setGen(appId, { step: 2, label: `Rédaction ${[pro.includes("cv") && "du CV", pro.includes("letter") && "de la lettre", other.length && "des messages"].filter(Boolean).join(", ")}…` });
@@ -3421,7 +3571,7 @@ export default function RadarApp() {
     const items = [];
     const th = settings.threshold;
     const offerOf = (a) => offers.find((o) => o.id === a.offerId);
-    apps.forEach((a) => {
+    apps.filter((a) => a.kind !== "base").forEach((a) => {
       const o = offerOf(a);
       const name = `${o?.title || "Poste"} · ${o?.company || NC}`;
       (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).forEach((f) => {
@@ -3578,16 +3728,17 @@ export default function RadarApp() {
 
   const go = (v, preset) => { setView(v); setMobileNav(false); if (preset !== undefined) setOfferPreset(preset); window.scrollTo?.({ top: 0 }); };
 
+  const pApps = useMemo(() => apps.filter((a) => a.kind !== "base"), [apps]);
   const dueCount = useMemo(() => apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0), [apps]);
   const newCount = useMemo(() => offers.filter((o) => o.status === "new").length, [offers]);
 
   const ctx = {
-    T, settings, setSettings, profile, setProfile, criteria, setCriteria, sources, setSources, offers, setOffers, apps, contacts,
+    T, settings, setSettings, profile, setProfile, criteria, setCriteria, sources, setSources, offers, setOffers, apps: pApps, allApps: apps, contacts,
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
     createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
-    openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText,
+    openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText, patchOfferNow, createSpontaneous, setSpontOpen,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
@@ -3644,6 +3795,7 @@ export default function RadarApp() {
           {appSel && <AppDrawer id={appSel.id} tab={appSel.tab} setTab={(t) => setAppSel((s) => ({ ...s, tab: t }))} onClose={() => setAppSel(null)} />}
           {studio && <DocStudio key={studio.appId} appId={studio.appId} type={studio.type} setType={(t) => setStudio((x) => ({ ...x, type: t }))} onClose={() => setStudio(null)} />}
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
+          <SpontaneousModal open={spontOpen} onClose={() => setSpontOpen(false)} />
           <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
           <ReplyReviewModal replies={replyProposals} setReplies={setReplyProposals} onResolve={resolveReply} apps={apps} offers={offers} />
           <StageDialog dialog={stageDialog} onClose={() => setStageDialog(null)} />
@@ -3769,6 +3921,7 @@ function CommandPalette({ open, onClose }) {
       { group: "Actions", label: "Lancer la veille", hint: "toutes les sources actives", icon: Play, run: run(() => app.runWatch()) },
       { group: "Actions", label: "Importer les alertes e-mail (Gmail)", icon: Mail, run: run(() => app.importGmail()) },
       { group: "Actions", label: "Importer une annonce (URL ou texte)", icon: Clipboard, run: run(() => app.setManualOpen(true)) },
+      { group: "Actions", label: "Candidature spontanée ou CV sans offre", hint: "studio", icon: Plus, run: run(() => app.setSpontOpen(true)) },
       { group: "Actions", label: "Voir les relances dues", icon: BellRing, run: run(() => app.go("followups")) },
       { group: "Actions", label: "Vérifier les réponses des recruteurs (Gmail)", icon: MailCheck, run: run(() => app.checkReplies()) },
       { group: "Actions", label: "Détecter les doublons (IA)", icon: GitMerge, run: run(() => app.detectDuplicates()) },
@@ -3909,7 +4062,7 @@ function DashboardView() {
 
   const bySource = useMemo(() => {
     const m = {};
-    offers.forEach((o) => [...new Set((o.sources || []).map((s) => s.name))].forEach((n) => { m[n] = (m[n] || 0) + 1; }));
+    offers.filter((o) => !o.spontaneous).forEach((o) => [...new Set((o.sources || []).map((s) => s.name))].forEach((n) => { m[n] = (m[n] || 0) + 1; }));
     return Object.entries(m).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count).slice(0, 8);
   }, [offers]);
 
@@ -4082,11 +4235,12 @@ function OffersView() {
     if (offerPreset) { setF({ ...DEFAULT_FILTERS, ...offerPreset }); setOfferPreset(null); }
   }, [offerPreset]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const sourceNames = useMemo(() => [...new Set(offers.flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [offers]);
+  const sourceNames = useMemo(() => [...new Set(offers.filter((o) => !o.spontaneous).flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [offers]);
   const vid = activeVersion(criteria)?.id;
   const list = useMemo(() => {
     const nq = normText(f.q);
     let l = offers.filter((o) => {
+      if (o.spontaneous) return false;
       if (f.status === "active" && !isActiveOffer(o)) return false;
       if (f.status === "new" && o.status !== "new") return false;
       if (f.status === "dismissed" && !["dismissed", "expired"].includes(o.status)) return false;
@@ -4466,6 +4620,65 @@ function BulletList({ title, items, icon: Icon, danger, empty = "—" }) {
   );
 }
 
+const SPONT_EMPTY = { mode: "company", role: "", company: "", website: "", location: "", contactName: "", language: "fr", context: "" };
+const SPONT_MODES = [
+  ["company", "Candidature spontanée", "Vous ciblez une entreprise qui n'a pas publié d'offre. CV, lettre, message LinkedIn et e-mail ; suivi dans le pipeline (relances, contacts)."],
+  ["base", "CV de base", "Un CV prêt pour un type de rôle, sans entreprise : pour un cabinet de recrutement, un message LinkedIn, ou comme point de départ."],
+];
+
+function SpontaneousModal({ open, onClose }) {
+  const T = useT();
+  const { createSpontaneous, criteria } = useApp();
+  const roles = activeVersion(criteria)?.roles || [];
+  const [d, setD] = useState(SPONT_EMPTY);
+  useEffect(() => { if (open) setD(SPONT_EMPTY); }, [open]);
+  const set = (k, v) => setD((x) => ({ ...x, [k]: v }));
+  const base = d.mode === "base";
+  const ok = !!d.role.trim() && (base || !!d.company.trim());
+  const submit = () => { if (!ok) return; createSpontaneous(d); onClose(); };
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="CV ou lettre sans offre"
+      wide
+      footer={<><Btn variant="ghost" onClick={onClose}>Annuler</Btn><Btn variant="primary" icon={Sparkles} disabled={!ok} onClick={submit}>Créer et ouvrir le studio</Btn></>}
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" role="radiogroup" aria-label="Type de dossier">
+          {SPONT_MODES.map(([id, label, text]) => (
+            <button key={id} type="button" role="radio" aria-checked={d.mode === id} onClick={() => set("mode", id)} className={`text-left rounded-2xl p-4 border-2 transition-colors ${d.mode === id ? "border-indigo-500" : T.line} ${T.ring}`}>
+              <div className="text-sm font-medium">{label}</div>
+              <div className={`text-xs mt-1 leading-relaxed ${T.muted}`}>{text}</div>
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Field label="Rôle visé *" hint="Ex. Head of Digital, Digital Transformation Manager">
+            <Input value={d.role} onChange={(e) => set("role", e.target.value)} list="spont-roles" data-autofocus />
+            <datalist id="spont-roles">{roles.map((r) => <option key={r} value={r} />)}</datalist>
+          </Field>
+          {!base && <Field label="Entreprise ciblée *"><Input value={d.company} onChange={(e) => set("company", e.target.value)} /></Field>}
+          {!base && <Field label="Site web (facultatif)"><Input value={d.website} onChange={(e) => set("website", e.target.value)} placeholder="entreprise.be" /></Field>}
+          {!base && <Field label="Interlocuteur (facultatif)" hint="Nom et fonction, si vous le connaissez"><Input value={d.contactName} onChange={(e) => set("contactName", e.target.value)} placeholder="Mme Anne Dupont, CIO" /></Field>}
+          <Field label="Lieu (facultatif)"><Input value={d.location} onChange={(e) => set("location", e.target.value)} placeholder="Bruxelles, Wavre…" /></Field>
+          <Field label="Langue des documents">
+            <Select value={d.language} onChange={(e) => set("language", e.target.value)} className="w-full">
+              <option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+            </Select>
+          </Field>
+        </div>
+        <Field
+          label={base ? "Contexte (facultatif)" : "Pourquoi cette entreprise ? (recommandé)"}
+          hint={base ? "Secteurs ou types d'organisations visés, ce que vous voulez mettre en avant." : "Activité, projets, actualité, enjeux digitaux, valeurs, lien avec vous. Seule source d'information sur l'entreprise : l'IA n'invente aucun fait."}
+        >
+          <Textarea rows={6} value={d.context} onChange={(e) => set("context", e.target.value)} placeholder={base ? "Ex. fédérations, mutualités, secteur public bruxellois ; mettre en avant CRM et automatisation." : "Ex. lance un programme de digitalisation de son service membres ; nouveau CEO en 2026 ; utilise Dynamics 365…"} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
 function ManualImportModal({ open, onClose }) {
   const T = useT();
   const { importManual, busy, openOffer } = useApp();
@@ -4511,7 +4724,7 @@ function nextStep(a) {
 
 function PipelineView() {
   const T = useT();
-  const { apps, offers, settings, requestMove, openApp, go } = useApp();
+  const { apps, offers, settings, requestMove, openApp, go, setSpontOpen } = useApp();
   const [over, setOver] = useState(null);
   const [showClosed, setShowClosed] = useState(true);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
@@ -4521,10 +4734,10 @@ function PipelineView() {
       <PageHeader
         title="Pipeline"
         subtitle="Glissez une carte pour changer d'étape, ou ouvrez-la pour la déplacer au clavier."
-        actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
+        actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
       />
       {apps.length === 0 ? (
-        <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre pour démarrer une candidature." action={<Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn>} /></Card>
+        <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre ou lancez une candidature spontanée." action={<div className="flex flex-wrap justify-center gap-2"><Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn></div>} /></Card>
       ) : (
         <div className="flex gap-4 overflow-x-auto pb-6 -mx-4 px-4 sm:mx-0 sm:px-0" style={{ scrollSnapType: "x proximity" }}>
           {cols.map((st) => {
@@ -4567,6 +4780,7 @@ function PipelineView() {
                           </div>
                           <div className="flex flex-wrap gap-1.5 mt-3">
                             {a.demo && <Chip>exemple</Chip>}
+                            {o?.spontaneous && <Chip tone="accent">spontanée</Chip>}
                             {a.closed && <Chip tone={a.closed.outcome === "accepted" ? "ok" : "neutral"}>{OUTCOME_LABEL[a.closed.outcome]}</Chip>}
                             {Object.keys(a.docs || {}).length > 0 && <Chip><FileText className="w-3 h-3" aria-hidden="true" />{Object.keys(a.docs).length} doc.</Chip>}
                             {ns && <Chip tone={ns.urgent ? "danger" : "neutral"}><Clock className="w-3 h-3" aria-hidden="true" />{ns.text}</Chip>}
@@ -4768,7 +4982,7 @@ function ConfirmExternalModal({ confirm, onClose }) {
 
 function AppDrawer({ id, tab, setTab, onClose }) {
   const T = useT();
-  const { apps, offers, requestMove, openOffer } = useApp();
+  const { allApps: apps, offers, requestMove, openOffer } = useApp();
   const app = apps.find((a) => a.id === id);
   const offer = offers.find((o) => o.id === app?.offerId);
   if (!app) return null;
@@ -4783,9 +4997,10 @@ function AppDrawer({ id, tab, setTab, onClose }) {
         <span className="flex flex-wrap items-center gap-2">
           <span>{show(offer?.company)}</span>
           {offer?.sources?.find((x) => x.url) && (
-            <a href={offer.sources.find((x) => x.url).url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>Voir l'offre <ExternalLink className="w-3 h-3" aria-hidden="true" /></a>
+            <a href={offer.sources.find((x) => x.url).url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>{offer.spontaneous ? "Site de l'entreprise" : "Voir l'offre"} <ExternalLink className="w-3 h-3" aria-hidden="true" /></a>
           )}
-          {offer && <button type="button" className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>fiche Radar</button>}
+          {offer?.spontaneous && <Chip tone="accent">{SPONT_LABEL[offer.spontaneous]}</Chip>}
+          {offer && !offer.spontaneous && <button type="button" className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>fiche Radar</button>}
           {offer && <RatingChip company={offer.company} />}
         </span>
       }
@@ -4846,8 +5061,8 @@ function TrackPanel({ app, offer }) {
           />
         </Field>
         <div>
-          <span className={`block text-xs font-medium mb-1.5 ${T.muted}`}>Annonce</span>
-          <div className="text-sm break-all">{offer?.sources?.[0]?.url ? <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
+          <span className={`block text-xs font-medium mb-1.5 ${T.muted}`}>{offer?.spontaneous ? "Site de l'entreprise" : "Annonce"}</span>
+          <div className="text-sm break-all">{offer?.sources?.[0]?.url ? <ExtLink href={offer.sources[0].url}>{offer.spontaneous ? hostOf(offer.sources[0].url) : "Ouvrir l'annonce"}</ExtLink> : <span className={T.faint}>{offer?.spontaneous ? "Non renseigné" : `URL ${NC}`}</span>}</div>
         </div>
       </section>
 
@@ -4921,10 +5136,18 @@ function DossierPanel({ app, offer }) {
   const msgCount = MSG_TYPES.filter((d) => docs[d.id]?.length).length;
   return (
     <div className="space-y-6">
-      <Notice icon={Info}>
-        La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Ouvrez l'annonce et joignez le CV et la lettre en PDF.{" "}
-        {offer?.sources?.[0]?.url && <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink>}
-      </Notice>
+      {offer?.spontaneous ? (
+        <Notice icon={Info}>
+          {offer.spontaneous === "base"
+            ? "CV de base : réutilisable pour un cabinet de recrutement, un message LinkedIn ou comme point de départ d'une candidature ciblée."
+            : "Candidature spontanée : envoyez le CV et la lettre en PDF à un décideur nommé (e-mail ou LinkedIn), puis planifiez une relance."}
+        </Notice>
+      ) : (
+        <Notice icon={Info}>
+          La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Ouvrez l'annonce et joignez le CV et la lettre en PDF.{" "}
+          {offer?.sources?.[0]?.url && <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink>}
+        </Notice>
+      )}
       <section>
         <SectionTitle action={all ? <CopyBtn text={all} label="Copier tout le dossier" /> : null}>CV et lettre — studio plein écran</SectionTitle>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -5387,7 +5610,7 @@ function DiffView({ before, after, compact }) {
   );
 }
 
-function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, aiBusy, proposal, onAccept, onReject, flash, missingCount }) {
+function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, aiBusy, proposal, onAccept, onReject, flash, missingCount, spont }) {
   const T = useT();
   const [aiOpen, setAiOpen] = useState(false);
   const [custom, setCustom] = useState("");
@@ -5443,7 +5666,7 @@ function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, ai
         </div>
       )}
       {isSubject && (
-        <FieldBox label="Objet" hint="Reprenez l'intitulé exact du poste.">
+        <FieldBox label="Objet" hint={spont ? "Ex. « Candidature spontanée — rôle visé »." : "Reprenez l'intitulé exact du poste."}>
           <Input value={s.title} onChange={(e) => onChange({ ...s, title: e.target.value })} aria-label="Objet de la lettre" />
         </FieldBox>
       )}
@@ -5622,7 +5845,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
             { id: "checks", label: "Contrôles", count: report.issues.length || undefined },
             { id: "kw", label: "Mots-clés", count: report.kwPct !== null ? `${report.kwPct} %` : undefined },
             { id: "ai", label: "IA", count: pending.length || undefined },
-            { id: "ad", label: "Annonce" },
+            { id: "ad", label: offer?.spontaneous ? "Cible" : "Annonce" },
           ]}
         />
       </div>
@@ -5753,16 +5976,17 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
         <div className="p-4 space-y-5">
           {analysis ? (
             <>
+              {offer?.spontaneous && <Notice tone="accent" icon={Info}>Aucune annonce : analyse déduite du rôle visé{offer.spontaneous === "base" ? "" : " et du contexte que vous avez fourni"}.</Notice>}
               <div>
-                <div className={`text-xs ${T.muted}`}>Intitulé exact</div>
+                <div className={`text-xs ${T.muted}`}>{offer?.spontaneous ? "Intitulé courant du rôle" : "Intitulé exact"}</div>
                 <div className="text-sm font-medium">{analysis.jobTitle}</div>
                 {analysis.titleVariants?.length > 0 && <div className={`text-xs ${T.faint}`}>Équivalents : {analysis.titleVariants.join(", ")}</div>}
               </div>
-              {analysis.angle && <div><SectionTitle>Ce que l'employeur cherche</SectionTitle><p className="text-sm leading-relaxed">{analysis.angle}</p></div>}
+              {analysis.angle && <div><SectionTitle>{offer?.spontaneous ? "Ce que l'employeur pourrait y gagner" : "Ce que l'employeur cherche"}</SectionTitle><p className="text-sm leading-relaxed">{analysis.angle}</p></div>}
               {analysis.positioning?.pitch && <div><SectionTitle>Votre proposition de valeur</SectionTitle><p className="text-sm leading-relaxed">{analysis.positioning.pitch}</p></div>}
               {analysis.requirements?.length > 0 && (
                 <div>
-                  <SectionTitle>Exigences clés et preuves</SectionTitle>
+                  <SectionTitle>{offer?.spontaneous ? "Attentes du rôle et preuves" : "Exigences clés et preuves"}</SectionTitle>
                   <ul className="space-y-2">
                     {analysis.requirements.map((r, i) => (
                       <li key={i} className="flex gap-2 text-sm">
@@ -5782,14 +6006,14 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
               {analysis.companyFacts?.length > 0 && (
                 <div><SectionTitle>Contexte de l'entreprise (annonce)</SectionTitle><ul className={`text-sm space-y-1 ${T.muted}`}>{analysis.companyFacts.map((f, i) => <li key={i}>• {f}</li>)}</ul></div>
               )}
-              <p className={`text-xs ${T.faint}`}>Analyse du {fmtDate(analysis.createdAt, { time: true })} · {analysis.fromSummary ? "sur un résumé de l'annonce" : `${analysis.adChars || "?"} caractères d'annonce`}</p>
+              <p className={`text-xs ${T.faint}`}>Analyse du {fmtDate(analysis.createdAt, { time: true })} · {offer?.spontaneous ? `rôle « ${offer.title} »` : analysis.fromSummary ? "sur un résumé de l'annonce" : `${analysis.adChars || "?"} caractères d'annonce`}</p>
             </>
-          ) : <p className={`text-sm ${T.muted}`}>L'analyse extrait l'intitulé exact, 20 à 35 mots-clés ATS, les exigences clés et les preuves de votre profil. Elle pilote la rédaction et les contrôles.</p>}
-          {!offer?.fullText && <Notice tone="warn" icon={AlertTriangle}>Seul un résumé de l'annonce est enregistré : collez le texte complet ci-dessous pour une analyse ATS exhaustive.</Notice>}
-          <Field label="Texte complet de l'annonce" hint={`${ad.length} caractères · enregistré sur l'offre`}>
-            <Textarea rows={10} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} placeholder="Collez ici l'annonce complète (missions, profil, compétences, conditions)…" />
+          ) : <p className={`text-sm ${T.muted}`}>{offer?.spontaneous ? "L'analyse déduit l'intitulé courant du rôle, 20 à 30 mots-clés habituels des annonces et les attentes du rôle, confrontés à votre profil." : "L'analyse extrait l'intitulé exact, 20 à 35 mots-clés ATS, les exigences clés et les preuves de votre profil."} Elle pilote la rédaction et les contrôles.</p>}
+          {!offer?.fullText && !offer?.spontaneous && <Notice tone="warn" icon={AlertTriangle}>Seul un résumé de l'annonce est enregistré : collez le texte complet ci-dessous pour une analyse ATS exhaustive.</Notice>}
+          <Field label={offer?.spontaneous ? "Contexte de la candidature" : "Texte complet de l'annonce"} hint={offer?.spontaneous ? "Seule source d'information sur l'entreprise." : `${ad.length} caractères · enregistré sur l'offre`}>
+            <Textarea rows={10} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} placeholder={offer?.spontaneous ? "Ce que vous savez de l'entreprise et pourquoi elle…" : "Collez ici l'annonce complète (missions, profil, compétences, conditions)…"} />
           </Field>
-          <Btn variant={analysis ? "soft" : "primary"} icon={RefreshCw} loading={busy[`analysis:${app.id}`]} onClick={async () => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); await runAnalysis(app.id); }}>{analysis ? "Relancer l'analyse" : "Analyser l'annonce"}</Btn>
+          <Btn variant={analysis ? "soft" : "primary"} icon={RefreshCw} loading={busy[`analysis:${app.id}`]} onClick={async () => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); await runAnalysis(app.id); }}>{analysis ? "Relancer l'analyse" : offer?.spontaneous ? "Analyser le rôle" : "Analyser l'annonce"}</Btn>
         </div>
       )}
     </div>
@@ -5797,7 +6021,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
 }
 
 /* ── Réglages de génération ── */
-const GEN_STEPS = ["Analyse de l'annonce", "Rédaction", "Contrôle qualité"];
+const GEN_STEPS = ["Analyse de l'annonce ou du rôle", "Rédaction", "Contrôle qualité"];
 function GenSteps({ st }) {
   const T = useT();
   return (
@@ -5821,10 +6045,18 @@ function GenSteps({ st }) {
 
 function StudioSetup({ app, offer, type, onDone, onCancel }) {
   const T = useT();
-  const { generateDocs, busy, genStatus, setOfferAdText, profile, go } = useApp();
+  const { generateDocs, busy, genStatus, setOfferAdText, patchOfferNow, profile, go } = useApp();
   const first = !Object.keys(app.docs || {}).length;
+  const spont = offer?.spontaneous;
   const [prefs, setPrefs] = useState({ ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) });
-  const [types, setTypes] = useState(first ? DOC_TYPES.map((d) => d.id) : [type]);
+  const [types, setTypes] = useState(first ? (spont === "base" ? ["cv"] : spont ? ["cv", "letter", "linkedin", "email"] : DOC_TYPES.map((d) => d.id)) : [type]);
+  const [tgt, setTgt] = useState({ title: offer?.title || "", company: offer?.company || "", contactName: offer?.contactName || "", location: offer?.location || "" });
+  const commitTgt = () => {
+    const patch = {};
+    for (const k of Object.keys(tgt)) { const v = str(tgt[k]); if ((v || null) !== (offer?.[k] || null)) patch[k] = v; }
+    if (patch.title === null) delete patch.title;
+    if (Object.keys(patch).length) patchOfferNow(offer.id, patch);
+  };
   const [instruction, setInstruction] = useState("");
   const [ad, setAd] = useState(adTextOf(offer));
   const loading = !!busy[`dossier:${app.id}`];
@@ -5832,13 +6064,31 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
   const P2 = (k, v) => setPrefs((p) => ({ ...p, [k]: v }));
   const weakProfile = !profile.name || (profile.achievements || []).some((a) => /\[à compléter/i.test(a)) || !(profile.cvText || "").trim();
   const run = async () => {
-    if (ad.trim() && ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad);
+    if (spont) commitTgt();
+    if ((ad.trim() || spont) && ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad);
     const ok = await generateDocs(app.id, types, instruction.trim(), prefs);
     if (ok) onDone?.();
   };
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-6xl mx-auto px-4 sm:px-8 py-8 grid grid-cols-1 lg:grid-cols-5 gap-6">
+        {spont ? (
+          <Card className="p-6 lg:col-span-3 space-y-4">
+            <div>
+              <div className="text-lg font-medium tracking-tight">{SPONT_LABEL[spont]}</div>
+              <p className={`text-sm mt-1 ${T.muted}`}>Aucune offre : l'IA déduit les attentes du rôle visé et les mots-clés habituels des annonces belges, puis les confronte à votre profil. {spont === "base" ? "Le document reste réutilisable : aucune entreprise n'est citée." : "Le contexte ci-dessous est la seule source d'information sur l'entreprise : rien n'est inventé."}</p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="Rôle visé"><Input value={tgt.title} onChange={(e) => setTgt((x) => ({ ...x, title: e.target.value }))} onBlur={commitTgt} placeholder="Ex. Head of Digital" /></Field>
+              {spont !== "base" && <Field label="Entreprise ciblée"><Input value={tgt.company} onChange={(e) => setTgt((x) => ({ ...x, company: e.target.value }))} onBlur={commitTgt} /></Field>}
+              {spont !== "base" && <Field label="Interlocuteur (facultatif)"><Input value={tgt.contactName} onChange={(e) => setTgt((x) => ({ ...x, contactName: e.target.value }))} onBlur={commitTgt} placeholder="Ex. Mme Anne Dupont, CIO" /></Field>}
+              <Field label="Lieu (facultatif)"><Input value={tgt.location} onChange={(e) => setTgt((x) => ({ ...x, location: e.target.value }))} onBlur={commitTgt} /></Field>
+            </div>
+            <Field label={spont === "base" ? "Contexte (facultatif)" : "Pourquoi cette entreprise ? (recommandé)"} hint={spont === "base" ? "Secteurs ou types d'organisations visés, ce que vous voulez mettre en avant." : "Activité, projets, actualité, enjeux digitaux, valeurs, lien avec vous."}>
+              <Textarea rows={10} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} />
+            </Field>
+          </Card>
+        ) : (
         <Card className="p-6 lg:col-span-3 space-y-4">
           <div>
             <div className="text-lg font-medium tracking-tight">Annonce source</div>
@@ -5848,6 +6098,7 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
           <Textarea rows={18} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() && ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} aria-label="Texte complet de l'annonce" placeholder="Collez ici l'annonce complète…" />
           <div className={`text-xs ${T.faint}`}>{ad.length} caractères{offer?.sources?.[0]?.url ? <> · <ExtLink href={offer.sources[0].url}>ouvrir l'annonce</ExtLink></> : null}</div>
         </Card>
+        )}
         <div className="lg:col-span-2 space-y-4">
           <Card className="p-6 space-y-4">
             <div className="text-lg font-medium tracking-tight">Réglages</div>
@@ -5863,7 +6114,7 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Langue">
                 <Select value={prefs.language} onChange={(e) => P2("language", e.target.value)} className="w-full">
-                  <option value="auto">Celle de l'annonce</option><option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+                  <option value="auto">{spont ? "Celle choisie pour la cible" : "Celle de l'annonce"}</option><option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
                 </Select>
               </Field>
               <Field label="Ton">
@@ -5892,14 +6143,14 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
               </Notice>
             )}
             <div className="flex flex-wrap gap-2">
-              <Btn variant="primary" size="lg" icon={Sparkles} loading={loading} disabled={!types.length || ad.trim().length < 40} onClick={run}>{first ? "Générer le dossier" : "Générer une nouvelle version"}</Btn>
+              <Btn variant="primary" size="lg" icon={Sparkles} loading={loading} disabled={!types.length || (spont ? !tgt.title.trim() : ad.trim().length < 40)} onClick={run}>{first ? "Générer le dossier" : "Générer une nouvelle version"}</Btn>
               {onCancel && !first && <Btn variant="ghost" size="lg" onClick={() => onCancel()} disabled={loading}>Annuler</Btn>}
             </div>
           </Card>
           {loading && <GenSteps st={genStatus[app.id]} />}
           {!loading && (
             <div className={`text-xs space-y-1 ${T.muted}`}>
-              <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Rédaction en 3 étapes : analyse de l'annonce, rédaction, contrôle qualité avec corrections ciblées.</div>
+              <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Rédaction en 3 étapes : analyse {spont ? "du rôle visé" : "de l'annonce"}, rédaction, contrôle qualité avec corrections ciblées.</div>
               <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Votre fonction réelle sous votre nom ; le poste visé cité comme objectif, jamais comme acquis.</div>
               <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Aucun chiffre inventé : les manques sont marqués [à compléter].</div>
             </div>
@@ -5918,7 +6169,7 @@ function StudioBar({ offer, type, setType, onClose, children }) {
       <IconBtn icon={X} label="Fermer le studio (Échap)" onClick={onClose} className="shrink-0" />
       <div className="min-w-0 hidden lg:block" style={{ maxWidth: 210 }}>
         <div className="text-sm font-medium truncate">{offer?.title || "Candidature"}</div>
-        <div className={`text-xs truncate ${T.muted}`}>{show(offer?.company)}</div>
+        <div className={`text-xs truncate ${T.muted}`}>{offer?.spontaneous === "base" ? "CV de base · sans entreprise" : offer?.spontaneous ? `${show(offer.company)} · spontanée` : show(offer?.company)}</div>
       </div>
       <div className="shrink-0"><Tabs compact value={type} onChange={setType} tabs={[{ id: "cv", label: "CV" }, { id: "letter", label: "Lettre" }]} /></div>
       {children}
@@ -5928,12 +6179,14 @@ function StudioBar({ offer, type, setType, onClose, children }) {
 
 function DocStudio({ appId, type, setType, onClose }) {
   const T = useT();
-  const { apps, offers } = useApp();
+  const { allApps: apps, offers } = useApp();
   const ref = useRef(null);
   const flushRef = useRef(null);
   const closeRef = useRef(null);
   closeRef.current = () => { flushRef.current?.(); onClose(); };
   useFocusTrap(true, ref, () => closeRef.current());
+  /* Disposition partagée entre CV et lettre (le changement de document ne la réinitialise pas). */
+  const [ui, setUi] = useState(() => ({ layout: "split", pane: "edit", tab: "checks", zoomMode: "fit", panelOpen: typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1536px)").matches }));
   const app = apps.find((a) => a.id === appId);
   const offer = offers.find((o) => o.id === app?.offerId);
   const close = () => closeRef.current();
@@ -5949,7 +6202,7 @@ function DocStudio({ appId, type, setType, onClose }) {
   return (
     <div ref={ref} className={`fixed inset-0 z-50 flex flex-col ${T.app}`} role="dialog" aria-modal="true" aria-label="Studio CV et lettre" style={{ fontFamily: FONT }}>
       {has
-        ? <StudioWorkspace key={`${app.id}-${type}`} app={app} offer={offer} type={type} setType={setType} onClose={close} flushRef={flushRef} />
+        ? <StudioWorkspace key={`${app.id}-${type}`} app={app} offer={offer} type={type} setType={setType} onClose={close} flushRef={flushRef} ui={ui} setUi={setUi} />
         : (
           <>
             <StudioBar offer={offer} type={type} setType={setType} onClose={close} />
@@ -5960,7 +6213,7 @@ function DocStudio({ appId, type, setType, onClose }) {
   );
 }
 
-function StudioWorkspace({ app, offer, type, setType, onClose, flushRef }) {
+function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
   const T = useT();
   const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus } = useApp();
   const wide = useMedia("(min-width: 1024px)");
@@ -6042,16 +6295,14 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef }) {
   const discardDraft = () => { setModel(docToModel(baseline, type)); setAccent(cleanHex(v.accent)); setRestoredAt(null); saveDocDraft(app.id, type, null); };
 
   /* Disposition */
-  const [layout, setLayout] = useState("split");
-  const [pane, setPane] = useState("edit");
-  const [panelOpen, setPanelOpen] = useState(() => typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1536px)").matches);
-  const [tab, setTab] = useState("checks");
+  const uiSet = (k) => (v) => setUi((u) => ({ ...u, [k]: typeof v === "function" ? v(u[k]) : v }));
+  const { layout, pane, panelOpen, tab, zoomMode } = ui;
+  const setLayout = uiSet("layout"), setPane = uiSet("pane"), setPanelOpen = uiSet("panelOpen"), setTab = uiSet("tab"), setZoomMode = uiSet("zoomMode");
   const showEditor = wide ? layout !== "preview" : pane === "edit";
   const showPreview = wide ? layout !== "edit" : pane === "preview";
   const showPanel = wide ? panelOpen : pane === "panel";
 
   /* Aperçu : zoom ajusté à la largeur */
-  const [zoomMode, setZoomMode] = useState("fit");
   const [fitZoom, setFitZoom] = useState(0.8);
   const prevRef = useRef(null);
   useEffect(() => {
@@ -6260,6 +6511,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef }) {
                   onReject={() => setSecProp(null)}
                   flash={flash === i}
                   missingCount={missing.length}
+                  spont={!!offer?.spontaneous}
                 />
               ))}
               {type === "cv" ? (
@@ -6542,13 +6794,18 @@ function AppContacts({ app }) {
 
 function AssistantView() {
   const T = useT();
-  const { apps, offers, settings, openApp, openStudio, addToPipeline, go } = useApp();
+  const { apps, allApps, offers, settings, openApp, openStudio, addToPipeline, go, setSpontOpen } = useApp();
   const inPrep = apps.filter((a) => ["new", "retained", "prep"].includes(a.stage));
+  const baseDocs = allApps.filter((a) => a.kind === "base");
   const candidates = offers.filter((o) => o.status === "new" && o.score?.value >= settings.threshold).sort((a, b) => b.score.value - a.score.value).slice(0, 6);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
   return (
     <div>
-      <PageHeader title="Assistant candidature" subtitle="L'IA prépare, vous validez. Aucun document n'est envoyé en votre nom." />
+      <PageHeader
+        title="Assistant candidature"
+        subtitle="L'IA prépare, vous validez. Aucun document n'est envoyé en votre nom."
+        actions={<Btn variant="primary" icon={Plus} onClick={() => setSpontOpen(true)}>CV ou lettre sans offre</Btn>}
+      />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="p-6 lg:col-span-2">
           <SectionTitle>Candidatures à préparer</SectionTitle>
@@ -6562,7 +6819,7 @@ function AssistantView() {
                 return (
                   <li key={a.id} className={`flex flex-wrap items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium">{o?.title}{a.demo && <Chip className="ml-2">exemple</Chip>}</div>
+                      <div className="text-sm font-medium">{o?.title}{a.demo && <Chip className="ml-2">exemple</Chip>}{o?.spontaneous && <Chip tone="accent" className="ml-2">spontanée</Chip>}</div>
                       <div className={`text-xs ${T.muted}`}>{show(o?.company)} · {STAGE_LABEL[a.stage]} · {n}/{DOC_TYPES.length} documents</div>
                       <div className={`mt-2 h-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}><div className="h-full bg-indigo-600" style={{ width: `${(n / DOC_TYPES.length) * 100}%` }} /></div>
                     </div>
@@ -6581,6 +6838,7 @@ function AssistantView() {
               [true, "Analyse de l'annonce : intitulé exact, 20 à 35 mots-clés ATS, exigences et preuves de votre profil"],
               [true, "CV et lettre rédigés en 3 étapes (analyse, rédaction, contrôle qualité) dans la langue de l'annonce"],
               [true, "Studio plein écran : éditeur par sections, aperçu A4 fidèle au PDF, score et corrections à valider"],
+              [true, "Candidatures spontanées et CV de base, sans offre : partez d'un rôle visé"],
               [true, "Message LinkedIn, réponses au formulaire, e-mail et brouillon Gmail (jamais envoyé)"],
               [false, "Soumettre un formulaire sur le site de l'employeur ou d'un job board"],
               [false, "Envoyer un e-mail ou un message LinkedIn à votre place"],
@@ -6589,6 +6847,29 @@ function AssistantView() {
               <li key={t} className="flex gap-2">{ok ? <Check className={`w-4 h-4 mt-0.5 shrink-0 ${T.accentText}`} aria-label="Oui" /> : <X className="w-4 h-4 mt-0.5 shrink-0 text-rose-500" aria-label="Non" />}<span>{t}</span></li>
             ))}
           </ul>
+        </Card>
+        <Card className="p-6 lg:col-span-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setSpontOpen(true)}>Nouveau</Btn>}>Sans offre : candidatures spontanées et CV de base</SectionTitle>
+          <p className={`text-sm mb-4 ${T.muted}`}>Partez d'un rôle visé, avec ou sans entreprise ciblée. Les candidatures spontanées rejoignent le pipeline (relances, contacts) ; les CV de base restent ici, prêts à être déclinés.</p>
+          {baseDocs.length === 0 ? <p className={`text-sm ${T.faint}`}>Aucun CV de base pour l'instant.</p> : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {baseDocs.map((a) => {
+                const o = offerOf(a);
+                const n = Object.keys(a.docs || {}).length;
+                return (
+                  <div key={a.id} className={`flex items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
+                    <FileText className={`w-5 h-5 shrink-0 ${T.muted}`} aria-hidden="true" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">{o?.title || "CV de base"}</div>
+                      <div className={`text-xs truncate ${T.muted}`}>CV de base · {n ? `${n} document(s) · ${fmtDate(a.updatedAt)}` : "pas encore généré"}</div>
+                    </div>
+                    <Btn size="sm" variant="ghost" onClick={() => openApp(a.id, "docs")}>Fiche</Btn>
+                    <Btn size="sm" variant="primary" icon={Maximize2} onClick={() => openStudio(a.id, "cv")}>Studio</Btn>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </Card>
         <Card className="p-6 lg:col-span-3">
           <SectionTitle>Offres au-dessus du seuil, pas encore retenues</SectionTitle>

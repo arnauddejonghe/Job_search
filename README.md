@@ -50,6 +50,14 @@ Ouvert depuis la fiche candidature (onglet *Dossier*), l'Assistant, la palette `
 
 Mise en page : *Édition*, *Côte à côte* ou *Aperçu* ; le panneau d'optimisation s'ouvre depuis le score dans la barre. Sur mobile, trois onglets (Éditer, Aperçu, Optimiser).
 
+**Sans offre : candidature spontanée ou CV de base**
+
+Bouton « CV ou lettre sans offre » (Assistant), « Candidature spontanée » (Pipeline) ou `⌘K`. On part d'un **rôle visé** :
+- *Candidature spontanée* : entreprise ciblée, site, interlocuteur et contexte facultatifs (« pourquoi cette entreprise », seule source de faits sur elle). Elle entre dans le pipeline (étape « En préparation », badge « spontanée ») avec relances et contacts. Documents par défaut : CV, lettre, message LinkedIn, e-mail.
+- *CV de base* : aucun employeur cité, document réutilisable (cabinet, LinkedIn, point de départ). Rangé dans l'Assistant, hors pipeline.
+
+L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots-clés habituels des annonces belges et les attentes du rôle, confrontés au profil. La lettre spontanée est plus courte (200 à 300 mots), ne mentionne jamais d'annonce et demande un échange de 20 à 30 minutes ; en mode CV de base, elle devient un modèle avec emplacements « [à compléter] ». Ces cibles sont exclues de la veille, du scoring, du dédoublonnage et des statistiques d'offres.
+
 **Génération en trois étapes**
 
 1. **Analyse de l'annonce** (`adAnalysis`), sur le texte complet collé ou importé (`offer.fullText`, à défaut le résumé) : intitulé exact et équivalents, 20 à 35 mots-clés ATS classés (catégorie, importance 1-3, variantes) et confrontés au profil (prouvé, transférable, absent, avec la preuve), exigences clés, angle de l'employeur, ligne de positionnement proposée, écarts. Mise en cache tant que l'annonce et le profil ne changent pas.
@@ -64,8 +72,8 @@ radar:profile   { name, headline, home, summary, skills[], experiences[{role,org
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,
-                   description, fullText, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
-radar:apps      [{ id, offerId, stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
+                   description, fullText, spontaneous ("company" | "base" | absent), contactName, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
+radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
                    analysis{jobTitle, titleVariants[], keywords[{term,category,importance,variants[],status,evidence}], requirements[], angle, positioning{…}, gaps[], sig},
                    drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
@@ -84,8 +92,8 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `gmail` | MCP Gmail, outils de lecture uniquement | `{offers[], messagesRead}` |
 | `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
-| `adAnalysis` | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
-| `cvWrite`, `letterWrite` | aucun | `{cv, accent, accentSource, tips}` ; `{letter}` (balisage léger) |
+| `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
+| `cvWrite`, `letterWrite` / `letterSpontaneous` | aucun | `{cv, accent, accentSource, tips}` ; `{letter}` (balisage léger) |
 | `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
 | `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
 | `dossier` | aucun | `{language, linkedin, answers, email}` |
