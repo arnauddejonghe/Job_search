@@ -32,10 +32,29 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 | Scoring IA | Score 0-100, décomposition par critère, points forts, écarts, questions, drapeaux rouges avec preuve textuelle, niveau de confiance. Plafonds appliqués côté client (indispensable manquant ≤ 45, exclusion ≤ 20). Recalcul automatique quand une nouvelle version de critères est enregistrée. |
 | Vue d'ensemble | KPIs, « À faire aujourd'hui » (repriorisable par l'IA), meilleures offres, entonnoir, volume par source, score moyen par semaine. |
 | Pipeline | Kanban en 8 colonnes, glisser-déposer (ou sélecteur d'étape au clavier), clôture avec issue et motif, journal horodaté. |
-| Assistant candidature | CV adapté + points clés, lettre, message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
+| Assistant candidature | **Studio CV & lettre plein écran** (voir ci-dessous), message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
 | Relances & agenda | Règles J+7 / J+14 après envoi et J+2 après entretien (paramétrables). Rédaction IA, brouillon Gmail, rappel dans l'agenda. **Détection des réponses des recruteurs dans Gmail** (lecture seule) : chaque réponse est proposée avec une action (journal, entretien, offre, refus) à valider ; les relances devenues inutiles sont annulées. Fiche de préparation d'entretien sourcée (web_search), STAR, questions, négociation. |
 | Contacts | Recruteurs, cabinets, hiring managers et réseau, liés aux candidatures (destinataires des brouillons). |
 | Confidentialité & données | Mode discret (aperçu + confirmation avant toute écriture Google), alerte si l'employeur actuel est cité, titres d'agenda neutres, écran masquable, export/import JSON, réinitialisation. |
+
+### Studio CV & lettre
+
+Ouvert depuis la fiche candidature (onglet *Dossier*), l'Assistant, la palette `⌘K` ou « À faire aujourd'hui ». Il occupe tout l'écran.
+
+| Zone | Rôle |
+|---|---|
+| Éditeur structuré | En-tête (nom, **ligne de positionnement** sous le nom, coordonnées ; destinataire, lieu et date pour la lettre), puis une carte par section : paragraphes, puces, postes (Fonction · Organisation · Lieu · Période + puces), libellés (« Compétences : … »). Entrée crée la puce suivante, un collage multiligne est découpé, outils flottants pour monter / descendre / supprimer. Sections ajoutables (Profil, Réalisations clés, Certifications…). |
+| Aperçu A4 | Mêmes métriques que le PDF (Helvetica, tailles en points, marges en mm, pagination par blocs sans titre orphelin). Nombre de pages en direct, zoom, couleur d'accent. Un clic sur un passage ouvre la section correspondante dans l'éditeur. Les « [à compléter] » sont surlignés. |
+| Optimisation | Score /100 (mots-clés ATS, impact ou pertinence, lisibilité) et statut « prêt à envoyer ». **Contrôles** instantanés et sans IA : titre sous le nom qui annonce le poste visé, profil rédigé comme si le poste était déjà occupé, intitulé exact absent, pronoms, clichés, affirmations non prouvées, puces sans chiffre ou à formule faible, répétitions, longueur, pages, sections manquantes, coordonnées, employeur actuel cité ; pour la lettre : objet, entreprise citée, demande d'entretien, phrases en « Je ». **Mots-clés** : couverture pondérée par importance, variantes tolérées (pluriel, accents, tirets, acronymes), section où chaque terme apparaît, « Intégrer » ou « Je l'ai » (ajout au profil). **IA** : relecture recruteur et corrections ciblées présentées en avant / après, appliquées une à une ou toutes. **Annonce** : texte complet modifiable et analyse (exigences, preuves, écarts). |
+| Versions | Brouillon enregistré automatiquement (rien n'est perdu en fermant), annuler / rétablir, `⌘S` pour enregistrer une version, régénération avec réglages (langue, ton, profil avec ou sans « je », 1 ou 2 pages, consigne). |
+
+Mise en page : *Édition*, *Côte à côte* ou *Aperçu* ; le panneau d'optimisation s'ouvre depuis le score dans la barre. Sur mobile, trois onglets (Éditer, Aperçu, Optimiser).
+
+**Génération en trois étapes**
+
+1. **Analyse de l'annonce** (`adAnalysis`), sur le texte complet collé ou importé (`offer.fullText`, à défaut le résumé) : intitulé exact et équivalents, 20 à 35 mots-clés ATS classés (catégorie, importance 1-3, variantes) et confrontés au profil (prouvé, transférable, absent, avec la preuve), exigences clés, angle de l'employeur, ligne de positionnement proposée, écarts. Mise en cache tant que l'annonce et le profil ne changent pas.
+2. **Rédaction** du CV et de la lettre en parallèle (`cvWrite`, `letterWrite`) à partir de cette matrice : sous le nom, la fonction **réelle** et 2-3 expertises (jamais l'intitulé visé comme s'il était occupé) ; profil en trois temps (qui je suis aujourd'hui, preuves, le poste visé cité comme **objectif**) ; poste actuel au présent, postes passés au passé ; chaque mot-clé prouvé ou transférable d'importance 2-3 placé dans une phrase où il est démontré, pas seulement dans une liste ; aucun mot-clé « absent ».
+3. **Contrôle qualité** local puis **corrections ciblées** (`fixDoc`) sur les points détectés : remplacements courts dont le texte d'origine doit exister à l'identique, sinon ignorés.
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
@@ -45,8 +64,10 @@ radar:profile   { name, headline, home, summary, skills[], experiences[{role,org
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,
-                   description, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
+                   description, fullText, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
 radar:apps      [{ id, offerId, stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
+                   analysis{jobTitle, titleVariants[], keywords[{term,category,importance,variants[],status,evidence}], requirements[], angle, positioning{…}, gaps[], sig},
+                   drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
 ```
@@ -63,7 +84,11 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `gmail` | MCP Gmail, outils de lecture uniquement | `{offers[], messagesRead}` |
 | `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
-| `dossier` | aucun | `{language, cv, letter, linkedin, answers, email}` |
+| `adAnalysis` | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
+| `cvWrite`, `letterWrite` | aucun | `{cv, accent, accentSource, tips}` ; `{letter}` (balisage léger) |
+| `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
+| `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
+| `dossier` | aucun | `{language, linkedin, answers, email}` |
 | `followUp` | aucun | `{subject, body}` |
 | `prep` | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
 | `gmailDraft` | MCP Gmail, `create_draft` uniquement | `{created, draftId}` |
@@ -80,7 +105,7 @@ Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du 
 - Recherche multi-sources via `web_search`, normalisation, estimation du trajet depuis Ohain, dédoublonnage et fusion des sources.
 - Extraction des offres depuis les alertes e-mail Gmail.
 - Scoring expliqué, recalcul quand les critères changent, priorisation du jour.
-- Rédaction de tout le dossier, des relances et de la fiche d'entretien.
+- Analyse de l'annonce, rédaction du dossier en trois étapes, contrôle qualité continu, relances et fiche d'entretien.
 - Création de brouillons Gmail et d'événements Google Calendar, **après votre clic** (et confirmation en mode discret).
 - Planification des relances selon les règles.
 
