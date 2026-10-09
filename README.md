@@ -71,8 +71,9 @@ radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], mode
 radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
-radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt,
-                   description, fullText, spontaneous ("company" | "base" | absent), contactName, collectedAt, sources[{name,url,collectedAt,via,verified}], status, score{value,confidence,breakdown[],…,criteriaVersionId}, demo }]
+radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, publishedApprox, deadline,
+                   description, fullText, spontaneous ("company" | "base" | absent), contactName, collectedAt, seenAt, link{state,evidence,at,method}, autoReason, autoRule, dismissedBy, userKept,
+                   sources[{name,url,collectedAt,via,verified}], status, score{method:2,value,wishAvg,mustAvg,fit,confidence,breakdown[{id,…}],caps,criteriaVersionId}, demo }]
 radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
                    analysis{jobTitle, titleVariants[], keywords[{term,category,importance,variants[],status,evidence}], requirements[], angle, positioning{…}, gaps[], sig},
                    drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
@@ -125,6 +126,37 @@ Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du 
 - **Veille planifiée** : un artefact ne tourne pas en arrière-plan. La veille se lance à la main, ou automatiquement à l'ouverture si l'option est activée. Une veille produite ailleurs (tâche planifiée) peut être importée en JSON.
 - **Réponses des recruteurs** : détectées automatiquement, mais appliquées seulement après votre validation (une mauvaise interprétation ne doit pas clôturer une candidature).
 - **Temps de trajet** : ordre de grandeur (table locale ou estimation IA), pas un calcul d'itinéraire.
+
+## Version 3 — fiabilité, tri et qualité de la veille
+
+### Données : fin du blocage « Lecture des données impossible »
+- **Cause** : en v1, chaque collection était découpée en tranches de 180 000 caractères réécrites sur place. Une écriture interrompue (onglet fermé, quota, deux onglets ouverts) laissait une tranche neuve à côté d'anciennes, d'où `Expected ',' or ']' … position 180000` et l'enregistrement suspendu.
+- **Offres** : un document par offre (`data/users/<id>/radar_offers_v2/items/<offerId>`). Seules les offres modifiées sont réécrites (synchronisation par différence).
+- **Autres collections** : écriture atomique par génération (`<clé>__<gen>_<i>`), puis bascule du `__meta` avec somme de contrôle, puis suppression de l'ancienne génération.
+- **Réparation automatique** : une collection illisible est récupérée élément par élément (197 offres sur 197 récupérées sur les données réelles), une copie brute est conservée et l'enregistrement reprend. Un incident réseau ne bloque plus que le temps de « Réessayer ».
+
+### Tri
+- Onglets **À traiter · Non lues · Arrivées (depuis la dernière visite, groupées par jour) · Échéances · Pipeline · Écartées · Expirées · Toutes**, avec compteurs.
+- Statut **lu / non lu** (pastille), bandeau « Depuis votre dernière visite » sur la vue d'ensemble.
+- **Actions de masse** : sélection multiple (Maj+clic pour une plage, « tout sélectionner » sur le filtre), puis écarter, expirées, remettre à traiter, lues, pipeline, scorer, vérifier les liens, fusionner, supprimer. Chaque action est **annulable**.
+- Actions rapides par ligne (retenir, écarter, expirée) et bouton « Lien mort (404) » dans la fiche.
+
+### Règles de tri automatique (modifiables, avec aperçu)
+Appliquées à chaque arrivée et à chaque ouverture, aux seules offres « à traiter » (jamais au pipeline ni aux offres restaurées) :
+intitulé exclu (junior, stage…), pas de poste de management, hors périmètre (digital / IT / CRM / transformation, complété par les postes visés), date limite dépassée, annonce clôturée, publiée depuis plus de 30 jours, date inconnue et collectée depuis plus de 21 jours, trajet trop long, score < 40. La raison est affichée sur l'offre, qui reste restaurable.
+
+### Scoring systématique
+L'IA évalue **chaque critère** de la version active (identifiants M1, W1, X1, A1…) sur une grille fixe ; le score est **calculé par la page**, toujours avec la même formule : 55 % souhaités pondérés + 45 % indispensables, −5 par signal d'alerte (max −15), plafond 45 si un indispensable n'est pas rempli, plafond 20 si une exclusion est présente. Toute offre à traiter est scorée automatiquement dès son arrivée.
+
+### Doublons systématiques
+- Local, à chaque ouverture et arrivée : même URL, même identifiant d'annonce (LinkedIn, Indeed, StepStone, Glassdoor, Jobat), ou même entreprise + intitulé nettoyé (sans « (m/f/x) », lieu…). Fusion automatique, annulable.
+- IA, après chaque arrivée : confiance haute fusionnée directement (annulable), confiance moyenne à valider.
+
+### Offres mortes, dates de publication et dates limites
+- Champs `publishedAt` (date réelle, ou date de l'alerte e-mail marquée « ≈ ») et `deadline` (date limite de candidature) extraits partout ; colonnes, tri, onglet « Échéances » et carte « Dates limites proches ».
+- **Routine réécrite** : qualité avant quantité, filtre de pertinence avant dépôt, chaque candidate est ouverte (WebFetch) ou recherchée pour confirmer qu'elle est ouverte ; les annonces clôturées ne sont plus déposées.
+- **Vérification des offres suivies** : la page entretient `veille/verify_queue` (40 offres actives au plus) ; à chaque passage la Routine les vérifie et écrit `veille_verify/verify-*`. Les annonces clôturées passent en « Expirées ». Vérification à la demande depuis la sélection ou la fiche.
+- Limite : l'environnement de la Routine est en accès réseau « de confiance » ; WebFetch y est refusé pour les sites d'emploi et la vérification se replie sur la recherche web. Ajouter les domaines d'emploi aux domaines autorisés de l'environnement rend la vérification directe.
 
 ## Réalisé en version 2
 

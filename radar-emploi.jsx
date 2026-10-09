@@ -10,8 +10,8 @@ import {
   LayoutDashboard, Briefcase, Columns, Sparkles, BellRing, Users, Radio, User, ShieldCheck, Search,
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
-  Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
-  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Star, Palette, ChevronLeft,
+  Info, Clock, Menu, History, FileText, RefreshCw, Building2, Inbox,
+  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Palette, ChevronLeft, Filter, Link2, CalendarClock, CalendarDays, Unlink,
   Maximize2, Minimize2, Redo2, ArrowUp, ArrowDown, Lightbulb, SlidersHorizontal, Circle, Minus,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
@@ -104,6 +104,18 @@ const DEFAULT_SETTINGS = {
   autoNext: true,
   hideOlderThan: 45,
   sidebarCollapsed: false,
+  // v3 : tri automatique, scoring et dédoublonnage systématiques, vérification des liens
+  rules: null, // null = DEFAULT_RULES
+  autoScore: true,
+  autoScoreMax: 60,
+  autoDedupe: true,
+  autoDedupeAI: true,
+  lastAiDedupeAt: null,
+  autoVerify: true,
+  lastVerifyAt: null,
+  importedVerify: [],
+  lastVisitAt: null,
+  rulesAppliedV3: false,
 };
 
 const DEFAULT_PROFILE = {
@@ -339,26 +351,63 @@ function estimateCommute(location, aiMinutes) {
 }
 const commuteLabel = (c) => (c ? `~${c.minutes} min` : NC);
 
-/* Déduplication : même URL canonique, ou même entreprise + intitulés très proches. */
-function sameOffer(a, b) {
-  const ua = (a.sources || []).map((s) => canonicalUrl(s.url)).filter(Boolean);
-  const ub = (b.sources || []).map((s) => canonicalUrl(s.url)).filter(Boolean);
-  if (ua.some((u) => ub.includes(u))) return true;
-  const ca = companyKey(a.company), cb = companyKey(b.company);
-  if (!ca || !cb) return false;
-  const sameCo = ca === cb || (ca.length > 3 && cb.length > 3 && (ca.includes(cb) || cb.includes(ca)));
-  return sameCo && jaccard(tokens(a.title), tokens(b.title)) >= 0.6;
+/* Identifiant stable d'une annonce sur les grands sites (LinkedIn, Indeed, StepStone, Jobat…), quel que soit le format d'URL. */
+function jobKey(u) {
+  if (!u) return null;
+  let m;
+  const s = String(u).toLowerCase();
+  if ((m = s.match(/linkedin\.com\/(?:comm\/)?jobs\/view\/(?:[^/?#]*?-)?(\d{6,})/))) return `li:${m[1]}`;
+  if ((m = s.match(/linkedin\.com\/jobs\/.*[?&]currentjobid=(\d{6,})/))) return `li:${m[1]}`;
+  if ((m = s.match(/indeed\.[a-z.]+\/.*[?&](?:jk|vjk)=([0-9a-f]{12,})/))) return `in:${m[1]}`;
+  if ((m = s.match(/stepstone\.be\/.*?--(\d{6,})/))) return `st:${m[1]}`;
+  if ((m = s.match(/glassdoor\.[a-z.]+\/.*?jl=?(\d{6,})/))) return `gd:${m[1]}`;
+  if ((m = s.match(/jobat\.be\/.*?\/(\d{6,})/))) return `jb:${m[1]}`;
+  return null;
 }
-const FILLABLE = ["company", "location", "commute", "contract", "seniority", "salary", "remote", "language", "publishedAt"];
+/* Intitulé nettoyé pour comparer : sans (m/f/x), h/f, lieu ou référence en suffixe. */
+function cleanTitle(t) {
+  return normText(String(t || "")
+    .replace(/\((?:[mhfvwxd]\s*[/|,]\s*)+[mhfvwxd]\)|\b[mhfv]\s*\/\s*[mhfvwx](?:\s*\/\s*[xd])?\b/gi, " ")
+    .replace(/\s[-–|·]\s.*$/, " ")
+    .replace(/\b(ref|réf|job id)\b.*$/i, " "));
+}
+const realCompany = (c) => !!str(c) && !/confidenti|anonym|non communiqu|undisclosed|our client|notre client|onze klant|client final/i.test(c);
+const offerKeys = (o) => (o.sources || []).flatMap((s) => [canonicalUrl(s.url), jobKey(s.url)]).filter(Boolean);
+
+/* Déduplication : même URL ou même identifiant d'annonce ; ou même entreprise + intitulés proches ;
+   ou, employeur masqué (cabinet), intitulé identique et même lieu. */
+const FEAT = new WeakMap();
+function offerFeat(o) {
+  let f = FEAT.get(o);
+  if (!f) {
+    f = { keys: new Set(offerKeys(o)), toks: tokens(cleanTitle(o.title)), co: realCompany(o.company) ? companyKey(o.company) : "", loc: normText(o.location) };
+    FEAT.set(o, f);
+  }
+  return f;
+}
+function sameOffer(a, b) {
+  const fa = offerFeat(a), fb = offerFeat(b);
+  for (const k of fa.keys) if (fb.keys.has(k)) return true;
+  const sim = jaccard(fa.toks, fb.toks);
+  if (fa.co && fb.co) {
+    const sameCo = fa.co === fb.co || (fa.co.length > 3 && fb.co.length > 3 && (fa.co.includes(fb.co) || fb.co.includes(fa.co)));
+    return sameCo && sim >= 0.6;
+  }
+  return sim >= 0.85 && !!fa.loc && fa.loc === fb.loc;
+}
+const FILLABLE = ["company", "location", "commute", "contract", "seniority", "salary", "remote", "language", "publishedAt", "deadline"];
 function mergeOffers(existing, incoming) {
-  const list = existing.map((o) => ({ ...o }));
+  const list = [...existing]; // seules les offres touchées deviennent de nouveaux objets (sauvegarde différentielle)
   const added = [], merged = [];
   for (const inc of incoming) {
-    const hit = list.find((o) => !o.spontaneous && sameOffer(o, inc));
-    if (hit) {
+    const hi = list.findIndex((o) => !o.spontaneous && sameOffer(o, inc));
+    if (hi >= 0) {
+      const hit = { ...list[hi] };
+      list[hi] = hit;
       const srcs = [...(hit.sources || [])];
       for (const s of inc.sources) if (!srcs.some((x) => canonicalUrl(x.url) === canonicalUrl(s.url) && x.name === s.name)) srcs.push(s);
       for (const k of FILLABLE) if ((hit[k] === null || hit[k] === undefined || hit[k] === "") && inc[k]) hit[k] = inc[k];
+      if (hit.publishedApprox && inc.publishedAt && !inc.publishedApprox) { hit.publishedAt = inc.publishedAt; delete hit.publishedApprox; }
       if (inc.description && (!hit.description || inc.description.length > hit.description.length)) hit.description = inc.description;
       if (inc.fullText && !hit.fullText) hit.fullText = inc.fullText;
       hit.sources = srcs;
@@ -372,6 +421,83 @@ function mergeOffers(existing, incoming) {
   return { list, added, merged };
 }
 
+/* Fusion d'un groupe d'offres identiques dans une offre principale (annulable via mergeHistory). */
+function pickPrimary(members, pipeIds) {
+  return members.find((o) => pipeIds.has(o.id))
+    || members.find((o) => o.dismissedBy === "user" || o.expiredBy === "user")
+    || [...members].sort((a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || new Date(a.collectedAt) - new Date(b.collectedAt))[0];
+}
+function mergeMembers(primary, absorbed, reason, origin) {
+  const before = { sources: primary.sources, description: primary.description, ...Object.fromEntries(FILLABLE.map((k) => [k, primary[k]])) };
+  const merged = { ...primary, sources: [...(primary.sources || [])] };
+  for (const o of absorbed) {
+    for (const src of o.sources || []) if (!merged.sources.some((x) => canonicalUrl(x.url) === canonicalUrl(src.url) && x.name === src.name)) merged.sources.push(src);
+    for (const k of FILLABLE) if ((merged[k] === null || merged[k] === undefined || merged[k] === "") && o[k]) merged[k] = o[k];
+    if (o.description && (!merged.description || o.description.length > merged.description.length)) merged.description = o.description;
+    if (!merged.seenAt && o.seenAt) merged.seenAt = o.seenAt;
+  }
+  const slim = absorbed.map(({ mergeHistory: _m, ...rest }) => rest);
+  merged.mergeHistory = [...(primary.mergeHistory || []), { id: uid("merge"), at: nowISO(), reason: str(reason), origin, before, absorbed: slim }];
+  return merged;
+}
+/* Dédoublonnage local systématique (URL, identifiant d'annonce, entreprise + intitulé) sur tout le stock. */
+function dedupeLocal(list, apps) {
+  const pipeIds = new Set((apps || []).map((a) => a.offerId));
+  const n = list.length;
+  const parent = list.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const members = (r) => list.filter((_, k) => find(k) === r);
+  for (let i = 0; i < n; i++) {
+    if (list[i].demo || list[i].spontaneous) continue;
+    for (let j = i + 1; j < n; j++) {
+      if (list[j].demo || list[j].spontaneous || find(i) === find(j) || !sameOffer(list[i], list[j])) continue;
+      const ri = find(i), rj = find(j);
+      const pipes = [...members(ri), ...members(rj)].filter((o) => pipeIds.has(o.id)).length;
+      if (pipes > 1) continue; // deux candidatures distinctes : jamais fusionnées
+      parent[rj] = ri;
+    }
+  }
+  const groups = {};
+  list.forEach((o, i) => { const r = find(i); (groups[r] = groups[r] || []).push(o); });
+  const multi = Object.values(groups).filter((g) => g.length > 1);
+  if (!multi.length) return { list, merged: 0 };
+  const drop = new Set();
+  const repl = new Map();
+  for (const g of multi) {
+    const p = pickPrimary(g, pipeIds);
+    const abs = g.filter((o) => o !== p);
+    abs.forEach((o) => drop.add(o.id));
+    repl.set(p.id, mergeMembers(p, abs, "même annonce (URL, identifiant ou entreprise + intitulé)", "automatique"));
+  }
+  return { list: list.filter((o) => !drop.has(o.id)).map((o) => repl.get(o.id) || o), merged: drop.size };
+}
+/* Applique les règles à une liste : renvoie la nouvelle liste et les offres modifiées (pour annuler). */
+function applyRules(list, ver, rules, onlyIds) {
+  const prev = [];
+  const counts = {};
+  const at = nowISO();
+  const next = list.map((o) => {
+    if (onlyIds && !onlyIds.has(o.id)) return o;
+    const v = ruleVerdict(o, ver, rules);
+    if (!v) return o;
+    prev.push(o);
+    counts[v.rule] = (counts[v.rule] || 0) + 1;
+    return applyVerdict(o, v, at);
+  });
+  return { list: next, prev, counts };
+}
+const RULE_LABEL = { title: "intitulé exclu", seniority: "pas de management", domain: "hors périmètre", deadline: "date limite dépassée", link: "annonce clôturée", age: "trop ancienne", commute: "trajet trop long", score: "score trop bas" };
+const rulesOf = (settings) => ({ ...DEFAULT_RULES, ...(settings?.rules || {}) });
+
+/* Date « YYYY-MM-DD » valide et plausible (pas dans plus d'un an), sinon null. */
+function isoDay(v) {
+  const s = str(v);
+  if (!s) return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const d = m ? new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00`) : new Date(s);
+  if (isNaN(d.getTime()) || Math.abs(d.getTime() - Date.now()) > 400 * 864e5) return null;
+  return d.toISOString().slice(0, 10);
+}
 function normalizeOffer(raw, { sourceName, via, verifiedUrls, toolText, allowNoUrl }) {
   if (!raw || typeof raw !== "object") return null;
   const urlRaw = str(raw.url);
@@ -394,7 +520,9 @@ function normalizeOffer(raw, { sourceName, via, verifiedUrls, toolText, allowNoU
     salary: str(raw.salary),
     remote: str(raw.remote),
     language: lang && /^(fr|nl|en)$/i.test(lang) ? lang.toLowerCase() : null,
-    publishedAt: str(raw.publishedAt),
+    publishedAt: isoDay(raw.publishedAt),
+    publishedApprox: raw.publishedApprox === true || undefined,
+    deadline: isoDay(raw.deadline),
     description: (str(raw.description) || "").slice(0, 4000) || null,
     collectedAt: t,
     lastSeenAt: t,
@@ -433,6 +561,7 @@ function veilleConfig(version, sources, settings, sourceIds) {
     roles: c.roles || [], zones: c.zones || [], maxCommute: c.maxCommute ?? 60, remote: c.remote || null,
     mustHave: c.mustHave || [], exclusions: c.exclusions || [], keywords: c.keywords || { fr: [], nl: [], en: [] },
     sources: src, lookbackDays: settings.lookbackDays, maxPerSource: settings.maxPerSource, home: "Ohain (Brabant wallon)",
+    filters: (() => { const r = rulesOf(settings); return { maxAgeDays: r.maxAgeDays, titleExclude: r.titleExclude, managementOnly: r.requireSeniority, seniorityWords: r.seniorityTokens.slice(0, 25) }; })(),
   };
   return { ...body, sig: JSON.stringify(body) };
 }
@@ -440,13 +569,93 @@ function veilleConfig(version, sources, settings, sourceIds) {
 /* Une offre « active » : ni écartée, ni expirée, ni liée à une candidature clôturée. */
 const INACTIVE = ["dismissed", "expired", "closed"];
 const isActiveOffer = (o) => !o.spontaneous && !INACTIVE.includes(o.status);
-const isOldOffer = (o, days) => {
-  if (!days || o.status === "pipeline") return false;
-  const ref = o.publishedAt && !isNaN(new Date(o.publishedAt)) ? o.publishedAt : o.lastSeenAt || o.collectedAt;
-  return Date.now() - new Date(ref).getTime() > days * 864e5;
-};
 const ratingKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
 const fmtRating = (r) => (r && typeof r.rating === "number" ? r.rating.toFixed(1).replace(".", ",") : null);
+
+/* ── Fraîcheur, règles de tri automatique, score systématique ─────────── */
+const DAY = 864e5;
+const validDate = (d) => !!d && !isNaN(new Date(d).getTime());
+const ageDays = (iso) => (validDate(iso) ? Math.floor((Date.now() - new Date(iso).getTime()) / DAY) : null);
+const deadlineIn = (o) => (validDate(o.deadline) ? daysFromToday(o.deadline) : null);
+const pubRef = (o) => (validDate(o.publishedAt) ? o.publishedAt : null);
+
+/* Étiquette de fraîcheur affichée partout : publiée il y a X j (ou « date inconnue »). */
+function freshness(o) {
+  const a = ageDays(pubRef(o));
+  if (a === null) return { label: "date inconnue", tone: "warn", days: null };
+  const label = a <= 0 ? "aujourd'hui" : a === 1 ? "hier" : `il y a ${a} j`;
+  return { label: o.publishedApprox ? `≈ ${label}` : label, tone: a <= 7 ? "ok" : a <= 21 ? "neutral" : "warn", days: a };
+}
+
+const DEFAULT_RULES = {
+  enabled: true,
+  titleExclude: ["junior", "stage", "stagiaire", "stagiair", "intern", "internship", "trainee", "student", "etudiant", "jobstudent", "alternance", "apprenti", "apprentice", "graduate", "starter", "vrijwilliger", "benevole"],
+  requireSeniority: true,
+  seniorityTokens: ["manager", "head", "lead", "leader", "director", "directeur", "directrice", "direction", "responsable", "responsible", "mgr", "chef", "hoofd", "diensthoofd", "verantwoordelijke", "teamleader", "teamlead", "chief", "cio", "cdo", "cto", "dsi", "vp", "president"],
+  requireDomain: true,
+  domainTokens: ["digital", "digitale", "digitalisation", "digitalisering", "it", "ict", "informatique", "informatica", "crm", "transformation", "transformatie", "process", "processus", "processen", "excellence", "excellentie", "operations", "operational", "operationnel", "operationele", "amelioration", "improvement", "verbetering", "data", "information", "informatie", "systems", "systemes", "business", "innovation", "erp", "dynamics", "automation", "automatisation", "technology", "technologie", "applications", "programme", "program", "pmo", "projects", "projets", "change", "cio", "cdo", "cto", "dsi", "digitalization", "digitization", "application", "solution", "solutions", "workplace", "web", "iam", "security", "cyber", "architecture", "platform", "dt", "delivery", "service desk", "servicedesk", "quality"],
+  maxAgeDays: 30,
+  unknownDateMaxDays: 21,
+  commuteSlack: 20,
+  dismissBelow: 40,
+};
+
+/* Verdict des règles pour une offre active non protégée : null (garder) ou { status, reason }. */
+function ruleVerdict(o, crit, rules) {
+  if (!rules?.enabled || !o || o.demo || o.spontaneous || o.userKept || !["new"].includes(o.status)) return null;
+  const tt = ` ${normText(o.title)} `;
+  const hit = (rules.titleExclude || []).find((w) => w && tt.includes(` ${normText(w)} `));
+  if (hit) return { status: "dismissed", rule: "title", reason: `intitulé exclu (« ${hit} »)` };
+  if (rules.requireSeniority && !(rules.seniorityTokens || []).some((w) => tt.includes(` ${normText(w)} `)))
+    return { status: "dismissed", rule: "seniority", reason: "pas un poste de management (intitulé)" };
+  if (rules.requireDomain) {
+    const roleTokens = (crit?.roles || []).flatMap((r) => tokens(r)).filter((w) => !(rules.seniorityTokens || []).includes(w));
+    const dom = [...new Set([...(rules.domainTokens || []), ...roleTokens].map(normText).filter(Boolean))];
+    if (!dom.some((w) => tt.includes(` ${w} `))) return { status: "dismissed", rule: "domain", reason: "hors périmètre digital / IT / CRM / transformation (intitulé)" };
+  }
+  const dl = deadlineIn(o);
+  if (dl !== null && dl < 0) return { status: "expired", rule: "deadline", reason: `date limite dépassée (${fmtDate(o.deadline)})` };
+  if (o.link?.state === "closed") return { status: "expired", rule: "link", reason: o.link.evidence ? `annonce clôturée : ${o.link.evidence}` : "annonce clôturée (vérifiée)" };
+  const age = ageDays(pubRef(o));
+  if (age !== null && rules.maxAgeDays && age > rules.maxAgeDays) return { status: "expired", rule: "age", reason: `publiée il y a ${age} j (probablement pourvue)` };
+  if (age === null && rules.unknownDateMaxDays && o.link?.state !== "open") {
+    const seen = ageDays(o.collectedAt);
+    if (seen !== null && seen > rules.unknownDateMaxDays) return { status: "expired", rule: "age", reason: `date inconnue, collectée il y a ${seen} j` };
+  }
+  const max = Number(crit?.maxCommute) || 0;
+  if (max && o.commute?.minutes && o.commute.minutes > max + (rules.commuteSlack || 0)) return { status: "dismissed", rule: "commute", reason: `trajet ~${o.commute.minutes} min (max ${max})` };
+  if (rules.dismissBelow && o.score?.method === 2 && o.score.value < rules.dismissBelow) return { status: "dismissed", rule: "score", reason: `score ${o.score.value} < ${rules.dismissBelow}` };
+  return null;
+}
+const applyVerdict = (o, v, at = nowISO()) => ({ ...o, status: v.status, autoReason: v.reason, autoRule: v.rule, dismissedBy: "auto", ...(v.status === "expired" ? { expiredAt: at } : { dismissedAt: at }) });
+
+/* Liste figée des critères d'une version, avec identifiants stables pour le scoring. */
+function criteriaList(ver) {
+  return [
+    ...(ver?.mustHave || []).map((label, i) => ({ id: `M${i + 1}`, kind: "indispensable", label, weight: null })),
+    ...(ver?.wishes || []).map((w, i) => ({ id: `W${i + 1}`, kind: "souhaité", label: w.label, weight: clamp(Number(w.weight) || 1, 1, 5) })),
+    ...(ver?.exclusions || []).map((label, i) => ({ id: `X${i + 1}`, kind: "exclusion", label, weight: null })),
+    ...(ver?.redFlags || []).map((label, i) => ({ id: `A${i + 1}`, kind: "alerte", label, weight: null })),
+  ];
+}
+
+/* Score systématique : calculé ici, à partir des taux de correspondance renvoyés par l'IA, toujours avec la même formule.
+   55 % souhaités (moyenne pondérée) + 45 % indispensables (moyenne) ; plafonds et pénalités ci-dessous. */
+function computeScore(rows) {
+  const avg = (l) => (l.length ? l.reduce((a, b) => a + b, 0) / l.length : null);
+  const must = rows.filter((r) => r.kind === "indispensable");
+  const wish = rows.filter((r) => r.kind === "souhaité");
+  const wSum = wish.reduce((a, r) => a + (r.weight || 1), 0);
+  const wishAvg = wSum ? wish.reduce((a, r) => a + r.match * (r.weight || 1), 0) / wSum : null;
+  const mustAvg = avg(must.map((r) => r.match));
+  let score = wishAvg === null ? mustAvg ?? 50 : mustAvg === null ? wishAvg : 0.55 * wishAvg + 0.45 * mustAvg;
+  const caps = [];
+  const alerts = rows.filter((r) => r.kind === "alerte" && r.match >= 70).length;
+  if (alerts) { score -= Math.min(15, alerts * 5); caps.push(`${alerts} signal(aux) d'alerte : −${Math.min(15, alerts * 5)}`); }
+  if (must.some((r) => r.match < 30)) { score = Math.min(score, 45); caps.push("indispensable non rempli : plafond 45"); }
+  if (rows.some((r) => r.kind === "exclusion" && r.match >= 70)) { score = Math.min(score, 20); caps.push("exclusion touchée : plafond 20"); }
+  return { value: clamp(Math.round(score), 0, 100), caps, wishAvg: wishAvg === null ? null : Math.round(wishAvg), mustAvg: mustAvg === null ? null : Math.round(mustAvg) };
+}
 
 /* ── Documents « prêts à envoyer » : balisage léger → aperçu, texte ATS et PDF ──
    # Nom · > accroche (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section / objet
@@ -995,7 +1204,7 @@ async function saveFile(filename, data, mime) {
 }
 
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
-const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId;
+const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId || (!offer.demo && offer.score.method !== 2);
 const offerLang = (o) => o?.language || "fr";
 const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais" };
 
@@ -1028,32 +1237,102 @@ async function initRuntime() {
   return RT;
 }
 
-/* Données publiées : un document par tranche de 180 Ko (limite 256 Kio par document), sous data/users/<id>/ (privé). */
-const DB_CHUNK = 180000;
+/* ── Données publiées, sous data/users/<id>/ (privé) ─────────────────────
+   Le format v1 découpait chaque collection en tranches de 180 000 caractères réécrites sur place : une
+   écriture interrompue laissait une tranche neuve à côté de tranches anciennes, et la lecture échouait
+   (« Expected ',' or ']' … position 180000 »). Désormais :
+   - les offres sont stockées UNE PAR DOCUMENT (seules les offres modifiées sont réécrites) ;
+   - les autres collections sont écrites en tranches d'une nouvelle « génération », puis le document
+     __meta bascule sur elle (avec somme de contrôle), puis l'ancienne génération est supprimée :
+     une écriture interrompue laisse l'ancienne version intacte ;
+   - une collection illisible est réparée (récupération élément par élément) au lieu de tout bloquer. */
+const DB_CHUNK = 100000;
 const dbQueues = {};
 const dbDoc = (name) => RT.db.doc(`data/users/${RT.uid}/${name}`);
 const dbName = (key) => key.replace(/[^a-z0-9]/gi, "_");
+function checksum(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return `${s.length.toString(36)}-${(h >>> 0).toString(36)}`;
+}
+const dbRetry = async (fn) => {
+  try { return await fn(); }
+  catch (e) {
+    if (e?.code !== "unavailable" && e?.code !== "resource_exhausted") throw e;
+    await sleep(600 + Math.random() * 900);
+    return fn();
+  }
+};
+class StoreCorrupt extends Error {
+  constructor(key, raw, cause) { super(`données illisibles (${cause})`); this.key = key; this.raw = raw; }
+}
+
+/* Récupère les objets complets d'un tableau JSON endommagé (ceux qui chevauchent la zone abîmée sont perdus). */
+function scanObjectEnd(s, i) {
+  let depth = 0, inStr = false;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j];
+    if (inStr) { if (c === "\\") j++; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return j + 1;
+  }
+  return -1;
+}
+function salvageArray(raw, isItem) {
+  const out = [], seen = new Set();
+  const re = /\{"id":"/g;
+  let m;
+  while ((m = re.exec(raw || ""))) {
+    const end = scanObjectEnd(raw, m.index);
+    if (end < 0) continue;
+    let o;
+    try { o = JSON.parse(raw.slice(m.index, end)); } catch { continue; }
+    if (!o || typeof o.id !== "string" || !isItem(o)) continue;
+    if (!seen.has(o.id)) { seen.add(o.id); out.push(o); }
+    re.lastIndex = end;
+  }
+  return out;
+}
+const SALVAGE = {
+  offers: (o) => typeof o.title === "string" && Array.isArray(o.sources),
+  apps: (o) => typeof o.offerId === "string" && typeof o.stage === "string",
+  contacts: (o) => typeof o.name === "string",
+};
+
 const dbStore = {
-  async get(key) {
+  async readRaw(key) {
     const k = dbName(key);
-    const meta = await dbDoc(`${k}__meta`).get();
+    const meta = await dbRetry(() => dbDoc(`${k}__meta`).get());
     if (!meta.exists) return null;
-    const n = Number(meta.data()?.n) || 0;
-    const parts = await Promise.all(Array.from({ length: n }, (_, i) => dbDoc(`${k}__${i}`).get()));
-    return JSON.parse(parts.map((x) => String(x.data()?.c ?? "")).join(""));
+    const m = meta.data() || {};
+    const n = Number(m.n) || 0;
+    const name = (i) => (m.gen ? `${k}__${m.gen}_${i}` : `${k}__${i}`);
+    const parts = await Promise.all(Array.from({ length: n }, (_, i) => dbRetry(() => dbDoc(name(i)).get())));
+    return { raw: parts.map((x) => String(x.data()?.c ?? "")).join(""), meta: m };
+  },
+  async get(key) {
+    const r = await this.readRaw(key);
+    if (!r) return null;
+    if (r.meta.sum && checksum(r.raw) !== r.meta.sum) throw new StoreCorrupt(key, r.raw, "somme de contrôle");
+    try { return JSON.parse(r.raw); } catch (e) { throw new StoreCorrupt(key, r.raw, e.message); }
   },
   set(key, value) {
     const k = dbName(key);
     const run = async () => {
-      const str = JSON.stringify(value);
+      const str = typeof value === "string" ? value : JSON.stringify(value);
       const chunks = [];
       for (let i = 0; i < str.length; i += DB_CHUNK) chunks.push(str.slice(i, i + DB_CHUNK));
       if (!chunks.length) chunks.push("");
-      const prev = await dbDoc(`${k}__meta`).get();
-      const prevN = prev.exists ? Number(prev.data()?.n) || 0 : 0;
-      for (let i = 0; i < chunks.length; i++) await dbDoc(`${k}__${i}`).set({ c: chunks[i] });
-      await dbDoc(`${k}__meta`).set({ n: chunks.length, at: nowISO() });
-      for (let i = chunks.length; i < prevN; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+      const prev = await dbRetry(() => dbDoc(`${k}__meta`).get());
+      const pm = prev.exists ? prev.data() || {} : null;
+      const gen = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      for (let i = 0; i < chunks.length; i++) await dbRetry(() => dbDoc(`${k}__${gen}_${i}`).set({ c: chunks[i] }));
+      await dbRetry(() => dbDoc(`${k}__meta`).set({ n: chunks.length, gen, sum: checksum(str), at: nowISO(), v: 2 }));
+      if (pm) {
+        const old = (i) => (pm.gen ? `${k}__${pm.gen}_${i}` : `${k}__${i}`);
+        for (let i = 0; i < (Number(pm.n) || 0); i++) await dbDoc(old(i)).delete().catch(() => {});
+      }
     };
     dbQueues[k] = (dbQueues[k] || Promise.resolve()).catch(() => {}).then(run);
     return dbQueues[k];
@@ -1061,9 +1340,63 @@ const dbStore = {
   async remove(key) {
     const k = dbName(key);
     const meta = await dbDoc(`${k}__meta`).get().catch(() => null);
-    const n = meta?.exists ? Number(meta.data()?.n) || 0 : 0;
-    for (let i = 0; i < n; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+    const m = meta?.exists ? meta.data() || {} : {};
+    for (let i = 0; i < (Number(m.n) || 0); i++) await dbDoc(m.gen ? `${k}__${m.gen}_${i}` : `${k}__${i}`).delete().catch(() => {});
     await dbDoc(`${k}__meta`).delete().catch(() => {});
+  },
+};
+
+/* Offres : un document par offre sous data/users/<id>/radar_offers_v2/items/<offerId>.
+   Synchronisation par différence : seules les offres dont l'objet a changé sont réécrites. */
+const offerStore = {
+  saved: new Map(),
+  queue: Promise.resolve(),
+  root: () => RT.db.doc(`data/users/${RT.uid}/radar_offers_v2`),
+  col() { return this.root().collection("items"); },
+  async load() {
+    const meta = await dbRetry(() => this.root().get());
+    if (!meta.exists) return null;
+    const out = [];
+    let last = null;
+    for (let page = 0; page < 30; page++) {
+      let q = this.col().orderBy("id").limit(1000);
+      if (last) q = q.where("id", ">", last);
+      const snap = await dbRetry(() => q.get());
+      snap.docs.forEach((d) => { const o = d.data(); if (o && o.id) out.push(o); });
+      if (snap.size < 1000) break;
+      last = snap.docs[snap.docs.length - 1].data().id;
+    }
+    this.saved = new Map(out.map((o) => [o.id, o]));
+    return out;
+  },
+  /* Première écriture (migration ou import) : tout est écrit, puis le marqueur racine. */
+  async writeAll(list, info = {}) {
+    this.saved = new Map();
+    await this.sync(list);
+    await dbRetry(() => this.root().set({ v: 2, count: list.length, at: nowISO(), ...info }));
+  },
+  sync(list) {
+    const run = async () => {
+      const cur = new Map(list.map((o) => [o.id, o]));
+      const changed = list.filter((o) => this.saved.get(o.id) !== o);
+      const removed = [...this.saved.keys()].filter((id) => !cur.has(id));
+      if (!changed.length && !removed.length) return;
+      const ops = [
+        ...changed.map((o) => async () => { await dbRetry(() => this.col().doc(o.id).set(JSON.parse(JSON.stringify(o)))); this.saved.set(o.id, o); }),
+        ...removed.map((id) => async () => { await dbRetry(() => this.col().doc(id).delete()); this.saved.delete(id); }),
+      ];
+      let firstErr = null;
+      await pool(ops, 3, async (op) => { try { await op(); } catch (e) { firstErr = firstErr || e; } });
+      if (firstErr) throw firstErr;
+      if (this.pendingMigration) { await dbRetry(() => this.root().set({ v: 2, count: list.length, at: nowISO(), migratedFrom: "v1" })); this.pendingMigration = false; }
+    };
+    this.queue = this.queue.catch(() => {}).then(run);
+    return this.queue;
+  },
+  async clear() {
+    for (const id of [...this.saved.keys()]) await this.col().doc(id).delete().catch(() => {});
+    this.saved = new Map();
+    await this.root().delete().catch(() => {});
   },
 };
 
@@ -1084,14 +1417,21 @@ const storage = {
     if (r === null || r === undefined) return null;
     const raw = typeof r === "string" ? r : r.value;
     if (raw === null || raw === undefined) return null;
-    return typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (typeof raw !== "string") return raw;
+    try { return JSON.parse(raw); } catch (e) { throw new StoreCorrupt(key, raw, e.message); }
   },
   async set(key, value) {
-    if (RT.mode === "published") return dbStore.set(key, value);
+    if (RT.mode === "published") {
+      if (key === KEYS.offers) return offerStore.sync(value);
+      return dbStore.set(key, value);
+    }
     await window.storage.set(key, JSON.stringify(value));
   },
   async remove(key) {
-    if (RT.mode === "published") return dbStore.remove(key);
+    if (RT.mode === "published") {
+      if (key === KEYS.offers) { await offerStore.clear(); return dbStore.remove(key); }
+      return dbStore.remove(key);
+    }
     try { await window.storage.delete(key); } catch { /* clé absente */ }
   },
 };
@@ -1375,7 +1715,7 @@ function profileDigest(p, full = false) {
   ].filter(Boolean).join("\n");
 }
 
-const OFFER_SCHEMA = `{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD ou null","url":"","description":"","commuteMinutes":null}`;
+const OFFER_SCHEMA = `{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD ou null","deadline":"YYYY-MM-DD ou null (date limite de candidature)","url":"","description":"","commuteMinutes":null}`;
 
 /* ── Rédaction des documents : réglages, contexte, analyse de l'annonce ── */
 const SYSTEM_WRITER = `Tu es un rédacteur senior de CV et de lettres de motivation (niveau cabinet de recrutement de cadres), spécialiste du marché belge en français, néerlandais et anglais.
@@ -1508,6 +1848,8 @@ MÉTHODE
 RÈGLES STRICTES
 - N'invente jamais une offre. L'URL doit être exactement celle d'un résultat de recherche que tu as vu.
 - Champ inconnu ou absent de l'annonce → null. Le salaire n'est renseigné que s'il est écrit dans l'annonce.
+- publishedAt : date de publication visible (« il y a 5 jours » → calcule la date). deadline : date limite de candidature si elle est indiquée (« postuler avant le… », « apply by », « solliciteren tot »), sinon null.
+- Écarte toute annonce marquée « expirée », « n'accepte plus de candidatures », « no longer accepting applications », « closed », « vacature gesloten », ou dont la date limite est passée.
 - description : résumé factuel (missions, profil, conditions) en 600 caractères max, sans extrapoler.
 - commuteMinutes : estimation du trajet en voiture hors heures de pointe depuis Ohain, null si le lieu est inconnu.
 
@@ -1526,11 +1868,12 @@ Mission : importer les offres d'emploi reçues dans les e-mails d'alertes emploi
 
 RÈGLES
 - N'extrais que ce qui figure dans les e-mails. url = lien de l'offre tel qu'il apparaît dans l'e-mail. Champ absent → null.
+- publishedAt : date de publication si l'e-mail l'indique ; sinon la date de réception de l'e-mail, avec "publishedApprox": true. deadline : date limite si indiquée, sinon null.
 - Garde les offres de niveau management / digital / IT / CRM / transformation / opérations ; ignore stages, postes juniors et métiers sans rapport.
 - description : ce que l'e-mail dit de l'offre (souvent court), sans extrapoler.
 
 Réponds uniquement avec ce JSON :
-{"offers":[{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":null,"url":"","description":"","commuteMinutes":null,"sourceName":"LinkedIn|Indeed|Jobat|…","emailSubject":""}],"messagesRead":0,"notes":""}`;
+{"offers":[{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD","publishedApprox":false,"deadline":null,"url":"","description":"","commuteMinutes":null,"sourceName":"LinkedIn|Indeed|Jobat|…","emailSubject":""}],"messagesRead":0,"notes":""}`;
   },
 
   structure({ text, url }) {
@@ -1538,7 +1881,7 @@ Réponds uniquement avec ce JSON :
 Mission : structurer une annonce d'emploi fournie par l'utilisateur.
 ${url ? `URL fournie : ${url}\n` : ""}${text ? `Texte de l'annonce :\n<<<\n${text.slice(0, 20000)}\n>>>\n` : ""}
 ${url && !text ? `Utilise web_search pour retrouver CETTE annonce précise (intitulé, entreprise, contenu). Si tu ne la retrouves pas avec certitude, réponds {"found":false,"reason":"…"}.` : "Base-toi uniquement sur le texte fourni."}
-Règles : aucun champ inventé (null si absent) ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 800 caractères max ; commuteMinutes = trajet voiture estimé depuis Ohain ou null.
+Règles : aucun champ inventé (null si absent) ; publishedAt et deadline (date limite de candidature) au format YYYY-MM-DD s'ils figurent dans l'annonce ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 800 caractères max ; commuteMinutes = trajet voiture estimé depuis Ohain ou null.
 Réponds uniquement avec ce JSON :
 {"found":true,"offer":${OFFER_SCHEMA}}`;
   },
@@ -1547,31 +1890,33 @@ Réponds uniquement avec ce JSON :
     const compact = offers.map((o) => ({
       id: o.id, title: o.title, company: o.company, location: o.location,
       commuteMinutes: o.commute?.minutes ?? null, contract: o.contract, seniority: o.seniority,
-      salary: o.salary, remote: o.remote, language: o.language, description: o.description,
+      salary: o.salary, remote: o.remote, language: o.language, publishedAt: o.publishedAt || null, deadline: o.deadline || null,
+      description: (o.description || "").slice(0, 1800),
     }));
-    return `Mission : évaluer l'adéquation de chaque offre avec le profil et les critères du candidat. Sois factuel, sobre, sans complaisance.
+    const list = criteriaList(c).map((x) => `${x.id} [${x.kind}${x.weight ? `, poids ${x.weight}` : ""}] ${x.label}`).join("\n");
+    return `Mission : évaluer, critère par critère, l'adéquation de chaque offre avec le profil du candidat. Le score final est calculé par la plateforme à partir de tes taux : sois rigoureux et constant d'une offre à l'autre.
 
 PROFIL
 ${profileDigest(profile)}
+Domicile : Ohain (Brabant wallon). Trajet max souhaité : ${c.maxCommute} min. Télétravail : ${c.remote}.
 
-CRITÈRES (version « ${versionLabel} »)
-${criteriaDigest(c)}
+CRITÈRES (version « ${versionLabel} ») — évalue CHACUN, pour CHAQUE offre, avec son identifiant :
+${list}
 
 OFFRES
 ${JSON.stringify(compact)}
 
-BARÈME
-- breakdown : une ligne par critère indispensable, souhaité, exclusion et signal d'alerte.
-  · indispensable / souhaité : match 0-100 = degré de satisfaction.
-  · exclusion / alerte : match 0-100 = degré de PRÉSENCE (100 = clairement présent dans l'annonce).
-  · note : 15 mots max, factuelle, qui s'appuie sur l'annonce. Information absente → match 50 et note « non précisé ».
-- score 0-100 : moyenne pondérée des souhaités, ajustée par le reste. Plafond 45 si un indispensable est clairement non rempli ; plafond 20 si une exclusion est clairement présente.
-- confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre (moins de ~3 phrases utiles ou champs clés absents).
-- redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce (type : stress, turnover, role_flou, autre).
-- questions : points à clarifier avec le recruteur.
+GRILLE (identique pour toutes les offres)
+- indispensable / souhaité : match = degré de satisfaction. 100 = explicitement satisfait ; 75 = très probable ; 50 = non précisé dans l'annonce ; 25 = peu probable ; 0 = explicitement contraire.
+- exclusion / alerte : match = degré de PRÉSENCE. 100 = explicitement présent ; 50 = non précisé ; 0 = explicitement absent.
+- Le niveau de responsabilité compte : un poste d'exécution, de consultant sans équipe ou de chef de projet sans management direct ne satisfait pas un critère « responsabilités managériales ».
+- note : 12 mots max, factuelle, tirée de l'annonce ; « non précisé » si l'information manque.
+- fit : "fort" | "moyen" | "faible" — ton avis global en une lettre de lecture rapide.
+- confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre.
+- redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce.
 
-Réponds uniquement avec ce JSON :
-{"scores":[{"id":"","score":0,"confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","breakdown":[{"criterion":"","kind":"indispensable|souhaité|exclusion|alerte","weight":1,"match":0,"note":""}],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
+Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifiant de critère) :
+{"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
   dossier(offer, profile, types, instruction, analysis) {
@@ -2064,6 +2409,15 @@ RÈGLES
 Réponds uniquement {"replies":[{"appId":"","date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"messagesRead":0}`;
   },
 
+  verify(items) {
+    return `Date du jour : ${todayStr()}.
+Mission : pour chaque offre d'emploi ci-dessous, déterminer si elle est ENCORE OUVERTE aux candidatures.
+${JSON.stringify(items)}
+Méthode : web_search sur l'intitulé exact + l'entreprise (et le domaine de l'URL). Une offre est "closed" si un résultat montre « expirée », « n'accepte plus de candidatures », « no longer accepting applications », « closed », « vacature gesloten », une date limite passée, ou si l'annonce n'apparaît plus que sur des agrégateurs anciens. "open" seulement si un résultat récent (moins de 30 jours) montre l'annonce active. Sinon "unknown".
+evidence : la preuve courte (texte du résultat). publishedAt / deadline : YYYY-MM-DD si visibles, sinon null. N'invente rien.
+Réponds uniquement {"results":[{"id":"","state":"open|closed|unknown","evidence":"","publishedAt":null,"deadline":null}]}`;
+  },
+
   today(items) {
     return `Voici les actions candidates d'une recherche d'emploi discrète (JSON). Classe-les par priorité pour aujourd'hui selon les échéances, le score des offres et l'avancement des candidatures. Pour chacune, une raison de 12 mots max. N'ajoute aucune action.
 ${JSON.stringify(items.map(({ id, label, detail, due }) => ({ id, label, detail, due })))}
@@ -2071,25 +2425,32 @@ Réponds uniquement {"ordered":[{"id":"","priority":1,"reason":""}]} (priorité 
   },
 };
 
-/* Score final : score IA borné par les règles dures, pour qu'il reste cohérent avec sa décomposition. */
-function finalizeScore(s, versionId) {
-  const bd = Array.isArray(s.breakdown) ? s.breakdown : [];
-  let score = clamp(Math.round(Number(s.score) || 0), 0, 100);
-  const caps = [];
-  if (bd.some((b) => b.kind === "indispensable" && Number(b.match) < 30)) { score = Math.min(score, 45); caps.push("indispensable non rempli"); }
-  if (bd.some((b) => b.kind === "exclusion" && Number(b.match) >= 70)) { score = Math.min(score, 20); caps.push("exclusion touchée"); }
+/* Score final : chaque critère de la version active reçoit un taux (50 « non précisé » si l'IA l'a omis),
+   puis computeScore applique toujours la même formule. */
+function finalizeScore(s, ver) {
+  const byId = Object.fromEntries((Array.isArray(s.matches) ? s.matches : []).filter((m) => m && m.c).map((m) => [String(m.c).trim().toUpperCase(), m]));
+  const breakdown = criteriaList(ver).map((c) => {
+    const m = byId[c.id];
+    const raw = Number(m?.match);
+    return { id: c.id, criterion: c.label, kind: c.kind, weight: c.weight, match: m && Number.isFinite(raw) ? clamp(Math.round(raw), 0, 100) : 50, note: m ? str(m.note) : "non évalué" };
+  });
+  const calc = computeScore(breakdown);
   return {
-    value: score,
+    method: 2,
+    value: calc.value,
+    wishAvg: calc.wishAvg,
+    mustAvg: calc.mustAvg,
+    fit: ["fort", "moyen", "faible"].includes(s.fit) ? s.fit : null,
     confidence: ["haute", "moyenne", "faible"].includes(s.confidence) ? s.confidence : "moyenne",
     confidenceReason: str(s.confidenceReason),
     summary: str(s.summary),
-    breakdown: bd.map((b) => ({ criterion: String(b.criterion || ""), kind: b.kind || "souhaité", weight: Number(b.weight) || null, match: clamp(Number(b.match) || 0, 0, 100), note: str(b.note) })),
-    strengths: (s.strengths || []).map(String),
-    gaps: (s.gaps || []).map(String),
-    questions: (s.questions || []).map(String),
+    breakdown,
+    strengths: (s.strengths || []).map(String).slice(0, 6),
+    gaps: (s.gaps || []).map(String).slice(0, 6),
+    questions: (s.questions || []).map(String).slice(0, 5),
     redFlags: (s.redFlags || []).filter((r) => r && r.evidence).map((r) => ({ type: r.type || "autre", evidence: String(r.evidence) })),
-    caps,
-    criteriaVersionId: versionId,
+    caps: calc.caps,
+    criteriaVersionId: ver.id,
     scoredAt: nowISO(),
   };
 }
@@ -2676,6 +3037,8 @@ function usePrefersDark() {
 export default function RadarApp() {
   const [loaded, setLoaded] = useState(false);
   const [storageState, setStorageState] = useState({ ok: true, readOnly: false, message: null });
+  const [bootMsg, setBootMsg] = useState(null);
+  const [recovery, setRecovery] = useState(null);
   const [saveState, setSaveState] = useState("idle");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [profile, setProfile] = useState(DEFAULT_PROFILE);
@@ -2702,6 +3065,9 @@ export default function RadarApp() {
   const [todayAI, setTodayAI] = useState(null);
   const [offerPreset, setOfferPreset] = useState(null);
   const [dupeProposals, setDupeProposals] = useState(null);
+  const [dupePending, setDupePending] = useState(null);
+  const [lastBulk, setLastBulk] = useState(null);
+  const [visitPrev, setVisitPrev] = useState(null);
   const [replyProposals, setReplyProposals] = useState(null);
   const [genStatus, setGenStatus] = useState({});
   const [studio, setStudio] = useState(null);
@@ -2746,25 +3112,58 @@ export default function RadarApp() {
         let existing = null;
         try { existing = await storage.list("radar:"); } catch { existing = null; }
         const out = {};
+        const repaired = [];
+        /* Collection illisible : copie brute mise de côté, puis récupération élément par élément (ou valeurs par défaut). */
+        const recover = async (name, key, e) => {
+          const items = SALVAGE[name] ? salvageArray(e.raw, SALVAGE[name]) : null;
+          // Offres publiées : les tranches v1 restent en place et servent de copie brute.
+          if (!(RT.mode === "published" && name === "offers")) {
+            try { await storage.set(`radar:backup:${name}`, String(e.raw || "")); } catch { /* sauvegarde best effort */ }
+          }
+          repaired.push({ name, count: items ? items.length : null, at: nowISO() });
+          return items;
+        };
         for (const [name, key] of Object.entries(KEYS)) {
+          if (RT.mode === "published" && name === "offers") {
+            setBootMsg("Lecture des offres…");
+            let list = await offerStore.load();
+            if (list === null) {
+              // Première ouverture depuis le format v1 : migration vers un document par offre.
+              try { list = await storage.get(key); } catch (e) { if (!(e instanceof StoreCorrupt)) throw e; list = await recover(name, key, e); }
+              if (Array.isArray(list) && list.length) {
+                setBootMsg(`Migration de ${list.length} offres vers le nouveau format (une seule fois)…`);
+                try { await offerStore.writeAll(list, { migratedFrom: "v1" }); }
+                catch { offerStore.pendingMigration = true; }
+              }
+            }
+            out[name] = list;
+            continue;
+          }
           if (existing && !existing.includes(key)) { out[name] = null; continue; }
           try {
             out[name] = await storage.get(key);
           } catch (e) {
-            if (existing || RT.mode === "published") throw e; // lecture en échec : on n'écrase rien
+            if (e instanceof StoreCorrupt) { out[name] = await recover(name, key, e); continue; }
+            if (existing || RT.mode === "published") throw e; // lecture en échec (réseau) : on n'écrase rien
             out[name] = null; // sans liste, une erreur signifie le plus souvent « clé absente »
           }
         }
+        if (repaired.length) setRecovery(repaired);
         const first = Object.values(out).every((v) => v === null || v === undefined);
         if (first) {
           applyDefaults();
         } else {
           const s = out.settings || {};
+          // Visite : la « dernière visite » n'avance que si la précédente date de plus de 2 h.
+          const lastV = s.lastVisitAt ? new Date(s.lastVisitAt).getTime() : 0;
+          const prevV = lastV && Date.now() - lastV > 2 * 36e5 ? s.lastVisitAt : s.visitPrevAt || s.lastVisitAt || null;
+          setVisitPrev(prevV);
           setSettings({
             ...DEFAULT_SETTINGS, ...s,
             mcp: { ...DEFAULT_SETTINGS.mcp, ...(s.mcp || {}) },
             mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(s.mcpTools || {}) },
             followUp: { ...DEFAULT_SETTINGS.followUp, ...(s.followUp || {}) },
+            visitPrevAt: prevV, lastVisitAt: nowISO(),
           });
           if (out.profile) setProfile({ ...DEFAULT_PROFILE, ...out.profile });
           setCriteria(out.criteria?.versions?.length ? out.criteria : makeCriteriaState());
@@ -2775,15 +3174,28 @@ export default function RadarApp() {
             if (missing.length) setSettings((x) => ({ ...x, sourcesPack: 2 }));
           }
           const closedOffers = new Set((out.apps || []).filter((a) => a.stage === "closed").map((a) => a.offerId));
-          setOffers((out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o)));
+          let list = (out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o));
+          // Tri systématique à chaque ouverture : doublons fusionnés, puis règles (âge, date limite, intitulé, trajet…).
+          const merged = s.autoDedupe === false ? 0 : (() => { const d = dedupeLocal(list, out.apps); list = d.list; return d.merged; })();
+          const crit0 = out.criteria?.versions?.length ? activeVersion(out.criteria) : null;
+          const ruled = crit0 ? applyRules(list, crit0, rulesOf(s)) : { list, prev: [], counts: {} };
+          list = ruled.list;
+          setOffers(list);
+          if (ruled.prev.length || merged) {
+            setLastBulk({
+              label: `À l'ouverture : ${merged ? `${merged} doublon(s) fusionné(s)` : ""}${merged && ruled.prev.length ? " · " : ""}${ruled.prev.length ? `${ruled.prev.length} offre(s) triée(s) automatiquement (${Object.entries(ruled.counts).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(", ")})` : ""}`,
+              prev: ruled.prev, at: nowISO(), undoable: ruled.prev.length > 0,
+            });
+          }
           if (out.ratings) setRatings(out.ratings);
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
       } catch (e) {
-        setStorageState({ ok: false, readOnly: true, message: `Lecture des données impossible (${e.message}). L'enregistrement est suspendu pour ne rien écraser. Rechargez l'artefact.` });
+        setStorageState({ ok: false, readOnly: true, retry: true, message: `Connexion au stockage impossible (${e?.message || e?.code || e}). Vos données ne sont pas touchées : l'enregistrement reste suspendu tant que la lecture n'a pas réussi.` });
         applyDefaults();
       } finally {
+        setBootMsg(null);
         setLoaded(true);
       }
     })();
@@ -2873,51 +3285,91 @@ export default function RadarApp() {
   const addLogEntry = (a, type, text) => ({ ...a, updatedAt: nowISO(), log: [...(a.log || []), { id: uid("log"), at: nowISO(), type, text }] });
   const patchApp = (id, fn) => setApps((l) => l.map((a) => (a.id === id ? fn(a) : a)));
   const logApp = (id, type, text) => patchApp(id, (a) => addLogEntry(a, type, text));
+  /* Arrivée d'offres : fusion des doublons, puis règles de tri appliquées aux nouvelles ; le scoring et la
+     détection IA des doublons suivent automatiquement (effets plus bas). */
   const applyIncoming = (incoming) => {
     const { list, added, merged } = mergeOffers(R.current.offers, incoming);
-    R.current.offers = list;
-    setOffers(list);
-    return { added, merged };
+    const ver = activeVersion(R.current.criteria);
+    const ruled = applyRules(list, ver, rulesOf(R.current.settings), new Set(added));
+    R.current.offers = ruled.list;
+    setOffers(ruled.list);
+    const filtered = ruled.prev.length;
+    if (added.length) arrivalsRef.current += added.length - filtered;
+    return { added, merged, filtered, kept: added.filter((id) => !ruled.prev.some((o) => o.id === id)) };
   };
+  const arrivalsRef = useRef(0);
 
   /* ── Scoring ────────────────────────────────────────────────────── */
-  const scoreOffers = (ids) => withBusy("score", async () => {
+  const autoScoreRef = useRef({ failed: new Set(), done: 0, off: false });
+  const scoreOffers = (ids, { auto = false } = {}) => withBusy("score", async () => {
     const { settings: s, profile: p, criteria: c } = R.current;
     const ver = activeVersion(c);
     const targets = R.current.offers.filter((o) => ids.includes(o.id) && !o.spontaneous);
     if (!targets.length) return;
-    setProgress({ label: "Scoring", done: 0, total: targets.length });
-    let ok = 0, failed = 0;
-    await pool(chunk(targets, 4), 2, async (batch) => {
+    setProgress({ label: auto ? "Scoring automatique" : "Scoring", done: 0, total: targets.length });
+    let ok = 0, failed = 0, dismissed = 0;
+    const rules = rulesOf(s);
+    await pool(chunk(targets, 5), 2, async (batch) => {
       try {
         const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.score(batch, p, ver, ver.label), maxTokens: 14000 });
-        const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).map((x) => [x.id, x]));
+        const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).filter((x) => x && x.id).map((x) => [x.id, x]));
         const got = batch.filter((o) => byId[o.id]).length;
         ok += got;
         failed += batch.length - got;
-        setOffers((l) => l.map((o) => (byId[o.id] ? { ...o, score: finalizeScore(byId[o.id], ver.id) } : o)));
+        batch.filter((o) => !byId[o.id]).forEach((o) => autoScoreRef.current.failed.add(o.id));
+        const at = nowISO();
+        const next = R.current.offers.map((o) => {
+          if (!byId[o.id]) return o;
+          const n = { ...o, score: finalizeScore(byId[o.id], ver) };
+          const v = ruleVerdict(n, ver, rules);
+          if (v) { dismissed++; return applyVerdict(n, v, at); }
+          return n;
+        });
+        R.current.offers = next;
+        setOffers(next);
       } catch (e) {
         failed += batch.length;
+        batch.forEach((o) => autoScoreRef.current.failed.add(o.id));
+        if (/refusé|not_granted|désactivé|disponible/i.test(e.message || "")) autoScoreRef.current.off = true;
         toast(`Scoring : ${e.message}`, "danger");
       } finally {
         setProgress((pr) => pr && { ...pr, done: Math.min(pr.total, pr.done + batch.length) });
       }
     });
     setProgress(null);
-    toast(`${ok} offre(s) scorée(s)${failed ? ` · ${failed} non scorée(s)` : ""}`, failed ? "warn" : "ok");
+    if (auto) autoScoreRef.current.done += ok;
+    toast(`${ok} offre(s) scorée(s)${dismissed ? ` · ${dismissed} écartée(s) (score < ${rules.dismissBelow})` : ""}${failed ? ` · ${failed} non scorée(s)` : ""}`, failed ? "warn" : "ok");
   });
 
   const staleIds = useMemo(() => {
     const vid = activeVersion(criteria)?.id;
-    return offers.filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid)).map((o) => o.id);
+    return offers.filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && isStale(o, vid)).map((o) => o.id);
   }, [offers, criteria]);
+
+  /* Scoring systématique : toute offre à traiter sans score à jour est scorée automatiquement (par lots, plafonné par session). */
+  useEffect(() => {
+    if (!loaded || storageState.readOnly || !settings.autoScore || RT.mode === "none" || (RT.mode === "published" && !RT.sample)) return undefined;
+    const a = autoScoreRef.current;
+    if (a.off || a.done >= (settings.autoScoreMax || 60) * 2) return undefined;
+    const t = setTimeout(() => {
+      if (busyRef.current.score) return;
+      const vid = activeVersion(R.current.criteria)?.id;
+      const ids = R.current.offers
+        .filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && isStale(o, vid) && !a.failed.has(o.id))
+        .sort((x, y) => (x.status === "pipeline" ? -1 : 0) - (y.status === "pipeline" ? -1 : 0) || new Date(y.collectedAt) - new Date(x.collectedAt))
+        .slice(0, settings.autoScoreMax || 60)
+        .map((o) => o.id);
+      if (ids.length) scoreOffers(ids, { auto: true });
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [loaded, staleIds.length, settings.autoScore, busy.score]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rescoreStale = () => {
     const vid = activeVersion(R.current.criteria)?.id;
     const ids = R.current.offers
-      .filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid))
+      .filter((o) => !o.demo && ["new", "pipeline"].includes(o.status) && isStale(o, vid))
       .sort((a, b) => new Date(b.collectedAt) - new Date(a.collectedAt))
-      .slice(0, 40)
+      .slice(0, 80)
       .map((o) => o.id);
     if (!ids.length) { toast("Tous les scores sont à jour.", "ok"); return undefined; }
     return scoreOffers(ids);
@@ -2954,7 +3406,7 @@ export default function RadarApp() {
     const list = R.current.sources.filter((x) => (sourceIds ? sourceIds.includes(x.id) : x.enabled) && x.kind !== "email");
     if (!list.length) throw new Error("Aucune source web active. Activez des sources dans « Sources & collecte ».");
     const newIds = [];
-    let merged = 0, errors = 0;
+    let merged = 0, errors = 0, filteredN = 0;
     setProgress({ label: "Veille", done: 0, total: list.length });
     await pool(list, 3, async (src) => {
       try {
@@ -2973,7 +3425,8 @@ export default function RadarApp() {
           .map((r) => normalizeOffer(r, { sourceName: src.name, via: "web_search", verifiedUrls: res.urls }))
           .filter((o) => o && (o.sources[0].verified || !res.urls.length || onSource(o.sources[0].url)));
         const r = applyIncoming(norm);
-        newIds.push(...r.added);
+        newIds.push(...r.kept);
+        filteredN += r.filtered;
         merged += r.merged.length;
         patchSource(src.id, { lastRunAt: nowISO(), lastCount: norm.length, lastError: null, lastNote: str(res.data?.notes) });
       } catch (e) {
@@ -2985,7 +3438,7 @@ export default function RadarApp() {
     });
     setProgress(null);
     setSettings((x) => ({ ...x, lastWatchAt: nowISO() }));
-    toast(`Veille terminée : ${newIds.length} nouvelle(s) offre(s), ${merged} fusion(s)${errors ? `, ${errors} source(s) en erreur` : ""}`, errors ? "warn" : "ok");
+    toast(`Veille terminée : ${newIds.length} nouvelle(s) offre(s) retenue(s), ${filteredN} écartée(s) par les règles, ${merged} fusion(s)${errors ? `, ${errors} source(s) en erreur` : ""}`, errors ? "warn" : "ok");
     if (newIds.length) await scoreOffers(newIds);
   });
 
@@ -3006,8 +3459,8 @@ export default function RadarApp() {
     const r = applyIncoming(norm);
     setSettings((x) => ({ ...x, lastGmailImportAt: nowISO() }));
     setSources((l) => l.map((x) => (x.kind === "email" ? { ...x, lastRunAt: nowISO(), lastCount: norm.length, lastError: null } : x)));
-    toast(`Gmail : ${res.data?.messagesRead ?? "?"} e-mail(s) lu(s), ${r.added.length} nouvelle(s) offre(s), ${r.merged.length} fusion(s)`, "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(`Gmail : ${res.data?.messagesRead ?? "?"} e-mail(s) lu(s), ${r.kept.length} nouvelle(s) offre(s), ${r.filtered} écartée(s) par les règles, ${r.merged.length} fusion(s)`, "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
   });
 
   const importManual = ({ text, url }) => withBusy("manual", async () => {
@@ -3029,8 +3482,8 @@ export default function RadarApp() {
     if (o.sources[0].url) o.sources[0].verified = cleanUrl ? true : (text || "").includes(o.sources[0].url);
     if (str(text)) o.fullText = str(text).slice(0, 20000);
     const r = applyIncoming([o]);
-    toast(r.added.length ? "Annonce importée et structurée" : "Annonce déjà connue : sources fusionnées", "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(r.added.length ? (r.filtered ? "Annonce importée, mais écartée par vos règles (voir l'onglet Écartées)" : "Annonce importée et structurée") : "Annonce déjà connue : sources fusionnées", r.filtered ? "warn" : "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
     return r.added[0] || r.merged[0];
   });
 
@@ -3042,19 +3495,20 @@ export default function RadarApp() {
     const norm = raw.map((r) => normalizeOffer(r, { sourceName: str(r?.sourceName) || str(r?.source) || "Import JSON", via: "import JSON" })).filter(Boolean);
     const skipped = raw.length - norm.length;
     const r = applyIncoming(norm);
-    toast(`Import JSON : ${r.added.length} nouvelle(s), ${r.merged.length} fusion(s)${skipped ? `, ${skipped} ignorée(s) (intitulé ou URL manquant)` : ""}`, skipped ? "warn" : "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(`Import JSON : ${r.kept.length} nouvelle(s), ${r.filtered} écartée(s) par les règles, ${r.merged.length} fusion(s)${skipped ? `, ${skipped} ignorée(s) (intitulé ou URL manquant)` : ""}`, skipped ? "warn" : "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
     return true;
   });
 
   /* ── Doublons : détection IA, fusion validée, annulable ──────────── */
   const inPipeline = (oid) => R.current.apps.some((a) => a.offerId === oid);
-  const detectDuplicates = () => withBusy("dedupe", async () => {
+  const detectDuplicates = ({ auto = false } = {}) => withBusy("dedupe", async () => {
     const pool0 = R.current.offers
-      .filter((o) => !o.demo && isActiveOffer(o))
-      .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || normText(a.title).localeCompare(normText(b.title)))
-      .slice(0, 180);
-    if (pool0.length < 2) { toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
+      .filter((o) => !o.demo && ["new", "pipeline"].includes(o.status))
+      .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || cleanTitle(a.title).localeCompare(cleanTitle(b.title)))
+      .slice(0, 240);
+    setSettings((x) => ({ ...x, lastAiDedupeAt: nowISO() }));
+    if (pool0.length < 2) { if (!auto) toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
     const known = new Set(pool0.map((o) => o.id));
     const used = new Set();
     const groups = [];
@@ -3068,25 +3522,23 @@ export default function RadarApp() {
         groups.push({ id: uid("dup"), ids, confidence: g.confidence === "haute" ? "haute" : "moyenne", reason: str(g.reason), accept: g.confidence === "haute" });
       }
     }
-    if (!groups.length) { toast("Aucun doublon détecté.", "ok"); return; }
-    setDupeProposals(groups);
+    if (!groups.length) { if (!auto) toast("Aucun doublon détecté.", "ok"); return; }
+    if (!auto) { setDupeProposals(groups); return; }
+    // Automatique : confiance haute fusionnée directement (annulable), le reste attend votre validation.
+    let n = 0;
+    groups.filter((g) => g.confidence === "haute").forEach((g) => { if (mergeGroup(g.ids, g.reason, "IA automatique (confiance haute)")) n++; });
+    const rest = groups.filter((g) => g.confidence !== "haute");
+    if (rest.length) setDupePending(rest);
+    if (n || rest.length) toast(`Doublons : ${n} fusion(s) automatique(s)${rest.length ? ` · ${rest.length} à valider (page Offres)` : ""}`, "ok");
   });
 
-  const mergeGroup = (ids, reason) => {
+  const mergeGroup = (ids, reason, origin = "IA validée") => {
     const list = R.current.offers;
     const members = ids.map((id) => list.find((o) => o.id === id)).filter(Boolean);
     if (members.length < 2) return false;
-    const primary = members.find((o) => inPipeline(o.id))
-      || [...members].sort((a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || new Date(a.collectedAt) - new Date(b.collectedAt))[0];
+    const primary = pickPrimary(members, new Set(R.current.apps.map((a) => a.offerId)));
     const absorbed = members.filter((o) => o.id !== primary.id);
-    const before = { sources: primary.sources, description: primary.description, ...Object.fromEntries(FILLABLE.map((k) => [k, primary[k]])) };
-    const merged = { ...primary, sources: [...(primary.sources || [])] };
-    for (const o of absorbed) {
-      for (const src of o.sources || []) if (!merged.sources.some((x) => canonicalUrl(x.url) === canonicalUrl(src.url) && x.name === src.name)) merged.sources.push(src);
-      for (const k of FILLABLE) if ((merged[k] === null || merged[k] === undefined || merged[k] === "") && o[k]) merged[k] = o[k];
-      if (o.description && (!merged.description || o.description.length > merged.description.length)) merged.description = o.description;
-    }
-    merged.mergeHistory = [...(primary.mergeHistory || []), { id: uid("merge"), at: nowISO(), reason: str(reason), origin: "IA validée", before, absorbed }];
+    const merged = mergeMembers(primary, absorbed, reason, origin);
     const absorbedIds = new Set(absorbed.map((o) => o.id));
     const next = list.filter((o) => !absorbedIds.has(o.id)).map((o) => (o.id === primary.id ? merged : o));
     R.current.offers = next;
@@ -3097,7 +3549,84 @@ export default function RadarApp() {
     let n = 0;
     groups.filter((g) => g.accept).forEach((g) => { if (mergeGroup(g.ids, g.reason)) n++; });
     setDupeProposals(null);
+    setDupePending(null);
     toast(n ? `${n} fusion(s) effectuée(s) — annulables depuis la fiche de l'offre` : "Aucune fusion appliquée", n ? "ok" : "neutral");
+  };
+  /* Dédoublonnage IA systématique après chaque arrivée d'offres (au plus toutes les 6 h, sauf grosse arrivée). */
+  useEffect(() => {
+    if (!loaded || storageState.readOnly || !settings.autoDedupeAI || RT.mode === "none" || (RT.mode === "published" && !RT.sample)) return undefined;
+    const t = setTimeout(() => {
+      const n = arrivalsRef.current;
+      const last = R.current.settings.lastAiDedupeAt ? new Date(R.current.settings.lastAiDedupeAt).getTime() : 0;
+      if (!n || busyRef.current.dedupe || busyRef.current.score) return;
+      if (n < 5 && Date.now() - last < 6 * 36e5) return;
+      arrivalsRef.current = 0;
+      detectDuplicates({ auto: true });
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [loaded, offers.length, busy.score]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Actions de masse (annulables) ──────────────────────────────── */
+  const bulkOffers = (ids, fn, label) => {
+    const want = new Set(ids);
+    const prev = [];
+    const next = [];
+    for (const o of R.current.offers) {
+      if (!want.has(o.id)) { next.push(o); continue; }
+      const n = fn(o);
+      if (n === o) { next.push(o); continue; }
+      prev.push(o);
+      if (n) next.push(n);
+    }
+    if (!prev.length) { toast("Aucune offre modifiée.", "neutral"); return 0; }
+    R.current.offers = next;
+    setOffers(next);
+    setLastBulk({ label: `${label} : ${prev.length} offre(s)`, prev, at: nowISO(), undoable: true });
+    return prev.length;
+  };
+  const undoBulk = () => {
+    const lb = lastBulk;
+    if (!lb?.prev?.length) { setLastBulk(null); return; }
+    const byId = new Map(lb.prev.map((o) => [o.id, o]));
+    const present = new Set(R.current.offers.map((o) => o.id));
+    const next = [...R.current.offers.map((o) => byId.get(o.id) || o), ...lb.prev.filter((o) => !present.has(o.id))];
+    R.current.offers = next;
+    setOffers(next);
+    setLastBulk(null);
+    toast(`Annulé : ${lb.prev.length} offre(s) restaurée(s)`, "ok");
+  };
+  const BULK = {
+    dismiss: (o) => (o.status === "pipeline" || o.status === "closed" ? o : { ...o, status: "dismissed", dismissedAt: nowISO(), dismissedBy: "user", autoReason: undefined, autoRule: undefined, seenAt: o.seenAt || nowISO() }),
+    expire: (o) => (o.status === "pipeline" || o.status === "closed" ? o : { ...o, status: "expired", expiredAt: nowISO(), expiredBy: "user", autoReason: undefined, autoRule: undefined, seenAt: o.seenAt || nowISO() }),
+    seen: (o) => (o.seenAt ? o : { ...o, seenAt: nowISO() }),
+    unseen: (o) => (o.seenAt ? { ...o, seenAt: undefined } : o),
+    restore: (o) => (["dismissed", "expired"].includes(o.status) ? { ...o, status: "new", userKept: true, autoReason: undefined, autoRule: undefined, dismissedBy: undefined, expiredBy: undefined } : o),
+    remove: (o) => (o.status === "pipeline" || R.current.apps.some((a) => a.offerId === o.id) ? o : null),
+  };
+  const bulkAction = (kind, ids) => {
+    const labels = { dismiss: "Écartées", expire: "Marquées expirées / pourvues", seen: "Marquées comme lues", unseen: "Marquées non lues", restore: "Remises à traiter", remove: "Supprimées" };
+    if (BULK[kind]) return bulkOffers(ids, BULK[kind], labels[kind]);
+    if (kind === "pipeline") { ids.forEach((id) => { if (!inPipeline(id)) addToPipeline(id, "new", { quiet: true }); }); toast(`${ids.length} offre(s) ajoutée(s) au pipeline`, "ok"); return ids.length; }
+    if (kind === "score") return scoreOffers(ids);
+    if (kind === "verify") return requestVerify(ids);
+    if (kind === "merge") { if (mergeGroup(ids, "fusion manuelle", "manuelle")) toast(`${ids.length} offres fusionnées en une (annulable depuis sa fiche)`, "ok"); return 1; }
+    return 0;
+  };
+  const runRules = (onlyIds) => {
+    const ver = activeVersion(R.current.criteria);
+    const r = applyRules(R.current.offers, ver, rulesOf(R.current.settings), onlyIds ? new Set(onlyIds) : null);
+    if (!r.prev.length) { toast("Les règles ne trouvent rien à trier.", "ok"); return 0; }
+    R.current.offers = r.list;
+    setOffers(r.list);
+    setLastBulk({ label: `Règles appliquées : ${r.prev.length} offre(s) (${Object.entries(r.counts).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(", ")})`, prev: r.prev, at: nowISO(), undoable: true });
+    return r.prev.length;
+  };
+  const dedupeNow = () => {
+    const d = dedupeLocal(R.current.offers, R.current.apps);
+    if (!d.merged) { toast("Aucun doublon évident (URL, identifiant ou entreprise + intitulé).", "ok"); return; }
+    R.current.offers = d.list;
+    setOffers(d.list);
+    toast(`${d.merged} doublon(s) fusionné(s) — annulable depuis la fiche de l'offre`, "ok");
   };
   const undoMerge = (offerId) => {
     const list = R.current.offers;
@@ -3184,6 +3713,84 @@ export default function RadarApp() {
     toast(`${Object.values(next).filter((x) => x.rating).length} note(s) trouvée(s) sur ${list.length}`, "ok");
   });
 
+  /* ── Vérification des liens (annonce encore ouverte ?) ─────────────
+     Page publiée : la Routine ouvre les annonces (ou les recherche) et dépose ses résultats dans veille_verify.
+     Elle traite aussi, à chaque passage planifié, la file veille/verify_queue entretenue par la page. */
+  const verifyTargets = (ids) => R.current.offers
+    .filter((o) => ids.includes(o.id) && !o.spontaneous && (o.sources || []).some((x) => x.url))
+    .slice(0, 40)
+    .map((o) => ({ id: o.id, url: (o.sources || []).find((x) => x.url)?.url, title: o.title, company: o.company || null }));
+  const applyVerifyResults = (results, at, method) => {
+    const by = new Map((results || []).filter((r) => r && r.id).map((r) => [r.id, r]));
+    if (!by.size) return { closed: 0, open: 0 };
+    const ver = activeVersion(R.current.criteria);
+    const rules = rulesOf(R.current.settings);
+    let closed = 0, open = 0, pipeClosed = 0;
+    const next = R.current.offers.map((o) => {
+      const r = by.get(o.id);
+      if (!r) return o;
+      const state = ["open", "closed", "unknown"].includes(r.state) ? r.state : "unknown";
+      let n = { ...o, link: { state, evidence: str(r.evidence), at: str(r.checkedAt) || at, method: str(r.method) || method } };
+      const pub = isoDay(r.publishedAt), dl = isoDay(r.deadline);
+      if (pub && (!n.publishedAt || n.publishedApprox)) { n.publishedAt = pub; delete n.publishedApprox; }
+      if (dl && !n.deadline) n.deadline = dl;
+      if (state === "closed") { closed++; if (n.status === "pipeline") pipeClosed++; }
+      if (state === "open") open++;
+      const v = ruleVerdict(n, ver, rules);
+      return v ? applyVerdict(n, v, at) : n;
+    });
+    R.current.offers = next;
+    setOffers(next);
+    if (pipeClosed) toast(`${pipeClosed} offre(s) de votre pipeline semblent clôturées : vérifiez-les.`, "warn");
+    return { closed, open };
+  };
+  const requestVerify = (ids) => withBusy("verify", async () => {
+    const items = verifyTargets(ids);
+    if (!items.length) { toast("Aucune offre avec lien à vérifier.", "neutral"); return; }
+    const mark = (state) => { const set = new Set(items.map((x) => x.id)); setOffers((l) => l.map((o) => (set.has(o.id) ? { ...o, link: { ...(o.link || {}), state, requestedAt: nowISO() } } : o))); };
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La vérification passe par la veille planifiée, qui n'est pas reliée à cette page.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « vérification des liens » uniquement : ${JSON.stringify({ task: "verify", offers: items })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      mark("pending");
+      setSettings((x) => ({ ...x, lastVerifyAt: nowISO() }));
+      toast(`Vérification demandée pour ${items.length} offre(s) : résultats d'ici 5 à 15 minutes. Les annonces clôturées passeront en « Expirées ».`, "ok");
+      return;
+    }
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.verify(items), web: { maxUses: Math.min(20, items.length * 2) }, maxTokens: 8000 });
+    const r = applyVerifyResults(res.data?.results, nowISO(), "recherche web");
+    setSettings((x) => ({ ...x, lastVerifyAt: nowISO() }));
+    toast(`Vérification : ${r.closed} clôturée(s), ${r.open} ouverte(s), le reste indéterminé.`, "ok");
+  });
+  const ingestVerify = (snapDoc) => {
+    if ((R.current.settings.importedVerify || []).includes(snapDoc.id)) return;
+    const d = snapDoc.data() || {};
+    R.current.settings = { ...R.current.settings, importedVerify: [...(R.current.settings.importedVerify || []), snapDoc.id] };
+    setSettings((x) => ({ ...x, importedVerify: [...(x.importedVerify || []), snapDoc.id].slice(-200) }));
+    const r = applyVerifyResults(d.results, str(d.createdAt) || nowISO(), str(d.method) || "veille");
+    if (r.closed || r.open) toast(`Liens vérifiés : ${r.closed} annonce(s) clôturée(s) (passées en « Expirées »), ${r.open} confirmée(s) ouverte(s).`, "ok");
+  };
+  /* File de vérification lue par la Routine : offres à traiter ou en pipeline, jamais vérifiées ou vérifiées il y a plus de 5 jours. */
+  const verifyQueue = useMemo(() => {
+    const due = (o) => !o.link?.at || Date.now() - new Date(o.link.at).getTime() > 5 * DAY;
+    const items = offers
+      .filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && due(o) && (o.sources || []).some((x) => x.url))
+      .sort((a, b) => (b.score?.value ?? 50) - (a.score?.value ?? 50))
+      .slice(0, 40)
+      .map((o) => ({ id: o.id, url: (o.sources || []).find((x) => x.url)?.url, title: o.title, company: o.company || null }));
+    return { items, sig: items.map((x) => x.id).join(",") };
+  }, [offers]);
+  const queueSig = useRef(null);
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db || storageState.readOnly || !settings.autoVerify || queueSig.current === verifyQueue.sig) return undefined;
+    const t = setTimeout(() => {
+      queueSig.current = verifyQueue.sig;
+      RT.db.doc("veille/verify_queue").set({ offers: verifyQueue.items, updatedAt: nowISO() }).catch(() => {});
+    }, 4000);
+    return () => clearTimeout(t);
+  }, [loaded, verifyQueue.sig, settings.autoVerify]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* ── Tri rapide des offres ──────────────────────────────────────── */
   const nextOfferId = (id) => {
     const q = offerQueue.length ? offerQueue : R.current.offers.filter(isActiveOffer).map((o) => o.id);
@@ -3192,7 +3799,7 @@ export default function RadarApp() {
   };
   const triageOffer = (id, patch) => {
     const nxt = nextOfferId(id);
-    patchOffer(id, patch);
+    patchOffer(id, (o) => ({ ...patch, seenAt: o.seenAt || nowISO(), autoReason: undefined, autoRule: undefined, ...(patch.status === "dismissed" ? { dismissedBy: "user" } : patch.status === "expired" ? { expiredBy: "user" } : {}) }));
     if (R.current.settings.autoNext && nxt) setOfferSel(nxt);
     else setOfferSel(null);
   };
@@ -3234,7 +3841,7 @@ export default function RadarApp() {
   const openApp = (id, tab = "track") => setAppSel({ id, tab });
   const openOffer = (id) => setOfferSel(id);
 
-  const addToPipeline = (oid, stage = "retained") => {
+  const addToPipeline = (oid, stage = "retained", { quiet = false } = {}) => {
     const existing = R.current.apps.find((a) => a.offerId === oid);
     if (existing) { openApp(existing.id); return existing.id; }
     const app = {
@@ -3244,8 +3851,8 @@ export default function RadarApp() {
     };
     R.current.apps = [app, ...R.current.apps];
     setApps((l) => [app, ...l]);
-    patchOffer(oid, { status: "pipeline" });
-    toast(`Ajoutée au pipeline (${STAGE_LABEL[stage]})`, "ok");
+    patchOffer(oid, (o) => ({ status: "pipeline", seenAt: o.seenAt || nowISO() }));
+    if (!quiet) toast(`Ajoutée au pipeline (${STAGE_LABEL[stage]})`, "ok");
     return app.id;
   };
 
@@ -3584,10 +4191,12 @@ export default function RadarApp() {
       if (a.stage === "prep" && daysFromToday(a.updatedAt) <= -3) items.push({ id: `send:${a.id}`, label: "Finaliser et envoyer la candidature", detail: name, weight: 2, go: () => openApp(a.id, "docs"), demo: a.demo });
     });
     offers
-      .filter((o) => o.status === "new" && o.score && o.score.value >= th)
-      .sort((a, b) => b.score.value - a.score.value)
-      .slice(0, 3)
-      .forEach((o) => items.push({ id: `tri:${o.id}`, label: `Trier une offre à ${o.score.value}`, detail: `${o.title} · ${o.company || NC}`, weight: 2, go: () => openOffer(o.id), demo: o.demo }));
+      .filter((o) => ["new", "pipeline"].includes(o.status) && deadlineIn(o) !== null && deadlineIn(o) >= 0 && deadlineIn(o) <= 3)
+      .forEach((o) => items.push({ id: `dl:${o.id}`, label: `Date limite ${relDay(o.deadline)}`, detail: `${o.title} · ${o.company || NC}`, due: o.deadline, weight: 1, go: () => openOffer(o.id) }));
+    const unreadGood = offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo && o.score && o.score.value >= th);
+    if (unreadGood.length) items.push({ id: "tri-good", label: `Trier ${unreadGood.length} offre(s) non lue(s) au-dessus de ${th}`, detail: unreadGood.slice(0, 2).map((o) => o.title).join(" · "), weight: 1, go: () => setView("offers") || setOfferPreset({ tab: "unread", minScore: th }) });
+    const unreadAll = offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length;
+    if (unreadAll > unreadGood.length) items.push({ id: "tri-all", label: `Trier ${unreadAll} offre(s) non lue(s)`, detail: "Sélection multiple et actions de masse disponibles", weight: 2, go: () => setView("offers") || setOfferPreset({ tab: "unread" }) });
     if (staleIds.length) items.push({ id: "stale", label: `Recalculer ${staleIds.length} score(s) obsolète(s)`, detail: "Les critères ont changé", weight: 3, go: () => rescoreStale() });
     if (apps.some((a) => !a.demo && a.sentAt && a.stage !== "closed") && (!settings.lastReplyCheckAt || (Date.now() - new Date(settings.lastReplyCheckAt)) / 36e5 > 48)) items.push({ id: "replies", label: "Vérifier les réponses des recruteurs", detail: `Dernière vérification : ${relTime(settings.lastReplyCheckAt)}`, weight: 2, go: () => checkReplies() });
     if (!settings.lastWatchAt || (Date.now() - new Date(settings.lastWatchAt)) / 36e5 > 24) items.push({ id: "watch", label: "Lancer la veille", detail: `Dernière collecte : ${relTime(settings.lastWatchAt)}`, weight: 3, go: () => runWatch() });
@@ -3665,7 +4274,11 @@ export default function RadarApp() {
     const norm = raw
       .map((r) => {
         const o = normalizeOffer(r, { sourceName: str(r?.sourceName) || "Veille planifiée", via: "veille planifiée (recherche web)" });
-        if (o) o.sources[0].verified = r?.verified === true ? true : null;
+        if (o) {
+          o.sources[0].verified = r?.verified === true ? true : null;
+          const live = ["open", "closed", "unknown"].includes(r?.liveness) ? r.liveness : null;
+          if (live && live !== "unknown") o.link = { state: live, evidence: str(r.livenessEvidence), at: str(d.createdAt) || nowISO(), method: str(r.livenessMethod) || "veille" };
+        }
         return o;
       })
       .filter(Boolean);
@@ -3676,7 +4289,7 @@ export default function RadarApp() {
     setSources((l) => l.map((x) => (counts[x.name] !== undefined || (d.sourcesSearched || []).includes(x.name) ? { ...x, lastRunAt: at, lastCount: counts[x.name] || 0, lastError: null } : x)));
     setSettings((x) => ({ ...x, lastWatchAt: at, importedRuns: [...(x.importedRuns || []), snapDoc.id].slice(-300) }));
     R.current.settings = { ...R.current.settings, importedRuns: [...(R.current.settings.importedRuns || []), snapDoc.id] };
-    if (norm.length || raw.length) toast(`Veille reçue : ${r.added.length} nouvelle(s) offre(s), ${r.merged.length} fusion(s). Scorez-les depuis la vue d'ensemble.`, "ok");
+    if (norm.length || raw.length) toast(`Veille reçue : ${r.kept.length} nouvelle(s) offre(s) retenue(s), ${r.filtered} écartée(s) par vos règles, ${r.merged.length} déjà connue(s). Le scoring suit automatiquement.`, "ok");
   };
   useEffect(() => {
     if (!loaded || RT.mode !== "published" || !RT.db) return undefined;
@@ -3687,6 +4300,7 @@ export default function RadarApp() {
       subs.push(RT.db.doc("veille/status").onSnapshot((d) => setVeille((v) => ({ ...v, status: d.exists ? d.data() : null })), quiet));
       subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
       subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
+      subs.push(RT.db.collection("veille_verify").onSnapshot((snap) => snap.docs.forEach(ingestVerify), quiet));
       subs.push(RT.db.collection("veille_ratings").onSnapshot((snap) => {
         setRatings((cur) => {
           let changed = false;
@@ -3705,7 +4319,7 @@ export default function RadarApp() {
   }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* La configuration lue par la veille planifiée suit les critères actifs et les sources (critères et domaines uniquement). */
-  const cfgNow = useMemo(() => veilleConfig(activeVersion(criteria), sources, settings), [criteria, sources, settings.lookbackDays, settings.maxPerSource]); // eslint-disable-line react-hooks/exhaustive-deps
+  const cfgNow = useMemo(() => veilleConfig(activeVersion(criteria), sources, settings), [criteria, sources, settings.lookbackDays, settings.maxPerSource, settings.rules]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (RT.mode !== "published" || !RT.db || !veille.configLoaded || veille.configSig === cfgNow.sig || storageState.readOnly) return undefined;
     const t = setTimeout(() => { RT.db.doc("veille/config").set({ ...cfgNow, updatedAt: nowISO() }).catch(() => {}); }, 1500);
@@ -3730,7 +4344,7 @@ export default function RadarApp() {
 
   const pApps = useMemo(() => apps.filter((a) => a.kind !== "base"), [apps]);
   const dueCount = useMemo(() => apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0), [apps]);
-  const newCount = useMemo(() => offers.filter((o) => o.status === "new").length, [offers]);
+  const unreadCount = useMemo(() => offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length, [offers]);
 
   const ctx = {
     T, settings, setSettings, profile, setProfile, criteria, setCriteria, sources, setSources, offers, setOffers, apps: pApps, allApps: apps, contacts,
@@ -3745,6 +4359,8 @@ export default function RadarApp() {
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
+    bulkAction, lastBulk, setLastBulk, undoBulk, runRules, dedupeNow, requestVerify, dupePending,
+    openDupePending: () => dupePending && setDupeProposals(dupePending), visitPrev, unreadCount,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -3758,13 +4374,13 @@ export default function RadarApp() {
           <div className="flex">
             {/* Navigation latérale */}
             <aside className={`hidden md:flex flex-col sticky top-0 h-screen shrink-0 transition-all duration-200 ${collapsed ? "w-16" : "w-60"} px-2 py-5`} aria-label="Navigation principale">
-              <SidebarContent collapsed={collapsed} dueCount={dueCount} newCount={newCount} onToggle={() => setSettings((s) => ({ ...s, sidebarCollapsed: !s.sidebarCollapsed }))} />
+              <SidebarContent collapsed={collapsed} dueCount={dueCount} newCount={unreadCount} onToggle={() => setSettings((s) => ({ ...s, sidebarCollapsed: !s.sidebarCollapsed }))} />
             </aside>
             {mobileNav && (
               <div className="md:hidden fixed inset-0 z-40">
                 <div className="absolute inset-0" style={{ background: "rgba(12,10,9,0.35)" }} onClick={() => setMobileNav(false)} />
                 <aside className={`absolute left-0 top-0 h-full w-72 px-3 py-5 flex flex-col ${T.app}`} style={T.shadow} aria-label="Navigation principale">
-                  <SidebarContent collapsed={false} dueCount={dueCount} newCount={newCount} onToggle={() => setMobileNav(false)} mobile />
+                  <SidebarContent collapsed={false} dueCount={dueCount} newCount={unreadCount} onToggle={() => setMobileNav(false)} mobile />
                 </aside>
               </div>
             )}
@@ -3777,9 +4393,22 @@ export default function RadarApp() {
                 </div>
               )}
               <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-10 py-8 md:py-10">
-                {storageState.message && <Notice tone="warn" icon={AlertTriangle} className="mb-6">{storageState.message}</Notice>}
+                {storageState.message && (
+                  <Notice tone="warn" icon={AlertTriangle} className="mb-6">
+                    {storageState.message}
+                    {storageState.retry && <Btn size="sm" variant="soft" icon={RefreshCw} className="ml-2" onClick={() => window.location.reload()}>Réessayer</Btn>}
+                  </Notice>
+                )}
+                {recovery && (
+                  <Notice tone="ok" icon={CheckCircle2} className="mb-6">
+                    Données endommagées réparées : {recovery.map((r) => `${{ offers: "offres", apps: "candidatures", contacts: "contacts" }[r.name] || r.name}${r.count !== null ? ` (${r.count} récupérée(s))` : " (valeurs par défaut)"}`).join(", ")}.
+                    Une copie brute est conservée. L'enregistrement fonctionne de nouveau, au format sécurisé.
+                    <Btn size="sm" variant="ghost" className="ml-2" onClick={() => setRecovery(null)}>OK</Btn>
+                  </Notice>
+                )}
                 {!loaded ? (
                   <div className="space-y-6">
+                    {bootMsg && <p className={`text-sm ${T.muted}`} aria-live="polite">{bootMsg}</p>}
                     <Skeleton lines={2} />
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">{[0, 1, 2, 3].map((i) => <Card key={i} className="p-6"><Skeleton lines={2} /></Card>)}</div>
                     <Card className="p-6"><Skeleton lines={5} /></Card>
@@ -4040,17 +4669,16 @@ function weekKey(iso) {
 
 function DashboardView() {
   const T = useT();
-  const { offers, apps, settings, go, runWatch, busy, todayItems, prioritizeToday, todayAI, openOffer, profile, staleIds, rescoreStale, hasDemo } = useApp();
+  const { offers, apps, settings, go, runWatch, busy, todayItems, prioritizeToday, todayAI, openOffer, profile, staleIds, rescoreStale, hasDemo, unreadCount, visitPrev } = useApp();
   const th = settings.threshold;
 
   const k = useMemo(() => {
-    const weekAgo = Date.now() - 7 * 864e5;
     const sent = apps.filter((a) => a.sentAt);
     const responded = sent.filter((a) => ["interview", "offer"].includes(a.stage) || (a.interviews || []).length || (a.stage === "closed" && a.closed?.outcome !== "withdrawn"));
     const upcoming = apps.flatMap((a) => (a.interviews || []).filter((i) => new Date(i.at) >= startOfDay(new Date())));
     return {
-      fresh: offers.filter((o) => o.status === "new" && new Date(o.collectedAt).getTime() >= weekAgo).length,
-      above: offers.filter((o) => isActiveOffer(o) && o.score?.value >= th).length,
+      todo: offers.filter((o) => o.status === "new").length,
+      above: offers.filter((o) => o.status === "new" && o.score?.value >= th).length,
       active: apps.filter((a) => a.stage !== "closed").length,
       due: apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0),
       interviews: upcoming.length,
@@ -4082,7 +4710,13 @@ function DashboardView() {
     return steps.map(([id, label]) => ({ label, count: apps.filter((a) => (a.reached ?? (a.stage === "closed" ? 0 : STAGE_INDEX[a.stage])) >= STAGE_INDEX[id]).length }));
   }, [apps]);
 
-  const top = useMemo(() => offers.filter((o) => isActiveOffer(o) && !isOldOffer(o, settings.hideOlderThan) && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
+  const top = useMemo(() => offers.filter((o) => ["new", "pipeline"].includes(o.status) && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
+  const deadlines = useMemo(() => offers.filter((o) => ["new", "pipeline"].includes(o.status) && deadlineIn(o) !== null && deadlineIn(o) >= 0 && deadlineIn(o) <= 21).sort((a, b) => new Date(a.deadline) - new Date(b.deadline)).slice(0, 6), [offers]);
+  const since = useMemo(() => {
+    const ref = new Date(visitPrev || addDays(nowISO(), -3));
+    const arr = offers.filter((o) => new Date(o.collectedAt) > ref && !o.demo && !o.spontaneous);
+    return { total: arr.length, kept: arr.filter((o) => ["new", "pipeline"].includes(o.status)).length, auto: arr.filter((o) => o.dismissedBy === "auto").length, good: arr.filter((o) => o.status === "new" && o.score?.value >= th).length };
+  }, [offers, visitPrev, th]);
   const hour = new Date().getHours();
   const hello = hour < 12 ? "Bonjour" : hour < 18 ? "Bon après-midi" : "Bonsoir";
 
@@ -4105,9 +4739,24 @@ function DashboardView() {
         </Notice>
       )}
 
+      {since.total > 0 && (
+        <Card className="p-5 mb-4">
+          <div className="flex flex-col md:flex-row md:items-center gap-3">
+            <div className="flex-1 text-sm">
+              <span className="font-medium">Depuis votre dernière visite{visitPrev ? ` (${relTime(visitPrev)})` : ""} :</span>{" "}
+              {since.total} offre(s) arrivée(s) · <strong>{since.kept} retenue(s) à trier</strong>{since.good ? ` dont ${since.good} au-dessus de ${th}` : ""} · {since.auto} écartée(s) ou expirée(s) automatiquement par vos règles.
+            </div>
+            <div className="flex gap-2">
+              <Btn size="sm" variant="primary" icon={Inbox} onClick={() => go("offers", { tab: "unread" })}>Trier les non lues ({unreadCount})</Btn>
+              <Btn size="sm" icon={History} onClick={() => go("offers", { tab: "arrivals" })}>Voir les arrivées</Btn>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-4">
-        <Kpi label="Nouvelles offres" value={k.fresh} sub="7 derniers jours" icon={Inbox} onClick={() => go("offers", { status: "new" })} />
-        <Kpi label={`Au-dessus de ${th}`} value={k.above} sub="score ≥ seuil" icon={Gauge} onClick={() => go("offers", { minScore: th })} />
+        <Kpi label="Non lues" value={unreadCount} sub={`${k.todo} à traiter au total`} icon={Inbox} onClick={() => go("offers", { tab: "unread" })} />
+        <Kpi label={`Au-dessus de ${th}`} value={k.above} sub="à traiter, score ≥ seuil" icon={Gauge} onClick={() => go("offers", { tab: "todo", minScore: th })} />
         <Kpi label="Candidatures actives" value={k.active} sub="hors clôturées" icon={Columns} onClick={() => go("pipeline")} />
         <Kpi label="Relances dues" value={k.due} sub="aujourd'hui ou en retard" icon={BellRing} onClick={() => go("followups")} />
         <Kpi label="Entretiens à venir" value={k.interviews} sub={k.nextInterview ? `prochain ${relDay(k.nextInterview.at)}` : "aucun planifié"} icon={CalendarPlus} onClick={() => go("followups")} />
@@ -4156,6 +4805,28 @@ function DashboardView() {
                       <span className={`block text-xs truncate ${T.muted}`}>{show(o.company)} · {show(o.location)} · {commuteLabel(o.commute)}</span>
                     </span>
                     {o.demo && <Chip>exemple</Chip>}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="p-6 lg:col-span-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" onClick={() => go("offers", { tab: "deadlines" })}>Tout voir</Btn>}>Dates limites proches</SectionTitle>
+          {deadlines.length === 0 ? (
+            <Empty icon={CalendarClock} title="Aucune date limite dans les 3 semaines" text="Les dates limites sont extraites des annonces quand elles sont indiquées." />
+          ) : (
+            <ul className="space-y-1">
+              {deadlines.map((o) => (
+                <li key={o.id}>
+                  <button type="button" onClick={() => openOffer(o.id)} className={`w-full flex items-center gap-3 rounded-2xl px-2 py-2 text-left ${T.subHover} ${T.ring}`}>
+                    <span className="w-14 shrink-0"><DeadlineChip o={o} /></span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm font-medium truncate">{o.title}</span>
+                      <span className={`block text-xs truncate ${T.muted}`}>{show(o.company)} · limite {fmtDate(o.deadline)}{o.status === "pipeline" ? " · dans le pipeline" : ""}</span>
+                    </span>
+                    <ScorePill score={o.score} threshold={th} />
                   </button>
                 </li>
               ))}
@@ -4224,64 +4895,147 @@ function DashboardView() {
    11. OFFRES
    ════════════════════════════════════════════════════════════════════════ */
 
-const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score", hideOld: true };
+const DEFAULT_FILTERS = { tab: "todo", q: "", source: "", minScore: 0, maxCommute: 0, pubWithin: 0, sort: "score", origin: "" };
+const OFFER_TABS = [
+  { id: "todo", label: "À traiter", hint: "Offres actives pas encore décidées" },
+  { id: "unread", label: "Non lues", hint: "À traiter, jamais ouvertes" },
+  { id: "arrivals", label: "Arrivées", hint: "Collectées depuis votre dernière visite (toutes, y compris triées automatiquement)" },
+  { id: "deadlines", label: "Échéances", hint: "Offres actives avec date limite de candidature" },
+  { id: "pipeline", label: "Pipeline" },
+  { id: "dismissed", label: "Écartées" },
+  { id: "expired", label: "Expirées" },
+  { id: "all", label: "Toutes" },
+];
+const dayLabel = (iso) => {
+  const n = -daysFromToday(iso);
+  if (n <= 0) return "Aujourd'hui";
+  if (n === 1) return "Hier";
+  if (n < 7) return new Date(iso).toLocaleDateString("fr-BE", { weekday: "long", day: "numeric", month: "short" });
+  return `Semaine du ${fmtDate(addDays(startOfDay(iso).toISOString(), -((new Date(iso).getDay() + 6) % 7)))}`;
+};
 
 function OffersView() {
   const T = useT();
-  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates, setOfferQueue, ratings, requestRatings } = useApp();
+  const {
+    offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates,
+    setOfferQueue, ratings, requestRatings, bulkAction, lastBulk, setLastBulk, undoBulk, dedupeNow, dupePending, openDupePending, visitPrev, addToPipeline, triageOffer,
+  } = useApp();
   const [f, setF] = useState(DEFAULT_FILTERS);
-  const [dense, setDense] = useState(true);
+  const [sel, setSel] = useState(() => new Set());
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const anchor = useRef(null);
   useEffect(() => {
     if (offerPreset) { setF({ ...DEFAULT_FILTERS, ...offerPreset }); setOfferPreset(null); }
   }, [offerPreset]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const sourceNames = useMemo(() => [...new Set(offers.filter((o) => !o.spontaneous).flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [offers]);
+  const since = useMemo(() => visitPrev || addDays(nowISO(), -3), [visitPrev]); // stable : sinon la liste se recalcule à chaque rendu
+  const realOffers = useMemo(() => offers.filter((o) => !o.spontaneous), [offers]);
+  const inTab = useMemo(() => ({
+    todo: (o) => o.status === "new",
+    unread: (o) => o.status === "new" && !o.seenAt,
+    arrivals: (o) => new Date(o.collectedAt) > new Date(since),
+    deadlines: (o) => ["new", "pipeline"].includes(o.status) && !!o.deadline,
+    pipeline: (o) => o.status === "pipeline",
+    dismissed: (o) => o.status === "dismissed",
+    expired: (o) => o.status === "expired" || o.status === "closed",
+    all: () => true,
+  }), [since]);
+  const counts = useMemo(() => Object.fromEntries(OFFER_TABS.map((t) => [t.id, realOffers.filter(inTab[t.id]).length])), [realOffers, inTab]);
+
+  const sourceNames = useMemo(() => [...new Set(realOffers.flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [realOffers]);
   const vid = activeVersion(criteria)?.id;
   const list = useMemo(() => {
     const nq = normText(f.q);
-    let l = offers.filter((o) => {
-      if (o.spontaneous) return false;
-      if (f.status === "active" && !isActiveOffer(o)) return false;
-      if (f.status === "new" && o.status !== "new") return false;
-      if (f.status === "dismissed" && !["dismissed", "expired"].includes(o.status)) return false;
-      if (f.status === "closed" && o.status !== "closed") return false;
-      if (f.hideOld && ["active", "new"].includes(f.status) && isOldOffer(o, settings.hideOlderThan)) return false;
-      if (f.status === "pipeline" && o.status !== "pipeline") return false;
+    const l = realOffers.filter((o) => {
+      if (!inTab[f.tab](o)) return false;
+      if (f.origin === "auto" && o.dismissedBy !== "auto") return false;
+      if (f.origin === "user" && o.dismissedBy === "auto") return false;
       if (f.source && !(o.sources || []).some((s) => s.name === f.source)) return false;
       if (f.minScore && !(o.score?.value >= f.minScore)) return false;
       if (f.maxCommute && !(o.commute && o.commute.minutes <= f.maxCommute)) return false;
+      if (f.pubWithin) { const a = ageDays(pubRef(o)); if (a === null || a > f.pubWithin) return false; }
       if (nq && !normText(`${o.title} ${o.company} ${o.location} ${o.description}`).includes(nq)) return false;
       return true;
     });
+    const t = (d) => (validDate(d) ? new Date(d).getTime() : null);
     const cmp = {
-      score: (a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1),
-      date: (a, b) => new Date(b.publishedAt || b.collectedAt) - new Date(a.publishedAt || a.collectedAt),
+      score: (a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || (t(b.publishedAt) ?? 0) - (t(a.publishedAt) ?? 0),
+      published: (a, b) => (t(b.publishedAt) ?? -1) - (t(a.publishedAt) ?? -1),
+      deadline: (a, b) => (t(a.deadline) ?? 8.64e15) - (t(b.deadline) ?? 8.64e15),
+      arrival: (a, b) => new Date(b.collectedAt) - new Date(a.collectedAt),
       commute: (a, b) => (a.commute?.minutes ?? 999) - (b.commute?.minutes ?? 999),
-      source: (a, b) => (a.sources?.[0]?.name || "").localeCompare(b.sources?.[0]?.name || ""),
-    }[f.sort];
+    }[f.tab === "deadlines" && f.sort === "score" ? "deadline" : f.tab === "arrivals" && f.sort === "score" ? "arrival" : f.sort] || ((a, b) => 0);
     return [...l].sort(cmp);
-  }, [offers, f, settings.hideOlderThan]);
+  }, [realOffers, f, inTab]);
   useEffect(() => { setOfferQueue(list.map((o) => o.id)); }, [list]); // eslint-disable-line react-hooks/exhaustive-deps
-  const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && !/confidenti|non communiqu/i.test(c)))], [list, ratings]);
+  useEffect(() => { setSel((cur) => { const ids = new Set(list.map((o) => o.id)); const n = new Set([...cur].filter((id) => ids.has(id))); return n.size === cur.size ? cur : n; }); }, [list]);
+  const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && realCompany(c)))], [list, ratings]);
+  const grouped = f.tab === "arrivals" || f.sort === "arrival";
+  const groups = useMemo(() => {
+    if (!grouped) return [{ key: "all", label: null, items: list }];
+    const g = [];
+    list.forEach((o) => { const k = dayLabel(o.collectedAt); const last = g[g.length - 1]; if (last && last.label === k) last.items.push(o); else g.push({ key: k, label: k, items: [o] }); });
+    return g;
+  }, [list, grouped]);
 
-  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.type === "number" || /minScore|maxCommute/.test(k) ? Number(e.target.value) : e.target.value }));
+  const set = (k) => (e) => setF((x) => ({ ...x, [k]: /minScore|maxCommute|pubWithin/.test(k) ? Number(e.target.value) : e.target.value }));
+  const toggle = (id, e) => {
+    setSel((cur) => {
+      const n = new Set(cur);
+      if (e?.shiftKey && anchor.current) {
+        const ids = list.map((o) => o.id);
+        const a = ids.indexOf(anchor.current), b = ids.indexOf(id);
+        if (a >= 0 && b >= 0) { ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach((x) => n.add(x)); return n; }
+      }
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+    anchor.current = id;
+  };
+  const allSel = list.length > 0 && list.every((o) => sel.has(o.id));
+  const act = (kind) => { const ids = [...sel]; if (!ids.length) return; bulkAction(kind, ids); if (!["score", "verify"].includes(kind)) setSel(new Set()); };
+  const selOffers = list.filter((o) => sel.has(o.id));
+  const canRestore = selOffers.some((o) => ["dismissed", "expired"].includes(o.status));
+  const canDecide = selOffers.some((o) => o.status === "new");
 
   return (
-    <div>
+    <div className="pb-24">
       <PageHeader
         title="Offres"
-        subtitle={`${list.length} offre(s) affichée(s) sur ${offers.length} · chaque offre garde ses URL sources et dates de collecte`}
+        subtitle={`${counts.todo} à traiter · ${counts.unread} non lue(s) · ${counts.arrivals} arrivée(s) depuis ${visitPrev ? relTime(visitPrev).replace("il y a ", "") : "3 jours"} · tri, score et doublons automatiques`}
         actions={
           <>
+            {dupePending?.length > 0 && <Btn icon={GitMerge} onClick={openDupePending}>{dupePending.length} doublon(s) à valider</Btn>}
             {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length}</Btn>}
-            {unrated.length > 0 && <Btn icon={Star} onClick={() => requestRatings(unrated)} loading={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</Btn>}
-            <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
-            <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
+            <Btn icon={Filter} onClick={() => setRulesOpen(true)}>Règles de tri</Btn>
+            <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
           </>
         }
       />
-      <Card className="p-4 mb-6">
+
+      <div className="flex gap-1 overflow-x-auto mb-4 -mx-4 px-4 sm:mx-0 sm:px-0" role="tablist" aria-label="Catégories d'offres">
+        {OFFER_TABS.map((t) => {
+          const active = f.tab === t.id;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              title={t.hint}
+              onClick={() => setF((x) => ({ ...x, tab: t.id, origin: "" }))}
+              className={`shrink-0 inline-flex items-center gap-2 h-9 px-3 rounded-xl text-sm transition-colors duration-150 ${active ? `${T.navActive} font-medium` : `${T.muted} ${T.subHover}`} ${T.ring}`}
+              style={active ? T.shadow : undefined}
+            >
+              {t.label}
+              <span className={`text-xs tabular-nums ${t.id === "unread" && counts.unread ? T.accentText : T.faint}`}>{counts[t.id]}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <Card className="p-4 mb-4">
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 items-end">
           <Field label="Recherche" className="col-span-2">
             <Input value={f.q} onChange={set("q")} placeholder="Intitulé, entreprise, lieu…" />
@@ -4300,6 +5054,14 @@ function OffersView() {
               <option value={85}>≥ 85</option>
             </Select>
           </Field>
+          <Field label="Publiée depuis">
+            <Select value={f.pubWithin} onChange={set("pubWithin")} className="w-full">
+              <option value={0}>Indifférent</option>
+              <option value={7}>≤ 7 jours</option>
+              <option value={14}>≤ 14 jours</option>
+              <option value={30}>≤ 30 jours</option>
+            </Select>
+          </Field>
           <Field label="Trajet max">
             <Select value={f.maxCommute} onChange={set("maxCommute")} className="w-full">
               <option value={0}>Indifférent</option>
@@ -4308,95 +5070,246 @@ function OffersView() {
               <option value={60}>≤ 60 min</option>
             </Select>
           </Field>
-          <Field label="Statut">
-            <Select value={f.status} onChange={set("status")} className="w-full">
-              <option value="active">Actives</option>
-              <option value="new">Nouvelles</option>
-              <option value="pipeline">Dans le pipeline</option>
-              <option value="dismissed">Écartées / expirées</option>
-              <option value="closed">Candidatures clôturées</option>
-              <option value="all">Toutes</option>
+          <Field label="Tri">
+            <Select value={f.sort} onChange={set("sort")} className="w-full">
+              <option value="score">Score</option>
+              <option value="published">Date de publication</option>
+              <option value="deadline">Date limite</option>
+              <option value="arrival">Date d'arrivée (groupée)</option>
+              <option value="commute">Trajet</option>
             </Select>
           </Field>
-          <Field label="Tri">
-            <div className="flex gap-2">
-              <Select value={f.sort} onChange={set("sort")} className="flex-1 min-w-0">
-                <option value="score">Score</option>
-                <option value="date">Date</option>
-                <option value="commute">Trajet</option>
-                <option value="source">Source</option>
-              </Select>
-              <IconBtn icon={dense ? LayoutList : List} label={dense ? "Vue détaillée" : "Vue compacte"} onClick={() => setDense(!dense)} />
-            </div>
-          </Field>
         </div>
-        <label className={`flex items-center gap-2 text-xs mt-3 ${T.muted}`}>
-          <input type="checkbox" checked={f.hideOld} onChange={(e) => setF((x) => ({ ...x, hideOld: e.target.checked }))} />
-          Masquer les offres de plus de {settings.hideOlderThan} jours (souvent déjà pourvues)
-        </label>
+        {f.tab === "dismissed" && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {[["", "Toutes"], ["auto", "Par les règles"], ["user", "Par vous"]].map(([v, l]) => (
+              <button key={v} type="button" onClick={() => setF((x) => ({ ...x, origin: v }))} className={`h-7 px-3 rounded-lg text-xs ${f.origin === v ? T.navActive : `${T.muted} ${T.subHover}`} ${T.ring}`}>{l}</button>
+            ))}
+          </div>
+        )}
+        <div className={`flex flex-wrap items-center gap-x-4 gap-y-2 mt-3 text-xs ${T.faint}`}>
+          <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={dedupeNow}>Fusionner les doublons évidents</button>
+          <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => detectDuplicates()} disabled={busy.dedupe}>{busy.dedupe ? "Recherche IA des doublons…" : "Doublons reformulés (IA)"}</button>
+          {unrated.length > 0 && <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => requestRatings(unrated)} disabled={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</button>}
+          {(f.q || f.source || f.minScore || f.maxCommute || f.pubWithin) ? <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => setF((x) => ({ ...DEFAULT_FILTERS, tab: x.tab, sort: x.sort }))}>Effacer les filtres</button> : null}
+        </div>
       </Card>
+
+      {lastBulk && (
+        <Notice tone="accent" icon={History} className="mb-4">
+          <span>{lastBulk.label}.</span>
+          {lastBulk.undoable && <button type="button" className="ml-2 font-medium underline underline-offset-4" onClick={undoBulk}>Annuler</button>}
+          <button type="button" className="ml-3 underline underline-offset-4 opacity-70" onClick={() => setLastBulk(null)}>Masquer</button>
+        </Notice>
+      )}
 
       {busy.watch && <Card className="p-6 mb-4"><Skeleton lines={4} /></Card>}
       {list.length === 0 && !busy.watch ? (
-        <Card><Empty icon={Search} title="Aucune offre ne correspond" text="Élargissez les filtres, lancez la veille ou importez vos alertes e-mail." action={<Btn onClick={() => setF(DEFAULT_FILTERS)}>Réinitialiser les filtres</Btn>} /></Card>
-      ) : dense ? (
-        <Card className="p-2">
-          <ul className={`divide-y ${T.divide}`}>
-            {list.map((o) => (
-              <li key={o.id}>
-                <button type="button" onClick={() => openOffer(o.id)} className={`w-full flex items-center gap-4 px-3 py-3 rounded-2xl text-left transition-colors duration-150 ${T.subHover} ${T.ring}`}>
-                  <ScorePill score={o.score} threshold={settings.threshold} />
-                  <span className="flex-1 min-w-0">
-                    <span className="flex items-center gap-2">
-                      <span className="text-sm font-medium truncate">{o.title}</span>
-                      {o.demo && <Chip>exemple</Chip>}
-                      {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
-                      {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">score obsolète</Chip>}
-                    </span>
-                    <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}><span className="truncate">{show(o.company)} · {show(o.location)}</span><RatingChip company={o.company} compact /></span>
-                  </span>
-                  <span className={`hidden md:flex items-center gap-1 text-xs w-20 ${T.muted}`}><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</span>
-                  <span className={`hidden lg:block text-xs w-32 truncate ${T.muted}`}>{o.sources?.map((s) => s.name).join(", ")}</span>
-                  <span className={`hidden sm:block text-xs w-20 text-right tabular-nums ${T.faint}`}>{fmtDate(o.publishedAt || o.collectedAt)}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+        <Card>
+          <Empty
+            icon={f.tab === "unread" || f.tab === "todo" ? CheckCircle2 : Search}
+            title={f.tab === "unread" ? "Tout est lu" : f.tab === "todo" ? "Rien à traiter" : "Aucune offre ici"}
+            text={f.tab === "todo" || f.tab === "unread" ? "Les nouvelles offres arrivent avec la veille planifiée ; celles qui ne passent pas vos règles vont directement dans « Écartées » ou « Expirées »." : "Élargissez les filtres ou changez d'onglet."}
+          />
         </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {list.map((o) => (
-            <Card key={o.id} as="button" type="button" onClick={() => openOffer(o.id)} className={`p-6 text-left transition-transform duration-200 hover:-translate-y-0.5 ${T.ring}`}>
-              <div className="flex items-start gap-4">
-                <ScorePill score={o.score} threshold={settings.threshold} size="lg" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-base font-medium leading-snug">{o.title}</div>
-                  <div className={`text-sm mt-0.5 ${T.muted}`}>{show(o.company)}</div>
-                  <div className="flex flex-wrap gap-1.5 mt-3">
-                    {o.demo && <Chip>exemple</Chip>}
-                    <Chip><MapPin className="w-3 h-3" aria-hidden="true" />{show(o.location)}</Chip>
-                    <Chip><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</Chip>
-                    <Chip>{show(o.remote)}</Chip>
-                    {o.score && <Chip tone={o.score.confidence === "faible" ? "warn" : "neutral"}>confiance {o.score.confidence}</Chip>}
-                  </div>
-                </div>
-              </div>
-              {o.score?.summary && <p className={`text-sm mt-4 ${T.muted}`}>{o.score.summary}</p>}
-              {o.score?.redFlags?.length > 0 && (
-                <div className="mt-3 text-xs text-rose-600 flex items-start gap-1.5"><Flag className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />{o.score.redFlags[0].evidence}</div>
-              )}
-              <div className={`mt-4 text-xs ${T.faint}`}>{o.sources?.map((s) => s.name).join(" · ")} · collectée {fmtDate(o.collectedAt)}</div>
-            </Card>
+        <Card className="p-2">
+          <div className={`hidden md:flex items-center gap-3 px-3 py-2 text-xs ${T.faint}`}>
+            <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? new Set() : new Set(list.map((o) => o.id)))} aria-label="Tout sélectionner" className="w-4 h-4" />
+            <span className="w-10">Score</span>
+            <span className="flex-1">Offre</span>
+            <span className="w-24">Publiée</span>
+            <span className="w-20">Limite</span>
+            <span className="w-20">Arrivée</span>
+            <span className="w-16">Trajet</span>
+            <span className="w-24 text-right">Décider</span>
+          </div>
+          <div className="md:hidden flex items-center gap-2 px-3 py-2 text-xs">
+            <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? new Set() : new Set(list.map((o) => o.id)))} aria-label="Tout sélectionner" className="w-4 h-4" />
+            <span className={T.faint}>Tout sélectionner ({list.length})</span>
+          </div>
+          {groups.map((g) => (
+            <div key={g.key}>
+              {g.label && <div className={`px-3 pt-4 pb-1 text-xs font-medium uppercase tracking-wider ${T.faint}`}>{g.label} · {g.items.length}</div>}
+              <ul className={`divide-y ${T.divide}`}>
+                {g.items.map((o) => (
+                  <OfferRow
+                    key={o.id}
+                    o={o}
+                    vid={vid}
+                    selected={sel.has(o.id)}
+                    onToggle={(e) => toggle(o.id, e)}
+                    onOpen={() => openOffer(o.id)}
+                    onKeep={() => addToPipeline(o.id, "retained")}
+                    onDismiss={() => triageOffer(o.id, { status: "dismissed", dismissedAt: nowISO() })}
+                    onExpire={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO() })}
+                  />
+                ))}
+              </ul>
+            </div>
           ))}
+        </Card>
+      )}
+
+      {sel.size > 0 && (
+        <div className="fixed bottom-4 left-4 right-4 flex justify-center" style={{ zIndex: 60 }}>
+          <div className="max-w-full flex flex-wrap items-center gap-1.5 rounded-2xl px-3 py-2" style={{ ...T.glass, ...T.shadow }} role="toolbar" aria-label="Actions sur la sélection">
+            <span className="text-sm font-medium px-2 tabular-nums">{sel.size} sélectionnée(s)</span>
+            {canDecide && <Btn size="sm" icon={X} onClick={() => act("dismiss")}>Écarter</Btn>}
+            {canDecide && <Btn size="sm" icon={Clock} onClick={() => act("expire")}>Expirées</Btn>}
+            {canRestore && <Btn size="sm" icon={RotateCcw} onClick={() => act("restore")}>Remettre à traiter</Btn>}
+            <Btn size="sm" icon={Eye} onClick={() => act("seen")}>Lues</Btn>
+            {canDecide && <Btn size="sm" icon={Plus} onClick={() => act("pipeline")}>Pipeline</Btn>}
+            <Btn size="sm" icon={Gauge} onClick={() => act("score")} loading={busy.score}>Scorer</Btn>
+            <Btn size="sm" icon={Link2} onClick={() => act("verify")} loading={busy.verify}>Vérifier les liens</Btn>
+            {sel.size >= 2 && sel.size <= 6 && <Btn size="sm" icon={GitMerge} onClick={() => act("merge")}>Fusionner</Btn>}
+            <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => act("remove")}>Supprimer</Btn>
+            <IconBtn icon={X} label="Vider la sélection" onClick={() => setSel(new Set())} />
+          </div>
         </div>
       )}
+
+      <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
     </div>
+  );
+}
+
+function FreshChip({ o, compact }) {
+  const T = useT();
+  const fr = freshness(o);
+  const color = fr.tone === "ok" ? (T.dark ? "text-emerald-200" : "text-emerald-800") : fr.tone === "warn" ? (T.dark ? "text-amber-200" : "text-amber-900") : T.muted;
+  return <span className={`text-xs tabular-nums ${color}`} title={o.publishedAt ? `Publiée le ${fmtDate(o.publishedAt)}${o.publishedApprox ? " (date de l'alerte e-mail)" : ""}` : "Date de publication inconnue"}>{compact ? fr.label.replace("il y a ", "") : fr.label}</span>;
+}
+function DeadlineChip({ o }) {
+  const T = useT();
+  const d = deadlineIn(o);
+  if (d === null) return <span className={`text-xs ${T.faint}`}>—</span>;
+  const cls = d < 0 ? "text-rose-600 line-through" : d <= 3 ? "text-rose-600 font-medium" : d <= 7 ? (T.dark ? "text-amber-200" : "text-amber-900") : T.muted;
+  return <span className={`text-xs tabular-nums ${cls}`} title={`Date limite : ${fmtDate(o.deadline)}`}>{d < 0 ? "dépassée" : d === 0 ? "aujourd'hui" : `J-${d}`}</span>;
+}
+function LinkChip({ o }) {
+  const st = o.link?.state;
+  if (st === "open") return <Chip tone="ok" title={o.link.evidence || "Annonce vérifiée ouverte"}>lien ouvert</Chip>;
+  if (st === "closed") return <Chip tone="danger" title={o.link.evidence || ""}>annonce clôturée</Chip>;
+  if (st === "pending") return <Chip>vérification…</Chip>;
+  return null;
+}
+
+function OfferRow({ o, vid, selected, onToggle, onOpen, onKeep, onDismiss, onExpire }) {
+  const T = useT();
+  const { settings } = useApp();
+  const unread = o.status === "new" && !o.seenAt && !o.demo;
+  return (
+    <li className={`flex items-center gap-3 px-3 py-2.5 rounded-2xl ${selected ? T.sub : ""}`}>
+      <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggle(e)} aria-label={`Sélectionner ${o.title}`} className="w-4 h-4 shrink-0" />
+      <button type="button" onClick={onOpen} className={`flex-1 min-w-0 flex items-center gap-3 text-left rounded-xl ${T.ring}`}>
+        <span className="relative shrink-0">
+          <ScorePill score={o.score} threshold={settings.threshold} />
+          {unread && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-indigo-600" aria-label="non lue" />}
+        </span>
+        <span className="flex-1 min-w-0">
+          <span className="flex items-center gap-2">
+            <span className={`text-sm truncate ${unread ? "font-semibold" : "font-medium"}`}>{o.title}</span>
+            {o.demo && <Chip>exemple</Chip>}
+            {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
+            {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">à rescorer</Chip>}
+          </span>
+          <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}>
+            <span className="truncate">{show(o.company)} · {show(o.location)} · {(o.sources || []).map((s) => s.name).filter((v, i, a) => a.indexOf(v) === i).join(", ")}</span>
+            <RatingChip company={o.company} compact />
+          </span>
+          {(o.autoReason || o.link?.state || (o.status !== "new" && o.status !== "pipeline")) && (
+            <span className="flex flex-wrap items-center gap-1.5 mt-1">
+              {o.autoReason && <Chip tone={o.status === "expired" ? "warn" : "neutral"} title="Tri automatique — restaurable">auto : {o.autoReason}</Chip>}
+              {!o.autoReason && o.status === "dismissed" && <Chip>écartée</Chip>}
+              {!o.autoReason && o.status === "expired" && <Chip tone="warn">expirée / pourvue</Chip>}
+              {o.status === "pipeline" && <Chip tone="accent">pipeline</Chip>}
+              <LinkChip o={o} />
+            </span>
+          )}
+          <span className="flex md:hidden items-center gap-3 mt-1">
+            <FreshChip o={o} />
+            {o.deadline && <span className="inline-flex items-center gap-1 text-xs"><CalendarClock className="w-3 h-3" aria-hidden="true" /><DeadlineChip o={o} /></span>}
+            <span className={`text-xs ${T.faint}`}>arrivée {relDay(o.collectedAt)}</span>
+          </span>
+        </span>
+        <span className="hidden md:block w-24"><FreshChip o={o} /></span>
+        <span className="hidden md:block w-20"><DeadlineChip o={o} /></span>
+        <span className={`hidden md:block w-20 text-xs tabular-nums ${T.faint}`} title={fmtDate(o.collectedAt, { time: true })}>{relDay(o.collectedAt)}</span>
+        <span className={`hidden md:block w-16 text-xs ${T.muted}`}>{commuteLabel(o.commute)}</span>
+      </button>
+      <span className="hidden sm:flex w-24 justify-end gap-0.5 shrink-0">
+        {o.status === "new" && !o.demo ? (
+          <>
+            <IconBtn icon={Check} label="Retenir (pipeline)" onClick={onKeep} />
+            <IconBtn icon={X} label="Écarter" onClick={onDismiss} />
+            <IconBtn icon={Clock} label="Expirée / pourvue" onClick={onExpire} />
+          </>
+        ) : null}
+      </span>
+    </li>
+  );
+}
+
+function RulesModal({ open, onClose }) {
+  const T = useT();
+  const { settings, setSettings, offers, criteria, runRules } = useApp();
+  const rules = rulesOf(settings);
+  const setR = (k, v) => setSettings((s) => ({ ...s, rules: { ...rulesOf(s), [k]: v } }));
+  const setS = (k, v) => setSettings((s) => ({ ...s, [k]: v }));
+  const ver = activeVersion(criteria);
+  const preview = useMemo(() => {
+    if (!open) return { total: 0, by: {} };
+    const by = {};
+    let total = 0;
+    offers.forEach((o) => { const v = ruleVerdict(o, ver, rules); if (v) { total++; by[v.rule] = (by[v.rule] || 0) + 1; } });
+    return { total, by };
+  }, [open, offers, ver, settings.rules]); // eslint-disable-line react-hooks/exhaustive-deps
+  const num = (k, min, max) => (e) => setR(k, clamp(Number(e.target.value) || 0, min, max));
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      wide
+      title="Règles de tri automatique"
+      footer={<><Btn variant="ghost" onClick={onClose}>Fermer</Btn><Btn variant="primary" icon={Filter} disabled={!preview.total} onClick={() => { runRules(); onClose(); }}>Appliquer maintenant ({preview.total})</Btn></>}
+    >
+      <div className="space-y-5">
+        <Notice icon={Info}>
+          Appliquées à chaque arrivée d'offres et à chaque ouverture, uniquement aux offres « à traiter » (jamais au pipeline ni aux offres que vous avez restaurées). Les offres triées restent visibles dans « Écartées » ou « Expirées », avec la raison, et se restaurent en un clic.
+        </Notice>
+        <Toggle checked={rules.enabled} onChange={(v) => setR("enabled", v)} label="Tri automatique activé" />
+        {preview.total > 0 && (
+          <p className={`text-sm ${T.muted}`}>Aperçu sur le stock actuel : {Object.entries(preview.by).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(" · ")}.</p>
+        )}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <Field label="Âge max (jours)" hint="depuis la publication"><Input type="number" value={rules.maxAgeDays} onChange={num("maxAgeDays", 0, 120)} /></Field>
+          <Field label="Date inconnue : max (j)" hint="depuis la collecte"><Input type="number" value={rules.unknownDateMaxDays} onChange={num("unknownDateMaxDays", 0, 120)} /></Field>
+          <Field label="Score minimum" hint="en dessous : écartée"><Input type="number" value={rules.dismissBelow} onChange={num("dismissBelow", 0, 90)} /></Field>
+          <Field label="Marge de trajet (min)" hint={`au-delà de ${ver?.maxCommute ?? 60} + marge`}><Input type="number" value={rules.commuteSlack} onChange={num("commuteSlack", 0, 120)} /></Field>
+        </div>
+        <Field label="Mots qui excluent un intitulé">
+          <ChipInput values={rules.titleExclude} onChange={(v) => setR("titleExclude", v)} placeholder="junior, stage…" ariaLabel="Mots exclus" />
+        </Field>
+        <Toggle checked={rules.requireSeniority} onChange={(v) => setR("requireSeniority", v)} label="L'intitulé doit indiquer un poste de management" description="manager, head, lead, directeur, responsable, hoofd…" />
+        {rules.requireSeniority && <ChipInput values={rules.seniorityTokens} onChange={(v) => setR("seniorityTokens", v)} placeholder="mot" ariaLabel="Mots de management" />}
+        <Toggle checked={rules.requireDomain} onChange={(v) => setR("requireDomain", v)} label="L'intitulé doit relever de votre périmètre" description="Digital, IT, CRM, transformation, process… complété automatiquement par les mots de vos postes visés." />
+        {rules.requireDomain && <ChipInput values={rules.domainTokens} onChange={(v) => setR("domainTokens", v)} placeholder="mot" ariaLabel="Mots du périmètre" />}
+        <div className={`pt-4 border-t ${T.line}`}>
+          <SectionTitle>Automatisations</SectionTitle>
+          <Toggle checked={settings.autoScore} onChange={(v) => setS("autoScore", v)} label="Scoring automatique" description={`Toute offre à traiter est scorée dès son arrivée (jusqu'à ${settings.autoScoreMax} par lot), avec la même formule.`} />
+          <Toggle checked={settings.autoDedupe} onChange={(v) => setS("autoDedupe", v)} label="Fusion automatique des doublons évidents" description="Même URL ou identifiant d'annonce, ou même entreprise + intitulé proche. Annulable depuis la fiche." />
+          <Toggle checked={settings.autoDedupeAI} onChange={(v) => setS("autoDedupeAI", v)} label="Détection IA des doublons reformulés après chaque arrivée" description="Confiance haute : fusion directe (annulable). Confiance moyenne : à valider." />
+          <Toggle checked={settings.autoVerify} onChange={(v) => setS("autoVerify", v)} label="Vérification des liens par la veille planifiée" description="À chaque passage, la Routine vérifie jusqu'à 40 offres actives ; les annonces clôturées passent en « Expirées »." />
+        </div>
+      </div>
+    </Modal>
   );
 }
 
 function OfferDrawer({ id, onClose }) {
   const T = useT();
-  const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel } = useApp();
+  const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel, requestVerify } = useApp();
   const o = offers.find((x) => x.id === id);
   const queue = offerQueue.length ? offerQueue : offers.filter(isActiveOffer).map((x) => x.id);
   const pos = queue.indexOf(id);
@@ -4411,6 +5324,7 @@ function OfferDrawer({ id, onClose }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [nextId, prevId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (o && !o.seenAt && !o.demo) patchOffer(o.id, { seenAt: nowISO() }); }, [o?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!o) return null;
   const mainUrl = (o.sources || []).find((x) => x.url)?.url;
   const s = o.score;
@@ -4421,7 +5335,11 @@ function OfferDrawer({ id, onClose }) {
     ["Entreprise", o.company], ["Lieu", o.location],
     ["Trajet depuis Ohain", o.commute ? `~${o.commute.minutes} min en voiture (${o.commute.basis})` : null],
     ["Contrat", o.contract], ["Séniorité", o.seniority], ["Salaire", o.salary], ["Télétravail", o.remote],
-    ["Langue", o.language ? LANG_NAME[o.language] : null], ["Publication", o.publishedAt ? fmtDate(o.publishedAt) : null], ["Collecte", fmtDate(o.collectedAt, { time: true })],
+    ["Langue", o.language ? LANG_NAME[o.language] : null],
+    ["Publication", o.publishedAt ? `${fmtDate(o.publishedAt)} (${freshness(o).label})${o.publishedApprox ? " — date de l'alerte e-mail" : ""}` : null],
+    ["Date limite de candidature", o.deadline ? `${fmtDate(o.deadline)}${deadlineIn(o) !== null ? ` (${deadlineIn(o) < 0 ? "dépassée" : `J-${deadlineIn(o)}`})` : ""}` : null],
+    ["Collecte", fmtDate(o.collectedAt, { time: true })],
+    ["Lien", o.link?.state ? `${{ open: "ouvert", closed: "clôturé", pending: "vérification demandée", unknown: "indéterminé" }[o.link.state] || o.link.state}${o.link.at ? ` · vérifié ${fmtDate(o.link.at)}` : ""}${o.link.evidence ? ` — ${o.link.evidence}` : ""}` : "non vérifié"],
   ];
   return (
     <Drawer
@@ -4440,6 +5358,9 @@ function OfferDrawer({ id, onClose }) {
           {o.demo && <Chip>exemple — donnée fictive</Chip>}
           {o.status === "expired" && <Chip tone="warn">expirée / pourvue</Chip>}
           {o.status === "closed" && <Chip>candidature clôturée</Chip>}
+          <Chip tone={freshness(o).tone === "ok" ? "ok" : freshness(o).tone === "warn" ? "warn" : "neutral"}><CalendarDays className="w-3 h-3" aria-hidden="true" />{freshness(o).days === null ? "date de publication inconnue" : `publiée ${freshness(o).label}`}</Chip>
+          {o.deadline && <Chip tone={deadlineIn(o) !== null && deadlineIn(o) <= 7 ? "danger" : "neutral"}><CalendarClock className="w-3 h-3" aria-hidden="true" />limite {fmtDate(o.deadline)}</Chip>}
+          <LinkChip o={o} />
           {pos >= 0 && <span className={`text-xs tabular-nums ${T.faint}`}>{pos + 1} / {queue.length}</span>}
           <span className="inline-flex gap-1">
             <IconBtn icon={ChevronLeft} label="Offre précédente (←)" onClick={() => prevId && setOfferSel(prevId)} disabled={!prevId} />
@@ -4458,16 +5379,23 @@ function OfferDrawer({ id, onClose }) {
           </>
         )}
         {INACTIVE.includes(o.status) && o.status !== "closed" ? (
-          <Btn variant="ghost" icon={RotateCcw} onClick={() => patchOffer(o.id, { status: "new" })}>Restaurer</Btn>
+          <Btn variant="ghost" icon={RotateCcw} onClick={() => patchOffer(o.id, { status: "new", userKept: true, autoReason: undefined, autoRule: undefined, dismissedBy: undefined, expiredBy: undefined })}>Restaurer (à traiter)</Btn>
         ) : !app && (
           <>
             <Btn variant="ghost" icon={X} onClick={() => triageOffer(o.id, { status: "dismissed", dismissedAt: nowISO() })}>Écarter</Btn>
             <Btn variant="ghost" icon={Clock} onClick={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO() })}>Expirée / pourvue</Btn>
+            <Btn variant="ghost" icon={Unlink} onClick={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO(), link: { state: "closed", evidence: "lien mort / 404 signalé", at: nowISO(), method: "vous" } })}>Lien mort (404)</Btn>
           </>
         )}
+        {!o.demo && mainUrl && <Btn variant="ghost" icon={Link2} onClick={() => requestVerify([o.id])} loading={busy.verify}>Vérifier le lien</Btn>}
         {nextId && <Btn variant="ghost" icon={ArrowRight} onClick={() => setOfferSel(nextId)}>Suivante</Btn>}
         {!o.demo && <Btn variant="ghost" icon={RefreshCw} onClick={() => scoreOffers([o.id])} loading={busy.score}>{s ? "Rescorer" : "Scorer"}</Btn>}
       </div>
+      {o.autoReason && (
+        <Notice tone={o.status === "expired" ? "warn" : "neutral"} icon={Filter} className="mb-3">
+          Triée automatiquement : {o.autoReason}. « Restaurer » la remet à traiter et la protège des règles.
+        </Notice>
+      )}
       <label className={`flex items-center gap-2 text-xs mb-8 ${T.faint}`}>
         <input type="checkbox" checked={!!settings.autoNext} onChange={(e) => setSettings((x) => ({ ...x, autoNext: e.target.checked }))} />
         Passer automatiquement à l'offre suivante après « Écarter », « Expirée » ou « Ajouter » · flèches ← → pour naviguer
@@ -4482,10 +5410,12 @@ function OfferDrawer({ id, onClose }) {
                 <div className="flex flex-wrap items-center gap-2">
                   <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>Confiance {s.confidence}</Chip>
                   {stale && !o.demo && <Chip tone="warn">critères modifiés depuis</Chip>}
-                  {s.caps?.map((c) => <Chip key={c} tone="danger">plafonné : {c}</Chip>)}
+                  {s.fit && <Chip tone={s.fit === "fort" ? "ok" : s.fit === "faible" ? "warn" : "neutral"}>adéquation {s.fit}</Chip>}
+                  {s.caps?.map((c) => <Chip key={c} tone="danger">{s.method === 2 ? c : `plafonné : ${c}`}</Chip>)}
                 </div>
                 {s.summary && <p className="text-sm mt-2">{s.summary}</p>}
                 {s.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
+                {s.method === 2 && <p className={`text-xs mt-1 ${T.faint}`}>Calcul systématique : 55 % souhaités pondérés{s.wishAvg !== null ? ` (${s.wishAvg})` : ""} + 45 % indispensables{s.mustAvg !== null ? ` (${s.mustAvg})` : ""}, puis plafonds et pénalités.</p>}
               </>
             ) : (
               <p className={`text-sm ${T.muted}`}>Pas encore scorée.</p>
