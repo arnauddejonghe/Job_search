@@ -858,6 +858,99 @@ function wordDiff(a, b) {
   return out;
 }
 
+/* ── 6b · Ce que vous corrigez à la main : écart mot à mot entre la version IA et votre version ── */
+function editDelta(base, edited) {
+  const rows = lineDiff(base || "", edited || "");
+  const wc = (s) => String(s || "").split(/\s+/).filter(Boolean).length;
+  let del = 0, add = 0;
+  const hunks = [];
+  for (const r of rows) {
+    if (r.t === "del") { del += wc(r.text); hunks.push({ del: r.text, add: "" }); }
+    else if (r.t === "add") { add += wc(r.text); hunks.push({ del: "", add: r.text }); }
+    else if (r.t === "chg") {
+      const d = r.segs.filter((x) => x.t === "del").map((x) => x.w).join(" … ");
+      const a = r.segs.filter((x) => x.t === "add").map((x) => x.w).join(" … ");
+      del += wc(d); add += wc(a);
+      if (d || a) hunks.push({ del: d, add: a });
+    }
+  }
+  const total = wc(displayMarkup(base)) + wc(displayMarkup(edited));
+  return { pct: total ? Math.round(((del + add) / total) * 100) : 0, changed: del + add, hunks: hunks.slice(0, 20).map((h) => ({ del: h.del.slice(0, 220), add: h.add.slice(0, 220) })) };
+}
+const learningOf = (p) => (p?.ruleLearning && typeof p.ruleLearning === "object" ? p.ruleLearning : { edits: [], lastLearnAt: null });
+const pendingLearnDocs = (p) => {
+  const l = learningOf(p);
+  const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+  return new Set(l.edits.filter((e) => new Date(e.at).getTime() > since).map((e) => `${e.appId}:${e.type}`)).size;
+};
+
+/* ── 6c · CV maître par langue : seuls la ligne de positionnement, le Profil, les Réalisations, l'ordre des puces et les Compétences changent ── */
+const masterOf = (p, lang) => (p?.masterCv && p.masterCv[lang]?.text ? p.masterCv[lang] : null);
+const ADAPTABLE = ["profile", "achievements", "skills"];
+const secKindOf = (title) => Object.keys(SEC).find((k) => SEC[k].test(String(title || ""))) || null;
+const bulletKey = (s) => normText(String(s || "").replace(/^[-•*]\s*/, ""));
+const similar = (a, b) => { const A = tokens(a), B = tokens(b); return A.length && B.length && jaccard(A, B) >= 0.6; };
+/* 6d · puces verrouillées : recopiées mot pour mot, jamais réécrites. */
+const lockedOf = (p) => (Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => str(x)) : []);
+const touchesLocked = (before, locked) => {
+  const b = normText(before);
+  return !!b && locked.some((l) => { const k = normText(l); return k && (b.includes(k) || (k.includes(b) && b.length > 25)); });
+};
+function restoreLocked(lines, locked) {
+  if (!locked.length) return lines;
+  return lines.map((l) => {
+    const m = l.match(/^(\s*[-•*]\s+)(.*)$/);
+    if (!m) return l;
+    const hit = locked.find((x) => bulletKey(x) !== bulletKey(m[2]) && similar(x, m[2]));
+    return hit ? `${m[1]}${hit.replace(/^[-•*]\s*/, "")}` : l;
+  });
+}
+/* Fusion : tout vient du maître, sauf les sections adaptables et l'ordre des puces de chaque poste. */
+function enforceMaster(genText, masterText, locked = []) {
+  const G = docOutline(genText, "cv"), M = docOutline(masterText, "cv");
+  const gBy = (k) => G.sections.find((s) => secKindOf(s.title) === k);
+  const out = [];
+  let insertedMissing = false;
+  const missingAdaptable = ADAPTABLE.filter((k) => !M.sections.some((s) => secKindOf(s.title) === k) && gBy(k));
+  for (const ms of M.sections) {
+    const k = secKindOf(ms.title);
+    if (ADAPTABLE.includes(k) && gBy(k)) out.push({ title: ms.title, lines: restoreLocked(gBy(k).lines, locked) });
+    else if (k === "experience") {
+      const gs = gBy("experience");
+      const gEntries = [];
+      (gs?.lines || []).forEach((l) => { const t = l.trim(); if (t.startsWith("### ")) gEntries.push({ h: t.slice(4), bullets: [] }); else if (/^[-•*]\s/.test(t) && gEntries.length) gEntries[gEntries.length - 1].bullets.push(t.replace(/^[-•*]\s*/, "")); });
+      const lines = [];
+      let entry = null;
+      const flush = () => {
+        if (!entry) return;
+        const g = gEntries.find((e) => similar(e.h.split("|").slice(0, 2).join(" "), entry.h.split("|").slice(0, 2).join(" ")));
+        let ordered = entry.bullets;
+        if (g) {
+          const used = new Set();
+          const seq = [];
+          g.bullets.forEach((gb) => { const i = entry.bullets.findIndex((mb, j) => !used.has(j) && (bulletKey(mb) === bulletKey(gb) || similar(mb, gb))); if (i >= 0) { used.add(i); seq.push(entry.bullets[i]); } });
+          ordered = [...seq, ...entry.bullets.filter((_, j) => !used.has(j))];
+        }
+        lines.push(`### ${entry.h}`, ...entry.pre, ...ordered.map((b) => `- ${b}`), "");
+        entry = null;
+      };
+      for (const l of ms.lines) {
+        const t = l.trim();
+        if (t.startsWith("### ")) { flush(); entry = { h: t.slice(4), pre: [], bullets: [] }; }
+        else if (entry && /^[-•*]\s/.test(t)) entry.bullets.push(t.replace(/^[-•*]\s*/, ""));
+        else if (entry && t) entry.pre.push(l);
+        else if (!entry) lines.push(l);
+      }
+      flush();
+      out.push({ title: ms.title, lines });
+    } else out.push(ms);
+    if (k === "profile" && !insertedMissing) { missingAdaptable.forEach((mk) => out.push({ title: gBy(mk).title, lines: restoreLocked(gBy(mk).lines, locked) })); insertedMissing = true; }
+  }
+  if (!insertedMissing) missingAdaptable.forEach((mk) => out.unshift({ title: gBy(mk).title, lines: gBy(mk).lines }));
+  const head = [`# ${M.name || G.name}`, (G.headline || M.headline) ? `> ${G.headline || M.headline}` : "", `@ ${M.contact || G.contact}`].filter((x) => x && x !== "@ ");
+  return [...head, "", ...out.flatMap((s) => [s.title ? `## ${s.title}` : "", ...s.lines.map((l) => l.trimEnd()), ""])].join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /* Remplacement ciblé proposé par l'IA : « before » doit exister dans le texte (tolérance typographique). */
 const typoNorm = (s) => String(s || "").replace(/[‘’′]/g, "'").replace(/[“”]/g, '"').replace(/[  ]/g, " ").replace(/[ \t]+/g, " ");
 function applyEdit(text, before, after) {
@@ -1900,8 +1993,11 @@ const SEED_RULES = [
 const writingRulesOf = (p) => (Array.isArray(p?.writingRules) ? p.writingRules : SEED_RULES);
 function rulesBlock(p) {
   const act = writingRulesOf(p).filter((r) => r.active && String(r.text || "").trim());
-  if (!act.length) return "";
-  return `RÈGLES D'ÉCRITURE DU CANDIDAT (prioritaires sur toutes les consignes de style et de ton ci-dessus ; jamais sur la vérité : un fait absent du profil reste [à compléter : …])\n${act.map((r) => `- ${r.text}`).join("\n")}`;
+  const locked = Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => String(x || "").trim()) : [];
+  const parts = [];
+  if (act.length) parts.push(`RÈGLES D'ÉCRITURE DU CANDIDAT (prioritaires sur toutes les consignes de style et de ton ci-dessus ; jamais sur la vérité : un fait absent du profil reste [à compléter : …])\n${act.map((r) => `- ${r.text}`).join("\n")}`);
+  if (locked.length) parts.push(`PUCES VERROUILLÉES (si tu en utilises une, recopie-la mot pour mot ; ne propose jamais de la modifier)\n${locked.map((b) => `- ${b}`).join("\n")}`);
+  return parts.join("\n\n");
 }
 /* Insère les règles juste avant la consigne de format JSON finale. */
 function withRules(prompt, p) {
@@ -2285,8 +2381,15 @@ Réponds uniquement avec ce JSON :
       : tg.spont
         ? `c) la projection : ce qu'il veut apporter à ${show(offer.company)} dans un rôle de « ${target} », formulé comme un OBJECTIF (aucune offre n'existe : jamais « en réponse à votre annonce »).`
         : `c) la projection : ce qu'il veut apporter, en citant l'intitulé exact « ${target} » comme OBJECTIF (par ex. « … souhaite mettre cette expérience au service de ${show(offer.company)} en tant que ${target} »), jamais comme une fonction déjà exercée.`;
+    const masterBlock = extra.master ? `
+CV MAÎTRE (${LANG_NAME[extra.masterLang] || "même langue"}) — base OBLIGATOIRE. Tu l'ADAPTES, tu ne le réécris pas.
+Tu ne peux modifier QUE : la ligne de positionnement (« > »), la section Profil, la section Réalisations clés (choisir et ordonner des réalisations du maître ou du profil), l'ORDRE des puces dans chaque poste (sans changer leur texte) et la section Compétences. Tout le reste (en-tête, postes, puces, langues, formation) est recopié à l'identique ; toute autre modification sera annulée.
+<<<
+${extra.master}
+>>>
+` : "";
     return `Mission : rédiger le CV du candidat, adapté à la cible ci-dessous et prêt à envoyer après relecture.
-
+${masterBlock}
 ${targetBlock(offer, a)}
 
 ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (déjà confrontée au profil)
@@ -2366,8 +2469,8 @@ Réponds uniquement avec ce JSON :
 RÈGLE D'OR : le CV prouve, la lettre explique. Le CV ci-dessous est déjà joint : la lettre ne le résume pas. Elle dit pourquoi CETTE entreprise, pourquoi CE rôle MAINTENANT, comment le candidat travaille, et raconte UNE preuve.
 TEST DE SUBSTITUTION : relis chaque phrase en remplaçant ${tg.base ? "l'entreprise" : company} par un concurrent. Si elle reste vraie, réécris-la avec un fait propre à ${tg.base ? "l'entreprise" : company}, ou supprime-la.
 
-${targetBlock(offer, a)}
-
+${targetBlock(offer, a).split("\n").filter((l) => !l.startsWith("Contexte fourni par le candidat")).join("\n")}
+${tg.spont && adTextOf(offer) ? `\nNOTES DU CANDIDAT SUR L'ENTREPRISE (son point de vue, pas des faits vérifiés : à utiliser pour le « pourquoi » personnel, jamais citées comme faits sur l'entreprise)\n${adTextOf(offer).slice(0, 1500)}\n` : ""}
 CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (faits sourcés, seules informations autorisées sur l'entreprise ; cite leurs identifiants dans « used »)
 ${facts.length ? facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n") : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
 
@@ -2440,6 +2543,24 @@ ${String(text || "").slice(0, 15000)}
 >>>
 Règles : uniquement ce que dit la source, une phrase factuelle par fait, 3 à 8 faits, aucune interprétation ni flatterie.
 Réponds uniquement {"summary":"1 phrase","facts":[{"text":""}]}`;
+  },
+
+  learnRules(edits, rules) {
+    return `Mission : déduire des corrections manuelles d'un candidat les règles d'écriture qu'il applique de façon RÉCURRENTE à ses CV et lettres générés par IA.
+
+RÈGLES DÉJÀ CONNUES (ne pas les reproposer)
+${rules.map((r) => `- ${r.text}`).join("\n") || "(aucune)"}
+
+CORRECTIONS (supprimé → ajouté), regroupées par document
+${edits.map((e) => `[${e.type} · ${e.appId.slice(-6)}]\n${e.hunks.slice(0, 12).map((h) => `- « ${h.del || "∅"} » → « ${h.add || "∅"} »`).join("\n")}`).join("\n\n").slice(0, 14000)}
+
+RÈGLES
+- Une règle n'est proposée que si le même type de correction apparaît dans AU MOINS 2 documents différents. Cite ces exemples dans evidence.
+- Règle courte, impérative, applicable par un rédacteur (ex. « Ne jamais écrire "responsable CRM" : préférer "transformation digitale" »).
+- Style, vocabulaire, ton, structure seulement : une règle ne peut jamais autoriser un fait absent du profil.
+- 0 à 5 règles. Aucune si rien n'est récurrent.
+
+Réponds uniquement {"rules":[{"text":"","evidence":"2 exemples courts","docs":2}]}`;
   },
 
   motivationDraft(answers, current) {
@@ -4374,6 +4495,7 @@ export default function RadarApp() {
           const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000 });
           let txt = d.text;
           for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
+            if (touchesLocked(e?.before, lockedOf(p))) continue;
             const nt = applyEdit(txt, e?.before, e?.after);
             if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
           }
@@ -4385,13 +4507,15 @@ export default function RadarApp() {
         : Promise.resolve();
       /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
       if (pro.includes("cv")) {
-        setGen(appId, { step: 2, label: "Rédaction du CV…" });
+        const master = masterOf(p, lang);
+        setGen(appId, { step: 2, label: master ? "Adaptation du CV maître…" : "Rédaction du CV…" });
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, extra), p), maxTokens: 9000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, { ...extra, master: master?.text, masterLang: lang }), p), maxTokens: 9000 });
           const raw = r.data?.cv;
           if (typeof raw === "string" && raw.trim()) {
             const accent = cleanHex(r.data?.accent, null);
-            drafts.cv = { text: normalizeDoc(raw, "cv", lang), accent, accentSource: accent ? str(r.data?.accentSource) || "suggérée" : null, tips: (r.data?.tips || []).map(String).filter(Boolean).slice(0, 4) };
+            const written = normalizeDoc(raw, "cv", lang);
+            drafts.cv = { text: master ? normalizeDoc(enforceMaster(written, master.text, lockedOf(p)), "cv", lang) : written, masterAt: master?.at || null, accent, accentSource: accent ? str(r.data?.accentSource) || "suggérée" : null, tips: (r.data?.tips || []).map(String).filter(Boolean).slice(0, 4) };
             setGen(appId, { step: 3, label: "Contrôle qualité du CV…" });
             await autoFix("cv", drafts.cv);
           }
@@ -4414,7 +4538,7 @@ export default function RadarApp() {
       await restJob;
       const versions = {};
       const meta = () => ({ id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction), prefs, analysisSig: analysis?.sig || null });
-      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed, ...(t === "letter" ? { used: d.used, metrics: d.metrics } : {}) };
+      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed, ...(t === "letter" ? { used: d.used, metrics: d.metrics } : { masterAt: d.masterAt || null }) };
       const rest = got.rest || {};
       for (const t of other) {
         const d = rest[t];
@@ -4456,6 +4580,33 @@ export default function RadarApp() {
   });
 
   /* « J'ai cette compétence » : ajoutée au profil et marquée comme prouvée pour cette candidature. */
+  /* 6b : règles apprises de vos corrections (au moins 3 documents corrigés) ; jamais activées seules. */
+  const learnRules = () => withBusy("learn-rules", async () => {
+    const { settings: s, profile: p } = R.current;
+    const l = learningOf(p);
+    const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+    const edits = l.edits.filter((e) => new Date(e.at).getTime() > since);
+    if (new Set(edits.map((e) => `${e.appId}:${e.type}`)).size < 3) throw new Error("Corrigez et enregistrez au moins 3 documents générés avant l'apprentissage.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.learnRules(edits, writingRulesOf(p)), maxTokens: 3000 });
+    const found = (Array.isArray(data?.rules) ? data.rules : []).map((r) => ({ text: str(r?.text), evidence: str(r?.evidence) })).filter((r) => r.text).slice(0, 5);
+    setProfile((pp) => {
+      const cur = writingRulesOf(pp);
+      const nid = (i) => `L${Date.now().toString(36)}${i}`;
+      const add = found.filter((r) => !cur.some((c) => normText(c.text) === normText(r.text))).map((r, i) => ({ id: nid(i), text: r.text, evidence: r.evidence, active: false, origin: "apprise", createdAt: nowISO() }));
+      return { ...pp, writingRules: [...cur, ...add], ruleLearning: { ...learningOf(pp), lastLearnAt: nowISO() } };
+    });
+    toast(found.length ? `${found.length} règle(s) proposée(s), inactives : activez celles qui vous conviennent.` : "Aucune correction récurrente détectée.", found.length ? "ok" : "neutral");
+    return found.length;
+  });
+  /* 6c / 6d : CV maître par langue et puces verrouillées. */
+  const setMasterCv = (lang, text, sourceAppId) => setProfile((p) => ({ ...p, masterCv: { ...(p.masterCv || {}), [lang]: { text, at: nowISO(), sourceAppId: sourceAppId || null } } }));
+  const clearMasterCv = (lang) => setProfile((p) => { const m = { ...(p.masterCv || {}) }; delete m[lang]; return { ...p, masterCv: m }; });
+  const toggleLockedBullet = (text) => setProfile((p) => {
+    const cur = lockedOf(p);
+    const k = bulletKey(text);
+    return { ...p, lockedBullets: cur.some((x) => bulletKey(x) === k) ? cur.filter((x) => bulletKey(x) !== k) : [...cur, String(text).replace(/^[-•*]\s*/, "").trim()] };
+  });
+
   /* Entretien de motivation : l'IA range les réponses dans la fiche, en reformulant seulement. */
   const draftMotivation = (answers) => withBusy("motiv-draft", async () => {
     const { settings: s, profile: p } = R.current;
@@ -4486,8 +4637,18 @@ export default function RadarApp() {
 
   const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
     const prev = a.docs?.[type]?.slice(-1)[0];
-    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, ...keep } = prev || {};
-    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition" };
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, edits: _e, ...keep } = prev || {};
+    /* 6b / 7 : écart avec la dernière version IA (mesure des corrections manuelles, matière de l'apprentissage des règles). */
+    const base = [...(a.docs?.[type] || [])].reverse().find((x) => x.origin === "IA");
+    const delta = base && (type === "cv" || type === "letter") ? editDelta(base.text, text) : null;
+    if (delta && delta.hunks.length && !a.demo) {
+      setProfile((p) => {
+        const l = learningOf(p);
+        const entry = { id: uid("ed"), appId, type, lang: base.language || null, at: nowISO(), pct: delta.pct, hunks: delta.hunks };
+        return { ...p, ruleLearning: { ...l, edits: [...l.edits.filter((e) => !(e.appId === appId && e.type === type && e.baseId === base.id)), { ...entry, baseId: base.id }].slice(-40) } };
+      });
+    }
+    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition", ...(delta ? { edits: { baseId: base.id, pct: delta.pct, changed: delta.changed } } : {}) };
     const drafts = { ...(a.drafts || {}) };
     delete drafts[type];
     return addLogEntry({ ...a, drafts, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
@@ -4759,7 +4920,7 @@ export default function RadarApp() {
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, draftMotivation, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, draftMotivation, learnRules, setMasterCv, clearMasterCv, toggleLockedBullet, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
     openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText, patchOfferNow, createSpontaneous, setSpontOpen,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
@@ -7167,6 +7328,55 @@ function ProposalCard({ p, text, api }) {
   );
 }
 
+/* 6c / 6d : CV maître par langue (base des CV adaptés) et puces verrouillées. */
+function MasterPanel({ app, offer, text }) {
+  const T = useT();
+  const { profile, setMasterCv, clearMasterCv, toggleLockedBullet } = useApp();
+  const lang = docLang(offer, { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, app.analysis);
+  const master = masterOf(profile, lang);
+  const locked = lockedOf(profile);
+  const bullets = master ? docOutline(master.text, "cv").sections.filter((s) => ["experience", "achievements"].includes(secKindOf(s.title))).flatMap((s) => s.lines.map((l) => l.trim()).filter((l) => /^[-•*]\s/.test(l)).map((l) => l.replace(/^[-•*]\s*/, ""))) : [];
+  return (
+    <div className="p-4 space-y-4">
+      <p className={`text-xs ${T.muted}`}>Le CV maître ({LANG_NAME[lang] || lang}) sert de base à chaque CV adapté : seuls la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences changent. Le reste est recopié à l'identique, même si l'IA s'en écarte.</p>
+      {!master ? (
+        <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+          <div className="text-sm font-medium">Aucun CV maître en {LANG_NAME[lang] || lang}</div>
+          <Btn size="sm" variant="primary" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Faire de ce CV le CV maître</Btn>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-2 items-center">
+            <Chip tone="accent">maître {String(lang).toUpperCase()} du {fmtDate(master.at)}</Chip>
+            <Btn size="sm" variant="soft" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Remplacer par ce CV</Btn>
+            <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => clearMasterCv(lang)}>Supprimer</Btn>
+          </div>
+          <div>
+            <SectionTitle>Écarts avec le maître</SectionTitle>
+            {normText(master.text) === normText(text) ? <p className={`text-xs ${T.faint}`}>Identique au maître.</p> : <DiffView before={master.text} after={text} compact />}
+          </div>
+          <div>
+            <SectionTitle>Puces verrouillées</SectionTitle>
+            <p className={`text-xs mb-2 ${T.muted}`}>Une puce verrouillée est recopiée mot pour mot : ni la génération, ni les corrections, ni la relecture ne la modifient.</p>
+            <ul className="space-y-1.5">
+              {bullets.map((b, i) => {
+                const on = locked.some((x) => bulletKey(x) === bulletKey(b));
+                return (
+                  <li key={i} className="flex gap-2 items-start text-sm">
+                    <button type="button" onClick={() => toggleLockedBullet(b)} aria-pressed={on} title={on ? "Déverrouiller" : "Verrouiller"} className={`shrink-0 mt-0.5 text-xs rounded-full px-2 py-0.5 ${on ? "bg-indigo-600 text-white" : T.chip} ${T.ring}`}>{on ? "verrouillée" : "libre"}</button>
+                    <span className="min-w-0">{b}</span>
+                  </li>
+                );
+              })}
+              {!bullets.length && <li className={`text-xs ${T.faint}`}>Aucune puce d'expérience ou de réalisation dans le maître.</li>}
+            </ul>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function OptimPanel({ app, offer, type, report, pages, text, api }) {
   const T = useT();
   const { busy, runAnalysis, setOfferAdText } = useApp();
@@ -7218,6 +7428,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
             { id: "kw", label: "Mots-clés", count: report.kwPct !== null ? `${report.kwPct} %` : undefined },
             { id: "ai", label: "IA", count: pending.length || undefined },
             { id: "ad", label: offer?.spontaneous ? "Cible" : "Annonce" },
+            ...(type === "cv" ? [{ id: "master", label: "Maître" }] : []),
           ]}
         />
       </div>
@@ -7344,6 +7555,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
         </div>
       )}
 
+      {tab === "master" && <MasterPanel app={app} offer={offer} text={text} />}
       {tab === "ad" && (
         <div className="p-4 space-y-5">
           {analysis ? (
@@ -7811,7 +8023,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   const [hlOpts, setHlOpts] = useState([]);
   const addProposals = (edits, source) => {
     const list = (Array.isArray(edits) ? edits : [])
-      .filter((e) => e && typeof e.before === "string" && typeof e.after === "string" && e.before.trim() && e.before !== e.after)
+      .filter((e) => e && typeof e.before === "string" && typeof e.after === "string" && e.before.trim() && e.before !== e.after && !touchesLocked(e.before, lockedOf(profile)))
       .map((e) => ({ id: uid("p"), before: e.before, after: e.after, reason: str(e.reason), severity: ["haute", "moyenne", "basse"].includes(e.severity) ? e.severity : null, source, status: "pending" }));
     setProposals((l) => [...list, ...l.filter((x) => x.status === "pending")]);
     return list.length;
@@ -8255,6 +8467,55 @@ function AppContacts({ app }) {
    14. ASSISTANT CANDIDATURE
    ════════════════════════════════════════════════════════════════════════ */
 
+/* Ch.7 · Mesures : ce que la lettre utilise, recouvrement avec le CV, corrections manuelles par document (doit baisser), étape atteinte. */
+function docMeasures(app) {
+  const pick = (t) => {
+    const list = app.docs?.[t] || [];
+    const ia = [...list].reverse().find((v) => v.origin === "IA");
+    const ed = [...list].reverse().find((v) => v.origin === "édition" && v.edits && (!ia || v.edits.baseId === ia.id));
+    return { ia, pct: ed ? ed.edits.pct : ia ? null : undefined };
+  };
+  const cv = pick("cv"), letter = pick("letter");
+  const lm = letter.ia?.metrics || (letter.ia ? letterMetrics(letter.ia.text, cv.ia?.text || "") : null);
+  return { at: (letter.ia || cv.ia)?.createdAt || null, cvPct: cv.pct, letterPct: letter.pct, overlap: lm?.overlap ?? null, numbers: lm?.numbers ?? null, used: letter.ia?.used || null, reached: app.reached ?? STAGE_INDEX[app.stage] };
+}
+function QualityStats() {
+  const T = useT();
+  const { allApps, offers } = useApp();
+  const rows = (allApps || []).filter((a) => a.docs?.cv?.length || a.docs?.letter?.length).map((a) => ({ a, o: offers.find((o) => o.id === a.offerId), m: docMeasures(a) })).filter((r) => r.m.at).sort((x, y) => new Date(x.m.at) - new Date(y.m.at));
+  if (!rows.length) return null;
+  const edited = rows.map((r) => [r.m.cvPct, r.m.letterPct].filter((x) => typeof x === "number")).filter((l) => l.length).map((l) => l.reduce((n, x) => n + x, 0) / l.length);
+  const half = Math.floor(edited.length / 2);
+  const avg = (l) => (l.length ? Math.round(l.reduce((n, x) => n + x, 0) / l.length) : null);
+  const early = avg(edited.slice(0, half)), late = avg(edited.slice(half));
+  const pctCell = (x) => (typeof x === "number" ? `${x} %` : x === null ? "non retouché" : "—");
+  return (
+    <Card className="p-6 lg:col-span-3">
+      <SectionTitle action={edited.length >= 4 && early !== null && late !== null ? <Chip tone={late <= early ? "ok" : "warn"}>corrections : {early} % → {late} %</Chip> : null}>Mesures des dossiers</SectionTitle>
+      <p className={`text-xs mb-3 ${T.muted}`}>Corrections manuelles = part des mots modifiés entre la version IA et votre version enregistrée (doit baisser au fil des candidatures). Recouvrement = part de la lettre déjà présente dans le CV (cible ≤ 15 %).</p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className={`text-left ${T.muted}`}><th className="py-1 pr-3 font-medium">Candidature</th><th className="pr-3 font-medium">Généré</th><th className="pr-3 font-medium">Corrections CV</th><th className="pr-3 font-medium">Corrections lettre</th><th className="pr-3 font-medium">Recouvrement</th><th className="pr-3 font-medium">Chiffres</th><th className="pr-3 font-medium">Lettre utilise</th><th className="font-medium">Étape atteinte</th></tr></thead>
+          <tbody>
+            {rows.slice(-15).reverse().map(({ a, o, m }) => (
+              <tr key={a.id} className={`border-t ${T.line}`}>
+                <td className="py-1.5 pr-3">{o?.title || "—"}<span className={T.faint}> · {show(o?.company)}</span></td>
+                <td className="pr-3 tabular-nums">{fmtDate(m.at)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.cvPct)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.letterPct)}</td>
+                <td className={`pr-3 tabular-nums ${m.overlap > 30 ? "text-rose-600" : m.overlap > 15 ? "text-amber-600" : ""}`}>{m.overlap === null ? "—" : `${m.overlap} %`}</td>
+                <td className={`pr-3 tabular-nums ${m.numbers > 2 ? "text-amber-600" : ""}`}>{m.numbers ?? "—"}</td>
+                <td className="pr-3">{m.used ? [m.used.companyFacts?.length ? `${m.used.companyFacts.length} fait(s)` : "0 fait", m.used.convictionId ? "conviction" : null, m.used.storyId ? "histoire" : null].filter(Boolean).join(" · ") : "—"}</td>
+                <td>{STAGES[m.reached]?.label || "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
 function AssistantView() {
   const T = useT();
   const { apps, allApps, offers, settings, openApp, openStudio, addToPipeline, go, setSpontOpen } = useApp();
@@ -8351,6 +8612,7 @@ function AssistantView() {
             </div>
           )}
         </Card>
+        <QualityStats />
       </div>
     </div>
   );
@@ -8955,8 +9217,10 @@ function MotivationEditor() {
 /* ── Règles d'écriture (6a) : injectées dans toutes les rédactions ; prioritaires sur le style, jamais sur la vérité ── */
 function WritingRulesEditor() {
   const T = useT();
-  const { profile, setProfile } = useApp();
+  const { profile, setProfile, learnRules, busy } = useApp();
   const rules = writingRulesOf(profile);
+  const learning = learningOf(profile);
+  const pending = pendingLearnDocs(profile);
   const save = (l) => setProfile((p) => ({ ...p, writingRules: l }));
   const up = (id, patch) => save(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const newId = () => { let i = rules.length + 1; while (rules.some((r) => r.id === `r${i}`)) i++; return `r${i}`; };
@@ -8966,15 +9230,25 @@ function WritingRulesEditor() {
         <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => save([...rules, { id: newId(), text: "Nouvelle règle", active: true, origin: "manuelle" }])}>Ajouter</Btn>}>Règles d'écriture</SectionTitle>
         <p className={`text-sm ${T.muted}`}>Injectées dans le CV, la lettre, les messages, les corrections, la relecture et la préparation d'entretien. Elles priment sur les consignes de style, jamais sur la vérité : une preuve absente de votre profil reste [à compléter]. Les règles « départ » sont à valider : modifiez-les ou désactivez-les.</p>
       </Card>
+      <Card className="p-6 space-y-2">
+        <SectionTitle>Apprendre de mes corrections</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Chaque fois que vous enregistrez un CV ou une lettre retouché à la main, l'écart avec la version IA est mémorisé ({learning.edits.length} correction(s) en mémoire). À partir de 3 documents corrigés, l'IA propose les règles que vous appliquez de façon récurrente. Elles arrivent <strong>inactives</strong> : rien n'est activé sans vous.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Chip tone={pending >= 3 ? "ok" : "neutral"}>{pending} document(s) corrigé(s) depuis le dernier apprentissage</Chip>
+          {learning.lastLearnAt && <span className={`text-xs ${T.faint}`}>dernier : {fmtDate(learning.lastLearnAt)}</span>}
+          <Btn size="sm" variant="primary" icon={Wand2} loading={busy["learn-rules"]} disabled={pending < 3} onClick={learnRules}>Proposer des règles</Btn>
+        </div>
+      </Card>
       {rules.map((r) => (
         <Card key={r.id} className="p-4">
           <div className="flex gap-3 items-start">
             <input type="checkbox" className="mt-2" checked={!!r.active} onChange={(e) => up(r.id, { active: e.target.checked })} aria-label="Règle active" />
             <div className="flex-1 min-w-0 space-y-1">
               <Textarea rows={2} value={r.text} onChange={(e) => up(r.id, { text: e.target.value })} aria-label={`Règle ${r.id}`} />
-              <div className="flex gap-1.5">
-                <Chip tone={r.active ? "ok" : "neutral"}>{r.active ? "active" : "inactive"}</Chip>
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <Chip tone={r.active ? "ok" : r.origin === "apprise" ? "warn" : "neutral"}>{r.active ? "active" : r.origin === "apprise" ? "à valider" : "inactive"}</Chip>
                 <Chip>{r.origin || "manuelle"}</Chip>
+                {r.evidence && <span className={`text-xs ${T.muted}`}>Observé : {r.evidence}</span>}
               </div>
             </div>
             <IconBtn icon={Trash2} label="Supprimer" onClick={() => save(rules.filter((x) => x.id !== r.id))} />

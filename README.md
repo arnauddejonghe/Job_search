@@ -78,6 +78,12 @@ L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots
 
 **Fiches entreprise** (`companyBriefs`, clé `radar:briefs`, une fiche par entreprise, valable **60 jours**) : faits d'une phrase, chacun avec son URL. Trois sources : `web_search` dans l'artefact (`companyBrief` ; un fait dont l'URL n'apparaît pas dans les résultats est écarté), la Routine dans la page publiée (tâche `{"task":"brief"}` à la demande, et file `veille/brief_queue` des candidatures actives à chaque passage → collection `veille_briefs`, même modèle que les notes employeur), ou une source collée avec son URL obligatoire (`briefFromText`). Les faits de l'annonce sont repris avec l'URL de l'annonce. **Un fait sans URL vérifiée est exclu.** La lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien utilisent la fiche ; la préparation réutilise ses faits et l'enrichit de ses propres faits vérifiés. La Routine cherche avec le nom de l'entreprise, jamais celui du candidat.
 
+**Apprentissage des corrections (6b)** : à chaque version enregistrée à la main, l'écart mot à mot avec la dernière version IA (`editDelta`, à partir de `wordDiff`) est mémorisé dans `profile.ruleLearning` (40 dernières corrections, hors données d'exemple). Après au moins 3 documents corrigés, *Règles d'écriture → Proposer des règles* (`learnRules`) propose 0 à 5 règles observées dans au moins 2 documents, avec leurs exemples. Elles arrivent **inactives** : une règle apprise n'est jamais activée seule.
+
+**CV maître par langue (6c)** et **puces verrouillées (6d)** : studio → panneau d'optimisation → onglet *Maître*. Le CV maître (`profile.masterCv.fr|nl|en`) sert de base : l'IA reçoit la consigne de ne modifier que la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences, et la page le **garantit** (`enforceMaster` : en-tête, postes, texte des puces, langues et formation repris du maître ; puces inventées écartées). Écarts avec le maître affichés en diff. Une puce verrouillée (`profile.lockedBullets`) est recopiée mot pour mot : restaurée si l'IA la reformule, et toute correction proposée qui la touche est écartée.
+
+**Mesures (7)** : carte *Mesures des dossiers* dans l'Assistant : date de génération, corrections manuelles du CV et de la lettre (part des mots modifiés, doit baisser ; tendance première moitié → seconde moitié), recouvrement lettre / CV, nombre de chiffres, ce que la lettre utilise (`used` : faits, conviction, histoire), étape atteinte.
+
 **Routine** : le prompt de la Routine « Radar – veille emploi » est versionné dans [`routines/radar-veille-emploi.md`](routines/radar-veille-emploi.md).
 
 ### Modèle de données (`window.storage`, une clé par collection)
@@ -86,7 +92,8 @@ L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots
 radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, lastWatchAt, … }
 radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText,
                   motivation?{purpose, convictions[{id,text}], stories[{id,title,situation,action,result,lesson}], management, method, whyNow, lookingFor, sectors[]},
-                  motivationAnswers?{q1…}, writingRules?[{id,text,active,origin}] }
+                  motivationAnswers?{q1…}, writingRules?[{id,text,active,origin,evidence}], ruleLearning?{edits[], lastLearnAt},
+                  masterCv?{fr|nl|en: {text, at, sourceAppId}}, lockedBullets?[] }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, publishedApprox, deadline,
@@ -116,6 +123,7 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
 | `cvWrite`, puis `letterWrite` → `letterCore` (CV en entrée, offre ou spontanée) | aucun | `{cv, accent, accentSource, tips}` ; `{letter, used{companyFacts, convictionId, storyId, keywords, numbers, sharedWithCv}}` |
 | `companyBrief` / `briefFromText` | `web_search` / aucun | `{summary, facts[{text, url}]}` |
+| `learnRules` | aucun | `{rules[{text, evidence, docs}]}` |
 | `motivationDraft` | aucun | `{purpose, convictions[], stories[], management, method, whyNow, lookingFor, sectors[], followUps[]}` |
 | `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
 | `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
