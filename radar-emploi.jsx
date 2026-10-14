@@ -912,6 +912,62 @@ const WEAK_OPENERS = {
 const PRONOUNS = { fr: /(^|[\s(])(je|j'|j’|mon|ma|mes|moi)(?=[\s,.;:!?)]|$)/i, nl: /\b(ik|mijn|mij)\b/i, en: /\b(I|my|me|My)\b/ };
 const REP_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden ensuite egalement notamment".split(" "));
 const LEVEL_ORDER = { block: 0, warn: 1, info: 2 };
+/* ── Lettre ≠ CV : mesures de complémentarité (sans IA) ── */
+const LETTER_FORMULAS = /(madame|monsieur|geachte|mevrouw|heer|dear|hiring manager|agr[ée]er|salutations distingu|met vriendelijke groet|hoogachtend|yours sincerely|kind regards)/i;
+/* Corps de la lettre : paragraphes, sans en-tête, objet, formules d'appel et de politesse ni signature. */
+function letterBody(text) {
+  return parseDoc(text).filter((b) => b.t === "para" && !(LETTER_FORMULAS.test(b.text) && b.text.split(/\s+/).length < 18)).map((b) => b.text).join("\n");
+}
+const ngrams = (s, n = 4) => {
+  const t = normText(s).split(" ").filter(Boolean);
+  const out = [];
+  for (let i = 0; i + n <= t.length; i++) out.push(t.slice(i, i + n).join(" "));
+  return out;
+};
+/* Part des 4-grammes de la lettre déjà présents dans le CV. */
+function overlapPct(letterText, cvText) {
+  const L = ngrams(letterBody(letterText));
+  if (!L.length || !String(cvText || "").trim()) return null;
+  const C = new Set(ngrams(docPlainText(cvText)));
+  return Math.round((L.filter((g) => C.has(g)).length / L.length) * 100);
+}
+/* Chiffres significatifs (années exclues ; 1 200 = 1200 ; 40 % = 40). */
+function sigNumbers(text) {
+  const out = new Set();
+  for (const m of String(text || "").matchAll(/[−-]?\d[\d\s  .,]*\d|\d/g)) {
+    const n = m[0].replace(/[\s  ]/g, "").replace(/^[−-]/, "").replace(/[.,](?=\d{3}\b)/g, "").replace(",", ".");
+    if (/^(19|20)\d\d$/.test(n)) continue;
+    if (n.replace(/\D/g, "").length >= 8) continue;
+    out.add(n);
+  }
+  return [...out];
+}
+function letterMetrics(letterText, cvText) {
+  const body = letterBody(letterText);
+  const nums = sigNumbers(body);
+  const cvNums = new Set(sigNumbers(docPlainText(cvText || "")));
+  return { overlap: overlapPct(letterText, cvText), numbers: nums.length, sharedNumbers: nums.filter((n) => cvNums.has(n)).length, words: body.split(/\s+/).filter(Boolean).length };
+}
+function normalizeUsed(u) {
+  u = u && typeof u === "object" ? u : {};
+  const list = (x) => (Array.isArray(x) ? x.map((y) => str(y)).filter(Boolean) : []);
+  return { companyFacts: list(u.companyFacts), convictionId: str(u.convictionId), storyId: str(u.storyId), keywords: list(u.keywords), numbers: list(u.numbers), sharedWithCv: str(u.sharedWithCv) };
+}
+const SIG_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden comme leur sont etre avoir fait faire tout tous mais donc alors aussi tres bien".split(" "));
+const sigTokens = (s) => new Set(normText(s).split(" ").filter((w) => w.length >= 5 && !SIG_STOP.has(w)));
+/* Une source (fait, conviction, histoire) est « présente » si la lettre en reprend au moins 3 mots significatifs (ou 40 % de ses mots). */
+function echoes(hayTokens, source) {
+  const t = [...sigTokens(source)];
+  if (!t.length) return false;
+  const hit = t.filter((w) => hayTokens.has(w)).length;
+  return hit >= Math.min(3, t.length) || hit / t.length >= 0.4;
+}
+const FLATTERY = {
+  fr: ["leader", "leader incontesté", "acteur majeur", "acteur incontournable", "référence", "renommée", "prestigieuse", "prestigieux", "réputation", "j'admire", "entreprise innovante", "excellence reconnue", "fleuron", "rayonnement"],
+  nl: ["marktleider", "toonaangevend", "gerenommeerd", "prestigieus", "bewonder", "innovatieve organisatie", "vooraanstaand"],
+  en: ["industry leader", "market leader", "renowned", "prestigious", "world-class", "i admire", "leading company", "innovative company", "reputation"],
+};
+
 
 function analyzeDoc(text, kind, ctx = {}) {
   const lang = ctx.lang || "fr";
@@ -947,7 +1003,7 @@ function analyzeDoc(text, kind, ctx = {}) {
   const titleIn = (hay) => titleForms.some((t) => kwCount(hay, { term: t, variants: [] }) > 0);
   const titleFound = titleForms.length ? titleIn(allHay) : null;
   const missingKw = eligible.filter((k) => !k.found);
-  if (missingKw.length) {
+  if (missingKw.length && kind === "cv") {
     const top = missingKw.filter((k) => k.importance >= 2);
     if (top.length) add(kind === "cv" && top.some((k) => k.importance === 3) ? "warn" : "info", "ats", "kw-missing", `${top.length} mot(s)-clé(s) ${kind === "cv" ? "justifiable(s)" : "essentiel(s)"} absent(s)`, `${top.slice(0, 6).map((k) => `« ${k.term} »`).join(", ")}${top.length > 6 ? "…" : ""} : votre profil les justifie, ${kind === "cv" ? "l'ATS les cherche" : "citez-les naturellement"}.`, { tab: "kw" });
   }
@@ -985,7 +1041,7 @@ function analyzeDoc(text, kind, ctx = {}) {
   const reps = Object.entries(freq).filter(([, n]) => n >= (kind === "cv" ? 6 : 4)).sort((a, b) => b[1] - a[1]).slice(0, 4);
   if (reps.length) add("info", "style", "reps", `Répétitions : ${reps.map(([w, n]) => `« ${w} » ×${n}`).join(", ")}`, "Variez le vocabulaire (sauf mots-clés de l'annonce).");
 
-  let impact = 70, read = 100;
+  let impact = 70, read = 100, letterScores = null;
   const pages = ctx.pages || null;
   if (kind === "cv") {
     const hl = o.headline;
@@ -1050,12 +1106,49 @@ function analyzeDoc(text, kind, ctx = {}) {
     if (!/(madame|monsieur|dear|geachte|beste)/i.test(bodyText)) add("info", "format", "salutation", "Formule d'appel absente", "FR : « Madame, Monsieur, » ; NL : « Geachte heer, mevrouw, » ; EN : « Dear … ».");
     if (!String(o.recipients.join(" ")).trim()) add("info", "format", "recipient", "Destinataire absent", null, { sec: "head" });
     if (!o.date) add("info", "format", "date", "Lieu et date absents", null, { sec: "head" });
-    const je = lang === "fr" ? (bodyText.match(/(^|[.!?]\s+)(je |j'|j’)/gi) || []).length : lang === "en" ? (bodyText.match(/(^|[.!?]\s+)I /g) || []).length : (bodyText.match(/(^|[.!?]\s+)ik /gi) || []).length;
-    if (je > 4) add("info", "style", "je", `${je} phrases commencent par « ${lang === "en" ? "I" : lang === "nl" ? "Ik" : "Je"} »`, "Variez les débuts de phrase (le poste, l'entreprise, un résultat).", { autoFix: true });
-    const nums = /\d/.test(bodyText.replace(/\b(19|20)\d{2}\b/g, ""));
-    if (!nums) add("info", "impact", "nums", "Aucun résultat chiffré dans la lettre", "Une preuve chiffrée rend la candidature crédible.");
-    impact = 100 - (companyIn ? 0 : 25) - (cta ? 0 : 10) - (nums ? 0 : 15) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - Math.max(0, je - 4) * 4 - cl.length * 8;
-    const [minW, maxW] = ctx.spontaneous ? [200, 300] : [260, 340];
+    /* Débuts de phrase : jamais deux phrases consécutives en « Je ». */
+    const jeRe = lang === "en" ? /^I\b/ : lang === "nl" ? /^ik\b/i : /^(je\b|j'|j’)/i;
+    const sentences = letterBody(text).split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+    const jeFlags = sentences.map((x) => jeRe.test(x));
+    const jeRuns = jeFlags.filter((f, i) => f && jeFlags[i - 1]).length;
+    const je = jeFlags.filter(Boolean).length;
+    if (jeRuns) add("warn", "style", "je-run", `${jeRuns + 1 > 2 ? `${jeRuns} enchaînements` : "Deux phrases consécutives"} en « ${lang === "en" ? "I" : lang === "nl" ? "Ik" : "Je"} »`, "Commencez l'une par l'entreprise, le rôle ou un fait.", { autoFix: true });
+
+    /* Lettre ≠ CV : complémentarité (recouvrement, chiffres). */
+    const m = letterMetrics(text, ctx.cvText);
+    if (m.overlap !== null) {
+      if (m.overlap > 30) add("block", "complementarite", "overlap", `La lettre recopie le CV (${m.overlap} % de recouvrement)`, "Au-delà de 30 %, la lettre résume le CV. Remplacez les preuves par le « pourquoi » : entreprise, rôle, méthode, une histoire racontée.", { autoFix: true });
+      else if (m.overlap > 15) add("warn", "complementarite", "overlap", `Recouvrement avec le CV : ${m.overlap} %`, "Visez 15 % maximum : la lettre explique, le CV prouve.", { autoFix: true });
+    } else add("info", "complementarite", "no-cv", "Recouvrement non mesuré : aucun CV pour cette candidature", "Générez ou enregistrez d'abord le CV.");
+    if (m.sharedNumbers > 1) add("warn", "complementarite", "shared-nums", `${m.sharedNumbers} chiffres repris du CV`, "Gardez au plus un chiffre commun : le CV porte les résultats.", { autoFix: true });
+    if (m.numbers > 2) add("warn", "complementarite", "nums", `${m.numbers} chiffres dans la lettre`, "2 au maximum : une preuve racontée vaut mieux qu'une série de résultats.", { autoFix: true });
+
+    /* Spécificité : pourquoi eux, conviction, histoire, sans flatterie. */
+    const bodyTok = sigTokens(letterBody(text));
+    const facts = (ctx.companyFacts || []).filter(Boolean);
+    const whyThem = facts.some((f) => echoes(bodyTok, f));
+    if (!ctx.spontaneous || ctx.spontaneous === "company") {
+      if (!facts.length) add("warn", "specificite", "why-them", "« Pourquoi eux » non étayé", "Aucun fait vérifié sur l'entreprise : collez l'annonce complète ou complétez le contexte de l'entreprise.");
+      else if (!whyThem) add("warn", "specificite", "why-them", "« Pourquoi eux » absent", "Aucun fait propre à l'entreprise n'est repris : une phrase qui resterait vraie pour un concurrent est interchangeable.", { autoFix: true });
+    }
+    const motiv = ctx.motivation || emptyMotivation();
+    const convOk = motiv.convictions.some((c) => echoes(bodyTok, c.text));
+    const storyOk = motiv.stories.some((st) => echoes(bodyTok, [st.situation, st.action, st.result].join(" ")));
+    if (!motiv.convictions.length) add("info", "specificite", "conviction", "Aucune conviction dans votre profil", "Renseignez vos convictions (Profil & critères → Motivations) : elles rendent la lettre personnelle.");
+    else if (!convOk) add("warn", "specificite", "conviction", "Aucune de vos convictions n'apparaît", "Reliez « pourquoi ce rôle » à une conviction que vous défendez.", { autoFix: true });
+    if (!motiv.stories.length) add("info", "specificite", "story", "Banque d'histoires vide", "Ajoutez 2 ou 3 histoires (Motivations) : la lettre en raconte une.");
+    else if (!storyOk) add("warn", "specificite", "story", "Aucune histoire racontée", "Racontez une histoire de votre banque (situation → action → effet) plutôt qu'une liste de résultats.", { autoFix: true });
+    const flat = (FLATTERY[lang] || FLATTERY.fr).filter((c) => kwCount(bodyHay, { term: c, variants: [] }) > 0);
+    if (flat.length) add("warn", "specificite", "flattery", `Flatterie : ${flat.slice(0, 4).join(", ")}`, "Remplacez le compliment par un fait précis sur l'entreprise.", { autoFix: true });
+    const kwUsed = kw.filter((k) => k.found && k.status !== "absent" && k.importance >= 2).length;
+    if (kwUsed > 6) add("info", "complementarite", "kw-many", `${kwUsed} mots-clés de l'annonce dans la lettre`, "2 à 4 suffisent : la lettre n'est pas un second CV.");
+
+    const spec = clamp(100 - (facts.length ? (whyThem ? 0 : 35) : 25) - (motiv.convictions.length ? (convOk ? 0 : 25) : 15) - (motiv.stories.length ? (storyOk ? 0 : 25) : 15) - flat.length * 10 - (companyIn ? 0 : 15), 0, 100);
+    const compl = m.overlap === null ? null : clamp(100 - Math.max(0, m.overlap - 10) * 4 - Math.max(0, m.sharedNumbers - 1) * 15 - Math.max(0, m.numbers - 2) * 10, 0, 100);
+    impact = 100 - (cta ? 0 : 20) - (storyOk ? 0 : 20) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - cl.length * 8;
+    read -= jeRuns * 8 + Math.max(0, je - 4) * 3;
+    letterScores = { spec, compl, overlap: m.overlap, numbers: m.numbers, sharedNumbers: m.sharedNumbers };
+    const [minW, maxW] = ctx.spontaneous ? [220, 300] : [250, 320];
     if (words < minW - 40) { add("info", "format", "short", `Lettre courte (${words} mots)`, `Visez ${minW} à ${maxW} mots.`); read -= 10; }
     if (words > maxW + 80) { add("warn", "format", "long", `Lettre longue (${words} mots)`, `Une page maximum : visez ${minW} à ${maxW} mots.`); read -= 15; }
     if (pages && pages > 1) { add("warn", "format", "pages", `La lettre tient sur ${pages} pages`, "Une page maximum."); read -= 20; }
@@ -1064,8 +1157,13 @@ function analyzeDoc(text, kind, ctx = {}) {
   if (!o.contact) read -= 20;
   const ats = kwPct === null ? (titleFound === null ? null : titleFound ? 80 : 50) : Math.round(0.78 * kwPct + (titleFound === false ? 0 : 22));
   const sc = (n) => (n === null ? null : clamp(Math.round(n), 0, 100));
-  const scores = { ats: sc(ats), impact: sc(impact), read: sc(read) };
-  const parts = [[scores.ats, 0.4], [scores.impact, 0.35], [scores.read, 0.25]].filter(([v]) => v !== null);
+  /* CV : ATS 40 / impact 35 / lisibilité 25. Lettre : spécificité 35 / complémentarité 25 / impact 20 / lisibilité 20 (plus de mots-clés). */
+  const scores = kind === "cv"
+    ? { ats: sc(ats), impact: sc(impact), read: sc(read) }
+    : { ats: null, spec: sc(letterScores?.spec ?? null), compl: sc(letterScores?.compl ?? null), impact: sc(impact), read: sc(read), overlap: letterScores?.overlap ?? null, numbers: letterScores?.numbers ?? null };
+  const parts = (kind === "cv"
+    ? [[scores.ats, 0.4], [scores.impact, 0.35], [scores.read, 0.25]]
+    : [[scores.spec, 0.35], [scores.compl, 0.25], [scores.impact, 0.2], [scores.read, 0.2]]).filter(([v]) => v !== null);
   let total = Math.round(parts.reduce((n, [v, w]) => n + v * w, 0) / parts.reduce((n, [, w]) => n + w, 0));
   const blockers = issues.filter((i) => i.level === "block").length;
   if (blockers) total = Math.min(total, 69);
@@ -1076,7 +1174,8 @@ function analyzeDoc(text, kind, ctx = {}) {
 /* Points que la passe de correction automatique traite après génération. */
 function autoFixList(rep) {
   const list = rep.issues.filter((i) => i.autoFix).map((i) => ({ title: i.title, detail: i.detail }));
-  rep.kw.filter((k) => k.status !== "absent" && !k.found && k.importance >= (rep.kind === "cv" ? 2 : 3)).slice(0, rep.kind === "cv" ? 10 : 5)
+  /* Lettre : aucune injection de mots-clés. */
+  if (rep.kind === "cv") rep.kw.filter((k) => k.status !== "absent" && !k.found && k.importance >= 2).slice(0, 10)
     .forEach((k) => list.push({ title: `Intégrer le mot-clé « ${k.term} »`, detail: k.evidence ? `preuve dans le profil : ${k.evidence}` : "justifié par le profil" }));
   return list.slice(0, 14);
 }
@@ -1733,6 +1832,81 @@ const profileBlock = (p) => [
   `Formation : ${(p.education || []).join(" ; ") || "non renseignée"}`,
   `Certifications : ${(p.certifications || []).join(" ; ") || "aucune"}`,
 ].join("\n");
+/* ── Motivations (profil) : le « pourquoi », source de la lettre, des messages et de la préparation d'entretien. Jamais du CV. ──
+   Champ facultatif profile.motivation ; absent = vide. */
+const MOTIV_TEXT_FIELDS = [
+  { id: "purpose", label: "Raison d'être professionnelle", hint: "Ce qui vous fait avancer dans votre travail, avec vos mots." },
+  { id: "whyNow", label: "Pourquoi changer maintenant", hint: "Le déclencheur réel, formulé positivement." },
+  { id: "lookingFor", label: "Ce que vous cherchez", hint: "Rôle, périmètre, culture, type de direction." },
+  { id: "method", label: "Votre méthode", hint: "Comment vous menez une transformation, du cadrage à l'adoption." },
+  { id: "management", label: "Votre management", hint: "Comment vous dirigez une équipe, avec un exemple." },
+];
+const emptyMotivation = () => ({ purpose: "", convictions: [], stories: [], management: "", method: "", whyNow: "", lookingFor: "", sectors: [] });
+function motivOf(p) {
+  const m = p?.motivation && typeof p.motivation === "object" ? p.motivation : {};
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  return {
+    ...emptyMotivation(),
+    ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, String(m[f.id] || "")])),
+    convictions: arr(m.convictions).map((c, i) => ({ id: c?.id || `c${i + 1}`, text: String(c?.text ?? c ?? "") })).filter((c) => c.text.trim()),
+    stories: arr(m.stories).map((s, i) => ({ id: s?.id || `s${i + 1}`, title: String(s?.title || ""), situation: String(s?.situation || ""), action: String(s?.action || ""), result: String(s?.result || ""), lesson: String(s?.lesson || "") })).filter((s) => s.title.trim() || s.situation.trim() || s.action.trim()),
+    sectors: arr(m.sectors).map(String).filter((x) => x.trim()),
+  };
+}
+const motivFilled = (m) => MOTIV_TEXT_FIELDS.filter((f) => m[f.id].trim()).length + (m.convictions.length ? 1 : 0) + (m.stories.length ? 1 : 0) + (m.sectors.length ? 1 : 0);
+const storyText = (s) => [s.title && `« ${s.title} »`, s.situation && `situation : ${s.situation}`, s.action && `action : ${s.action}`, s.result && `résultat : ${s.result}`, s.lesson && `leçon : ${s.lesson}`].filter(Boolean).join(" · ");
+/* Bloc « pourquoi » injecté dans la lettre, les messages et la préparation d'entretien (jamais dans le CV). */
+function motivationBlock(p) {
+  const m = motivOf(p);
+  if (!motivFilled(m)) return "MOTIVATIONS DU CANDIDAT : non renseignées. Toute phrase de motivation personnelle s'écrit [à compléter : …].";
+  return [
+    "MOTIVATIONS DU CANDIDAT (ses propres mots, seule source autorisée pour le « pourquoi » ; reformule sans rien ajouter)",
+    m.purpose && `Raison d'être : ${m.purpose}`,
+    m.whyNow && `Pourquoi maintenant : ${m.whyNow}`,
+    m.lookingFor && `Ce qu'il cherche : ${m.lookingFor}`,
+    m.method && `Méthode : ${m.method}`,
+    m.management && `Management : ${m.management}`,
+    m.sectors.length && `Secteurs qui l'attirent : ${m.sectors.join(" ; ")}`,
+    m.convictions.length && `Convictions :\n${m.convictions.map((c) => `- [${c.id}] ${c.text}`).join("\n")}`,
+    m.stories.length && `Banque d'histoires (à raconter, pas à lister) :\n${m.stories.map((s) => `- [${s.id}] ${storyText(s)}`).join("\n")}`,
+  ].filter(Boolean).join("\n");
+}
+
+/* Entretien de motivation : 10 questions ; l'IA reformule les réponses, sans rien ajouter. */
+const MOTIV_QUESTIONS = [
+  { id: "q1", field: "purpose", q: "Qu'est-ce qui vous fait avancer dans votre travail ? Un moment où vous vous êtes dit « c'est pour ça que je fais ce métier »." },
+  { id: "q2", field: "convictions", q: "Quelles convictions défendez-vous sur la transformation digitale, et qu'est-ce qui les a forgées ?" },
+  { id: "q3", field: "stories", q: "Racontez le projet dont vous êtes le plus fier : contexte, ce que VOUS avez fait, résultat." },
+  { id: "q4", field: "stories", q: "Racontez une résistance au changement ou un échec, et ce que vous en avez appris." },
+  { id: "q5", field: "management", q: "Comment dirigez-vous une équipe ? Donnez un exemple concret." },
+  { id: "q6", field: "method", q: "Quelle est votre méthode pour mener une transformation, du cadrage à l'adoption par les utilisateurs ?" },
+  { id: "q7", field: "whyNow", q: "Pourquoi chercher un nouveau poste maintenant ?" },
+  { id: "q8", field: "lookingFor", q: "Que cherchez-vous dans votre prochain poste : rôle, périmètre, culture, type de direction ?" },
+  { id: "q9", field: "sectors", q: "Quels secteurs ou types d'organisations vous attirent, et pourquoi ?" },
+  { id: "q10", field: "stories", q: "Que diraient de vous votre direction ou vos collègues ? Appuyez-vous sur une situation réelle." },
+];
+
+/* ── Règles d'écriture (6a) : prioritaires sur les consignes de style, jamais sur la vérité. Champ facultatif profile.writingRules. ── */
+const SEED_RULES = [
+  "Positionnement : généraliste de la transformation digitale, pont entre le métier et la technique. Jamais « responsable CRM », ni un rôle réduit au seul CRM.",
+  "Trilinguisme FR / NL / EN cité dans le Profil du CV.",
+  "Master mentionné discrètement : section Formation uniquement, sans mise en avant.",
+  "Preuves prioritaires, quand le profil les contient : plus de 20 projets ; 120 utilisateurs et 80 000 contacts ; 1,5 ETP ; −40 % ; comité IA ; rôle de conseil auprès du COO et du CEO.",
+  "Ton humble : les faits parlent, aucune autopromotion.",
+].map((text, i) => ({ id: `r${i + 1}`, text, active: true, origin: "départ" }));
+const writingRulesOf = (p) => (Array.isArray(p?.writingRules) ? p.writingRules : SEED_RULES);
+function rulesBlock(p) {
+  const act = writingRulesOf(p).filter((r) => r.active && String(r.text || "").trim());
+  if (!act.length) return "";
+  return `RÈGLES D'ÉCRITURE DU CANDIDAT (prioritaires sur toutes les consignes de style et de ton ci-dessus ; jamais sur la vérité : un fait absent du profil reste [à compléter : …])\n${act.map((r) => `- ${r.text}`).join("\n")}`;
+}
+/* Insère les règles juste avant la consigne de format JSON finale. */
+function withRules(prompt, p) {
+  const block = rulesBlock(p);
+  if (!block) return prompt;
+  const i = prompt.lastIndexOf("Réponds uniquement");
+  return i < 0 ? `${prompt}\n\n${block}` : `${prompt.slice(0, i)}${block}\n\n${prompt.slice(i)}`;
+}
 const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
 const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
 
@@ -1811,7 +1985,10 @@ function normalizeAnalysis(d, offer) {
   };
 }
 
-const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords }) => ({
+/* CV de référence pour la lettre : brouillon en cours, sinon dernière version enregistrée. */
+const latestCvText = (app) => app?.drafts?.cv?.text || app?.docs?.cv?.slice(-1)[0]?.text || "";
+const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords, cvText }) => ({
+  cvText: cvText || "", motivation: motivOf(profile), companyFacts: analysis?.companyFacts || [],
   lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
   jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
   company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
@@ -1938,6 +2115,8 @@ ${analysis ? `\nANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+
 DOCUMENTS DEMANDÉS : ${types.join(", ")}
 
 CONSIGNES
@@ -1946,8 +2125,8 @@ CONSIGNES
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
 - Le candidat n'occupe PAS encore le poste visé : présente son poste actuel tel qu'il est, et le poste visé comme un objectif.
 - Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
-- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager, personnalisé (un élément précis de l'annonce + une preuve).
-- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses.
+- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager : un fait propre à l'entreprise (annonce ou contexte) + une conviction ou une histoire du candidat. Pas de liste de compétences. Test de substitution : le message ne doit pas rester vrai pour un concurrent.
+- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses. La réponse « Pourquoi nous / votre motivation » s'appuie sur les faits propres à l'entreprise et sur les MOTIVATIONS (conviction, pourquoi maintenant, une histoire), jamais sur un résumé du CV ; manque → [à compléter : …].
 - email : objet et corps courts (120 mots max) mentionnant CV et lettre en pièces jointes.
 ${instruction ? `- Instruction spécifique de l'utilisateur : ${instruction}` : ""}
 
@@ -2098,101 +2277,102 @@ Réponds uniquement avec ce JSON :
 {"cv":"<balisage>","accent":"#RRGGBB ou null","accentSource":"charte connue ou null","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
   },
 
-  letterWrite(offer, profile, a, prefs, instruction) {
+  letterWrite(offer, profile, a, prefs, instruction, cvText) {
     const code = docLang(offer, prefs, a) || "fr";
     const target = a?.jobTitle || offer.title;
     const city = String(profile.home || "").split(/[(,]/)[0].trim() || "[à compléter : ville]";
     const dateLine = code === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(code)}`;
-    if (offer.spontaneous) return P.letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine });
-    return `Mission : rédiger la lettre de motivation du candidat pour l'offre ci-dessous, prête à envoyer après relecture.
-
-OFFRE
-Intitulé : ${offer.title} · Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)}
-
-ANALYSE DE L'ANNONCE (déjà confrontée au profil)
-${analysisDigest(a, offer)}
-
-PROFIL (seule source de faits)
-Nom : ${profile.name || "[à compléter : prénom nom]"}
-Coordonnées : ${profileContact(profile)}
-${profileBlock(profile)}
-
-CONSIGNES
-Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}. Corps de 260 à 340 mots (hors en-tête et signature) : une page.
-Corps, paragraphes séparés par une ligne vide :
-1. Formule d'appel seule sur sa ligne (FR : « Madame, Monsieur, » sauf destinataire nommé ; NL : « Geachte mevrouw, geachte heer, » ; EN : « Dear Hiring Manager, »).
-2. Accroche (2-3 phrases) : un élément précis de l'annonce ou du contexte de l'entreprise (uniquement ce que dit l'annonce), puis qui est le candidat aujourd'hui en une phrase (fonction réelle, périmètre). Jamais « je me permets », « c'est avec un grand intérêt », « suite à votre annonce ».
-3. Preuves (4-5 phrases) : 2 ou 3 exigences clés de l'annonce, chacune reliée à une réalisation concrète et chiffrée du profil.
-4. Projection (2-3 phrases) : ce que le candidat apportera à ${show(offer.company)} sur les missions du poste, formulé comme une intention (« je souhaite », « je compte »), jamais comme un acquis.
-5. Conclusion (1-2 phrases) : disponibilité pour un entretien, sans insistance.
-6. Formule de politesse sobre adaptée à la langue (FR : « Je vous prie d'agréer, Madame, Monsieur, mes salutations distinguées. »).
-Règles :
-- Cite l'entreprise par son nom au moins une fois, et l'intitulé exact « ${target} » dans l'objet et une fois dans le corps.
-- Intègre naturellement 6 à 10 mots-clés « prouvés » ou « transférables », sans énumération.
-- Au plus 3 phrases commençant par « Je » ; varie les débuts de phrase.
-- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom.
-- Exigence non prouvée : ne la mentionne pas, sauf si une compétence voisine permet de la traiter honnêtement en une demi-phrase.
-- Aucun cliché ni superlatif. Aucun fait inventé.
-${instruction ? `- Consigne du candidat : ${instruction}` : ""}
-
-FORMAT (balisage léger, une instruction par ligne)
-# Prénom Nom
-@ coordonnées
-= ${dateLine}
-> Destinataire (service recrutement, ou nom si connu)
-> ${show(offer.company)}
-## Objet : candidature au poste de ${target}
-paragraphes séparés par une ligne vide
-~ Prénom Nom
-
-Réponds uniquement avec ce JSON :
-{"letter":"<balisage>"}`;
+    return P.letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine });
   },
 
-  letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine }) {
-    const base = offer.spontaneous === "base";
-    const company = base ? "[à compléter : entreprise]" : show(offer.company);
-    return `Mission : rédiger ${base ? "une lettre de candidature spontanée MODÈLE, réutilisable : l'entreprise et son contexte restent à compléter" : "une lettre de candidature SPONTANÉE"} pour un rôle de « ${target} », prête à envoyer après relecture.
+  /* Règle d'or : le CV prouve, la lettre explique. Lettre = pourquoi eux + pourquoi ce rôle maintenant + méthode + 1 preuve racontée. */
+  letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine }) {
+    const tg = targetInfo(offer, a);
+    const company = tg.base ? "[à compléter : entreprise]" : show(offer.company);
+    const facts = (a?.companyFacts || []).filter(Boolean);
+    const kws = (a?.keywords || []).filter((k) => k.status !== "absent" && k.importance === 3).slice(0, 6).map((k) => `« ${k.term} »`);
+    const subject = tg.spont ? `## Objet : candidature spontanée — ${target}` : `## Objet : candidature au poste de ${target}`;
+    return `Mission : rédiger ${tg.base ? "une lettre de candidature spontanée MODÈLE, réutilisable (l'entreprise et ses faits restent à compléter)" : tg.spont ? "une lettre de candidature SPONTANÉE" : "la lettre de motivation"} pour ${tg.spont ? `un rôle de « ${target} »` : `le poste « ${target} »`}${tg.base ? "" : ` chez ${company}`}, prête à envoyer après relecture.
+
+RÈGLE D'OR : le CV prouve, la lettre explique. Le CV ci-dessous est déjà joint : la lettre ne le résume pas. Elle dit pourquoi CETTE entreprise, pourquoi CE rôle MAINTENANT, comment le candidat travaille, et raconte UNE preuve.
+TEST DE SUBSTITUTION : relis chaque phrase en remplaçant ${tg.base ? "l'entreprise" : company} par un concurrent. Si elle reste vraie, réécris-la avec un fait propre à ${tg.base ? "l'entreprise" : company}, ou supprime-la.
 
 ${targetBlock(offer, a)}
 
-ANALYSE DU RÔLE VISÉ (déjà confrontée au profil)
+CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (seules sources autorisées sur l'entreprise ; numérote-les F1, F2… dans « used »)
+${facts.length ? facts.map((f, i) => `F${i + 1}. ${f}`).join("\n") : tg.spont && !tg.base && adTextOf(offer) ? `F1. ${adTextOf(offer).slice(0, 1200)}` : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
+
+ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (repères, pas une liste à recopier)
 ${analysisDigest(a, offer)}
 
-PROFIL (seule source de faits)
+${motivationBlock(profile)}
+
+PROFIL (faits autorisés)
 Nom : ${profile.name || "[à compléter : prénom nom]"}
 Coordonnées : ${profileContact(profile)}
 ${profileBlock(profile)}
 
-CONSIGNES
-Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}. Corps de 220 à 300 mots : une page, plus court qu'une réponse à une annonce.
-Aucune offre n'existe : n'écris jamais « suite à votre annonce », « le poste à pourvoir » ni « votre offre ».
-Corps, paragraphes séparés par une ligne vide :
-1. Formule d'appel (FR : « Madame, Monsieur, » ; si un interlocuteur est nommé avec sa civilité, adresse-toi à lui ; NL : « Geachte mevrouw, geachte heer, » ; EN : « Dear … »).
-2. Pourquoi ${base ? "cette entreprise" : show(offer.company)} (2-3 phrases) : ${base ? "laisse un emplacement « [à compléter : un fait précis sur l'entreprise] »" : "uniquement à partir du contexte fourni par le candidat ; s'il est vide, parle du rôle et du secteur sans inventer de fait sur l'entreprise"}. Puis qui est le candidat aujourd'hui en une phrase (fonction réelle, périmètre).
-3. Preuves (3-4 phrases) : 2 ou 3 réalisations concrètes et chiffrées du profil, reliées aux attentes du rôle.
-4. Apport (2 phrases) : ce que le candidat pourrait apporter, formulé comme une proposition (« je pourrais », « je serais heureux de contribuer à »), jamais comme une certitude sur leurs besoins.
-5. Demande (1-2 phrases) : un échange de 20 à 30 minutes pour présenter son parcours, même sans poste ouvert.
-6. Formule de politesse sobre adaptée à la langue.
-Règles :
-- Intègre naturellement 5 à 8 mots-clés « prouvés » ou « transférables », sans énumération.
-- Au plus 3 phrases commençant par « Je ».
-- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique.
-- Aucun cliché, aucun fait inventé.
+CV DÉJÀ JOINT (à NE PAS répéter)
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 9000)}
+>>>
+
+TRAME (corps de ${tg.spont ? "220 à 300" : "250 à 320"} mots, paragraphes séparés par une ligne vide)
+1. Appel : formule seule sur sa ligne (FR « Madame, Monsieur, » ; NL « Geachte mevrouw, geachte heer, » ; EN « Dear Hiring Manager, » ; interlocuteur nommé si connu).
+2. Pourquoi vous (2-3 phrases) : un ou deux faits propres à ${tg.base ? "l'entreprise" : company} (liste ci-dessus) reliés à une conviction ou à un intérêt réel du candidat. Aucune flatterie (« leader », « référence », « renommée », « prestigieuse », « j'admire »…).${tg.spont ? " Aucune offre n'existe : jamais « votre annonce », « le poste à pourvoir »." : ""}
+3. Pourquoi ce rôle, maintenant (2-3 phrases) : à partir de « pourquoi maintenant », « ce qu'il cherche » et d'une conviction. Le candidat n'occupe pas le poste visé.
+4. Preuve racontée (3-4 phrases) : UNE histoire de la banque, racontée (situation → ce qu'il a fait → ce que ça a changé), pas une liste de réalisations.
+5. Méthode (2 phrases) : comment il aborderait les enjeux de ${tg.base ? "l'entreprise" : company}, à partir de sa méthode, formulé comme une intention.
+6. Échange (1-2 phrases) : ${tg.spont ? "proposer un échange de 20 à 30 minutes, même sans poste ouvert" : "disponibilité pour un entretien, sans insistance"}, puis formule de politesse sobre adaptée à la langue.
+
+CONTRAINTES
+- Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}, humble.
+- 2 chiffres au maximum dans toute la lettre.
+- Au plus 1 réalisation commune avec le CV, et formulée autrement qu'en puce de CV.
+- 2 à 4 mots-clés de l'annonce au plus, seulement s'ils viennent naturellement${kws.length ? ` (parmi : ${kws.join(", ")})` : ""}. Aucune énumération de compétences.
+- Jamais deux phrases consécutives commençant par « Je » (« Ik », « I »).
+- Intitulé exact « ${target} » dans l'objet ; ${tg.base ? "entreprise laissée en [à compléter]" : `${company} citée au moins une fois`}.
+- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom.
+- Motivation, conviction ou histoire absentes des MOTIVATIONS : écris [à compléter : …], n'invente rien. Aucun fait inventé, aucun cliché.
 ${instruction ? `- Consigne du candidat : ${instruction}` : ""}
 
 FORMAT (balisage léger, une instruction par ligne)
 # Prénom Nom
 @ coordonnées
 = ${dateLine}
-> ${offer.contactName || "Destinataire (direction ou service des ressources humaines)"}
+> ${offer.contactName || "Destinataire (service recrutement, ou nom si connu)"}
 > ${company}
-## Objet : candidature spontanée — ${target}
+${subject}
 paragraphes séparés par une ligne vide
 ~ Prénom Nom
 
+« used » décrit honnêtement ce que la lettre utilise : faits entreprise (F1…), conviction (id [c…]), histoire (id [s…]), mots-clés de l'annonce, chiffres écrits, réalisation commune avec le CV (texte ou null).
+
 Réponds uniquement avec ce JSON :
-{"letter":"<balisage>"}`;
+{"letter":"<balisage>","used":{"companyFacts":["F1"],"convictionId":null,"storyId":null,"keywords":[],"numbers":[],"sharedWithCv":null}}`;
+  },
+
+  motivationDraft(answers, current) {
+    return `Mission : ranger les réponses d'un candidat à un entretien de motivation dans sa fiche « Motivations ».
+
+RÈGLE ABSOLUE : tu REFORMULES seulement. Aucune idée, aucun fait, aucun chiffre, aucun adjectif valorisant qui ne soit pas dans ses réponses. Garde ses mots quand ils sont précis. Un champ sans matière reste vide ("" ou []). Langue : français, sauf si les réponses sont dans une autre langue.
+
+RÉPONSES
+${answers.map((x) => `Q (${x.field}) : ${x.q}\nR : ${x.a || "(pas de réponse)"}`).join("\n\n")}
+
+FICHE ACTUELLE (ne la répète pas ; propose seulement ce que les réponses apportent)
+${JSON.stringify(current).slice(0, 6000)}
+
+CHAMPS
+- purpose : raison d'être professionnelle (1-2 phrases).
+- convictions : 1 phrase chacune, affirmée, telle qu'il la défend.
+- stories : histoires racontables { title (5 mots), situation, action (ce qu'IL a fait), result (avec ses chiffres exacts s'il en donne), lesson }.
+- management, method, whyNow, lookingFor : 1-3 phrases chacun.
+- sectors : secteurs ou types d'organisations cités.
+- followUps : 0 à 3 questions de relance quand une réponse est trop vague pour écrire une lettre spécifique (ex. histoire sans résultat, conviction sans exemple). Chaque relance vise un champ.
+
+Réponds uniquement avec ce JSON :
+{"purpose":"","convictions":[],"stories":[{"title":"","situation":"","action":"","result":"","lesson":""}],"management":"","method":"","whyNow":"","lookingFor":"","sectors":[],"followUps":[{"field":"","q":""}]}`;
   },
 
   fixDoc({ kind, text, issues, analysis, profile, offer }) {
@@ -2216,7 +2396,7 @@ ${profileBlock(profile)}
 
 RÈGLES
 - Chaque correction remplace un passage court (une ligne ou une phrase) : "before" = texte exact du document, "after" = nouvelle version, avec le même balisage en début de ligne (« - », « > », « ### »…).
-- Pour ajouter un mot-clé, réécris la phrase ou la puce où le profil le démontre ; jamais de liste de mots ajoutée.
+- ${kind === "cv" ? "Pour ajouter un mot-clé, réécris la phrase ou la puce où le profil le démontre ; jamais de liste de mots ajoutée." : "Lettre : n'ajoute ni mot-clé ni chiffre ; elle explique le « pourquoi » (entreprise, rôle, méthode, une histoire), le CV porte les preuves."}
 - Le candidat n'occupe pas le poste visé : la ligne sous le nom part de sa fonction réelle ; l'intitulé visé ne s'écrit que comme objectif.
 - Aucun fait, chiffre ou outil absent du profil. Aucun cliché. Même langue que le document.
 - Un point qui ne peut pas être corrigé honnêtement est ignoré.
@@ -2225,7 +2405,7 @@ Réponds uniquement avec ce JSON :
 {"edits":[{"before":"","after":"","reason":"10 mots max"}]}`;
   },
 
-  review({ kind, text, analysis, profile, offer }) {
+  review({ kind, text, analysis, profile, offer, cvText }) {
     const tg = targetInfo(offer, analysis);
     const reader = tg.base
       ? `un recruteur exigeant qui cherche un profil de « ${tg.role} »`
@@ -2244,7 +2424,19 @@ ${analysisDigest(analysis, offer)}
 
 PROFIL (faits autorisés)
 ${profileBlock(profile)}
+${kind === "cv" ? "" : `
+${motivationBlock(profile)}
 
+CV JOINT À LA LETTRE
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 8000)}
+>>>
+
+LETTRE : le CV prouve, la lettre explique. Vérifie en priorité :
+- TEST DE SUBSTITUTION : chaque phrase qui resterait vraie si l'on remplaçait ${show(offer.company)} par un concurrent est à réécrire (fait propre à l'entreprise, ou [à compléter : fait vérifiable]).
+- Répétition du CV : toute phrase qui reformule une puce du CV est à remplacer par du « pourquoi » (conviction, pourquoi maintenant, méthode) ou par l'histoire racontée.
+- Présence de : pourquoi eux, pourquoi ce rôle maintenant, une histoire racontée, la méthode, la demande d'échange. Au plus 2 chiffres. Aucune flatterie.
+`}
 Évalue : positionnement compris en 10 secondes, preuves chiffrées, adéquation aux exigences clés, couverture des mots-clés prouvés, honnêteté (aucune prétention d'occuper déjà le poste visé), style (clichés, répétitions, phrases longues), cohérence des temps.
 Propose 4 à 10 corrections, les plus utiles d'abord : "before" = copie EXACTE d'un passage court du document (une ligne ou une phrase), "after" = version améliorée avec le même balisage de début de ligne, "reason" = pourquoi (12 mots max), "severity" = haute | moyenne | basse. Aucun fait absent du profil.
 
@@ -2355,9 +2547,11 @@ Annonce : ${show(offer.description)}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+
 1. Utilise web_search pour documenter l'entreprise (activité, taille, organisation, actualité des 12 derniers mois, culture, avis publics). Chaque fait doit citer l'URL de sa source. Si une information n'est pas trouvée, ne la mentionne pas.
 2. Questions probables pour ce poste, avec l'angle attendu.
-3. Exemples STAR construits UNIQUEMENT à partir du profil ; si un élément manque, écris [à compléter].
+3. Exemples STAR construits UNIQUEMENT à partir du profil et de la banque d'histoires (priorité aux histoires) ; si un élément manque, écris [à compléter]. Inclure la réponse à « Pourquoi nous ? » à partir des faits trouvés et des motivations du candidat.
 4. Questions pertinentes à poser.
 5. Points de négociation. Fourchette salariale uniquement si une source publique chiffrée existe (avec URL), sinon null.
 
@@ -3986,7 +4180,7 @@ export default function RadarApp() {
     const { app, offer } = appAndOffer(appId);
     const adText = adTextOf(offer);
     if (offer.spontaneous ? !str(offer.title) : adText.length < 40) throw new Error(offer.spontaneous ? "Indiquez le rôle visé." : "Annonce trop courte pour être analysée : collez son texte complet.");
-    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify(p)}`);
+    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify({ ...p, motivation: undefined, motivationAnswers: undefined, writingRules: undefined })}`);
     if (!force && app.analysis?.sig === sig) return app.analysis;
     const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000 });
     const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.spontaneous && !offer.fullText, adChars: adText.length, spontaneous: offer.spontaneous || null };
@@ -4012,49 +4206,61 @@ export default function RadarApp() {
       setGen(appId, { step: 1, label: offer.spontaneous ? "Analyse du rôle visé et confrontation à votre profil…" : "Analyse de l'annonce et confrontation à votre profil…" });
       let analysis = null;
       try { analysis = await analyzeAd(appId); } catch (e) { toast(`Analyse de l'annonce impossible (${e.message}) : rédaction à partir de l'annonce seule.`, "warn"); }
-      setGen(appId, { step: 2, label: `Rédaction ${[pro.includes("cv") && "du CV", pro.includes("letter") && "de la lettre", other.length && "des messages"].filter(Boolean).join(", ")}…` });
-      const jobs = pro.map((t) => () => askJSON(s, {
-        system: SYSTEM_WRITER,
-        prompt: t === "cv" ? P.cvWrite(offer, p, analysis, prefs, instruction) : P.letterWrite(offer, p, analysis, prefs, instruction),
-        maxTokens: 9000,
-      }).then((r) => [t, r.data]));
-      if (other.length) jobs.push(() => askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, other, instruction, analysis), maxTokens: 8000 }).then((r) => ["rest", r.data]));
-      const settled = await settleLimited(jobs, RT.mode === "published" ? 2 : 3);
-      const failed = settled.filter((x) => x.status === "rejected").map((x) => x.reason?.message || String(x.reason));
-      const got = Object.fromEntries(settled.filter((x) => x.status === "fulfilled").map((x) => x.value));
       const lang = docLang(offer, prefs, analysis);
+      const failed = [];
+      const got = {};
       const drafts = {};
-      for (const t of pro) {
-        const raw = got[t]?.[t];
-        if (typeof raw !== "string" || !raw.trim()) continue;
-        const accent = t === "cv" ? cleanHex(got.cv?.accent, null) : null;
-        drafts[t] = {
-          text: normalizeDoc(raw, t, lang), accent,
-          accentSource: accent ? str(got.cv?.accentSource) || "suggérée" : null,
-          tips: t === "cv" ? (got.cv?.tips || []).map(String).filter(Boolean).slice(0, 4) : [],
-        };
+      const qaCtx = (extra) => lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p, ...extra });
+      /* Passe de correction ciblée après rédaction (points « autoFix » du contrôle qualité). */
+      const autoFix = async (t, d, extra) => {
+        d.autoFixed = 0;
+        const issues = autoFixList(analyzeDoc(d.text, t, qaCtx(extra)));
+        if (!issues.length) return;
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000 });
+          let txt = d.text;
+          for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
+            const nt = applyEdit(txt, e?.before, e?.after);
+            if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
+          }
+          d.text = normalizeDoc(txt, t, lang);
+        } catch { /* passe facultative : le document reste utilisable */ }
+      };
+      const restJob = other.length
+        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
+        : Promise.resolve();
+      /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
+      if (pro.includes("cv")) {
+        setGen(appId, { step: 2, label: "Rédaction du CV…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction), p), maxTokens: 9000 });
+          const raw = r.data?.cv;
+          if (typeof raw === "string" && raw.trim()) {
+            const accent = cleanHex(r.data?.accent, null);
+            drafts.cv = { text: normalizeDoc(raw, "cv", lang), accent, accentSource: accent ? str(r.data?.accentSource) || "suggérée" : null, tips: (r.data?.tips || []).map(String).filter(Boolean).slice(0, 4) };
+            setGen(appId, { step: 3, label: "Contrôle qualité du CV…" });
+            await autoFix("cv", drafts.cv);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
       }
-      if (Object.keys(drafts).length) {
-        setGen(appId, { step: 3, label: "Contrôle qualité et corrections ciblées…" });
-        await Promise.all(Object.entries(drafts).map(async ([t, d]) => {
-          const rep = analyzeDoc(d.text, t, lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p }));
-          const issues = autoFixList(rep);
-          d.autoFixed = 0;
-          if (!issues.length) return;
-          try {
-            const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), maxTokens: 5000 });
-            let txt = d.text;
-            for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
-              const nt = applyEdit(txt, e?.before, e?.after);
-              if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
-            }
-            d.text = normalizeDoc(txt, t, lang);
-          } catch { /* passe facultative : le document reste utilisable */ }
-        }));
+      if (pro.includes("letter")) {
+        const cvText = drafts.cv?.text || app.drafts?.cv?.text || app.docs?.cv?.slice(-1)[0]?.text || "";
+        setGen(appId, { step: 2, label: cvText ? "Rédaction de la lettre à partir du CV (sans le répéter)…" : "Rédaction de la lettre…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText), p), maxTokens: 9000 });
+          const raw = r.data?.letter;
+          if (typeof raw === "string" && raw.trim()) {
+            drafts.letter = { text: normalizeDoc(raw, "letter", lang), accent: null, accentSource: null, tips: [], used: normalizeUsed(r.data?.used), cvText };
+            setGen(appId, { step: 3, label: "Contrôle qualité de la lettre…" });
+            await autoFix("letter", drafts.letter, { cvText });
+            drafts.letter.metrics = letterMetrics(drafts.letter.text, cvText);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
       }
+      await restJob;
       const versions = {};
       const meta = () => ({ id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction), prefs, analysisSig: analysis?.sig || null });
-      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed };
+      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed, ...(t === "letter" ? { used: d.used, metrics: d.metrics } : {}) };
       const rest = got.rest || {};
       for (const t of other) {
         const d = rest[t];
@@ -4086,14 +4292,37 @@ export default function RadarApp() {
     const { settings: s, profile: p } = R.current;
     const { app, offer } = appAndOffer(appId);
     const analysis = app.analysis || null;
-    const args = { ...payload, analysis, profile: p, offer };
+    const cvText = latestCvText(app);
+    const args = { cvText, ...payload, analysis, profile: p, offer };
     const prompt = { review: P.review, fix: P.fixDoc, section: P.improveSection, headlines: P.headlines }[action];
     if (!prompt) throw new Error("Action inconnue.");
-    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: prompt(args), maxTokens: action === "headlines" ? 2500 : 6000 });
+    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000 });
     return data || {};
   });
 
   /* « J'ai cette compétence » : ajoutée au profil et marquée comme prouvée pour cette candidature. */
+  /* Entretien de motivation : l'IA range les réponses dans la fiche, en reformulant seulement. */
+  const draftMotivation = (answers) => withBusy("motiv-draft", async () => {
+    const { settings: s, profile: p } = R.current;
+    const filled = answers.filter((x) => str(x.a));
+    if (filled.length < 3) throw new Error("Répondez à au moins 3 questions.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.motivationDraft(filled, motivOf(p)), maxTokens: 6000 });
+    const d = data && typeof data === "object" ? data : {};
+    const t = (x) => (typeof x === "string" ? x.trim() : "");
+    const proposal = {
+      ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, t(d[f.id])])),
+      convictions: (Array.isArray(d.convictions) ? d.convictions : []).map((c) => t(c?.text ?? c)).filter(Boolean),
+      stories: (Array.isArray(d.stories) ? d.stories : []).map((x) => ({ title: t(x?.title), situation: t(x?.situation), action: t(x?.action), result: t(x?.result), lesson: t(x?.lesson) })).filter((x) => x.title || x.situation || x.action),
+      sectors: (Array.isArray(d.sectors) ? d.sectors : []).map(t).filter(Boolean),
+      followUps: (Array.isArray(d.followUps) ? d.followUps : []).map((f) => ({ field: t(f?.field), q: t(f?.q) })).filter((f) => f.q).slice(0, 3),
+    };
+    /* Garde-fou « rien ajouté » : tout chiffre absent des réponses est signalé. */
+    const src = new Set(sigNumbers(filled.map((x) => x.a).join("\n")));
+    const out = JSON.stringify({ ...proposal, followUps: [] });
+    proposal.inventedNumbers = sigNumbers(out).filter((n) => !src.has(n));
+    return proposal;
+  });
+
   const declareSkill = (appId, term) => {
     setProfile((p) => (p.skills.some((x) => normText(x) === normText(term)) ? p : { ...p, skills: [...p.skills, term] }));
     patchApp(appId, (a) => (a.analysis ? { ...a, analysis: { ...a.analysis, keywords: a.analysis.keywords.map((k) => (k.term === term ? { ...k, status: "prouvé", evidence: "déclarée par vous (ajoutée au profil)" } : k)) } } : a));
@@ -4122,7 +4351,7 @@ export default function RadarApp() {
     const fu = app?.followUps.find((f) => f.id === fuId);
     const offer = O.find((o) => o.id === app?.offerId);
     const contact = C.find((c) => app?.contactIds?.includes(c.id));
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.followUp(app, offer, fu, p, contact), maxTokens: 3000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.followUp(app, offer, fu, p, contact), p), maxTokens: 3000 });
     if (!data?.body) throw new Error("Aucun texte reçu.");
     setFollowUp(appId, fuId, { draft: { subject: data.subject || "", body: data.body, createdAt: nowISO() } });
     toast("Relance rédigée — à relire", "ok");
@@ -4140,7 +4369,7 @@ export default function RadarApp() {
     const { settings: s, profile: p, apps: A, offers: O } = R.current;
     const app = A.find((a) => a.id === appId);
     const offer = O.find((o) => o.id === app?.offerId);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.prep(offer, p), web: { maxUses: 6 }, maxTokens: 14000 });
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p), p), web: { maxUses: 6 }, maxTokens: 14000 });
     const d = res.data || {};
     const seen = (u) => !!u && res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u));
     const prep = {
@@ -4351,7 +4580,7 @@ export default function RadarApp() {
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, draftMotivation, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
     openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText, patchOfferNow, createSpontaneous, setSpontOpen,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
@@ -6569,7 +6798,7 @@ function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, ai
       {aiOpen && (
         <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
           <div className="flex flex-wrap gap-1.5">
-            {AI_GOALS.map(([g, l]) => (
+            {AI_GOALS.filter(([g]) => kind === "cv" || g !== "keywords").map(([g, l]) => (
               <Btn key={g} size="sm" variant="soft" disabled={aiBusy || (g === "keywords" && !missingCount)} onClick={() => onAI(g)}>
                 {l}{g === "keywords" ? ` (${missingCount || 0})` : ""}
               </Btn>
@@ -6681,6 +6910,28 @@ function ScoreRing({ value }) {
     </svg>
   );
 }
+/* Lettre : deux jauges — recouvrement avec le CV (≤ 15 %) et spécificité. */
+function LetterGauges({ scores }) {
+  const T = useT();
+  const ov = scores.overlap;
+  const ovTone = ov === null ? T.faint : ov > 30 ? "text-rose-600" : ov > 15 ? "text-amber-600" : "text-emerald-600";
+  const spTone = scores.spec === null ? T.faint : scores.spec >= 80 ? "text-emerald-600" : scores.spec >= 60 ? "text-amber-600" : "text-rose-600";
+  const Gauge = ({ label, value, unit, tone, hint, max }) => (
+    <div className={`rounded-2xl p-3 ${T.sub}`} title={hint}>
+      <div className={`text-xs ${T.muted}`}>{label}</div>
+      <div className={`text-2xl font-semibold tabular-nums ${tone}`}>{value === null || value === undefined ? "—" : `${value}${unit}`}</div>
+      <div className={`h-1.5 mt-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}>
+        <div className={`h-full rounded-full ${tone.replace("text-", "bg-")}`} style={{ width: `${value == null ? 0 : clamp((value / max) * 100, 0, 100)}%` }} />
+      </div>
+    </div>
+  );
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <Gauge label="Recouvrement CV" value={ov} unit=" %" tone={ovTone} max={50} hint="Part des suites de 4 mots de la lettre déjà présentes dans le CV. Cible ≤ 15 %, bloquant au-delà de 30 %." />
+      <Gauge label="Spécificité" value={scores.spec} unit="/100" tone={spTone} max={100} hint="Pourquoi eux (fait vérifié), conviction, histoire racontée, aucune flatterie." />
+    </div>
+  );
+}
 function ScoreBar({ label, value, hint }) {
   const T = useT();
   if (value === null || value === undefined) return null;
@@ -6762,9 +7013,21 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
             <div className={`text-xs ${T.muted}`}>{report.words} mots · {pages || "…"} page(s){!analysis ? " · annonce non analysée" : ""}</div>
           </div>
         </div>
-        <ScoreBar label="Mots-clés ATS" value={report.scores.ats} hint="Couverture pondérée des mots-clés justifiables + intitulé exact" />
-        <ScoreBar label={type === "cv" ? "Impact" : "Pertinence"} value={report.scores.impact} hint={type === "cv" ? "Puces chiffrées, verbes d'action, absence de clichés" : "Entreprise citée, preuves chiffrées, objet, conclusion"} />
-        <ScoreBar label="Lisibilité" value={report.scores.read} hint="Longueur, pages, sections, répétitions" />
+        {type === "cv" ? (
+          <>
+            <ScoreBar label="Mots-clés ATS" value={report.scores.ats} hint="Couverture pondérée des mots-clés justifiables + intitulé exact" />
+            <ScoreBar label="Impact" value={report.scores.impact} hint="Puces chiffrées, verbes d'action, absence de clichés" />
+            <ScoreBar label="Lisibilité" value={report.scores.read} hint="Longueur, pages, sections, répétitions" />
+          </>
+        ) : (
+          <>
+            <LetterGauges scores={report.scores} />
+            <ScoreBar label="Spécificité (35 %)" value={report.scores.spec} hint="Faits propres à l'entreprise, conviction, histoire racontée, aucune flatterie" />
+            <ScoreBar label="Complémentarité avec le CV (25 %)" value={report.scores.compl} hint="Recouvrement de 4-grammes avec le CV ≤ 15 %, chiffres communs ≤ 1, 2 chiffres au plus" />
+            <ScoreBar label="Impact (20 %)" value={report.scores.impact} hint="Histoire racontée, objet, demande d'échange, aucun cliché" />
+            <ScoreBar label="Lisibilité (20 %)" value={report.scores.read} hint="Longueur, débuts de phrase, répétitions, une page" />
+          </>
+        )}
       </div>
       <div className="px-4 pt-3 overflow-x-auto">
         <Tabs
@@ -6785,7 +7048,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
           {fixable.length > 0 && (
             <div className={`rounded-2xl p-3 ${T.accentSoft}`}>
               <Btn variant="primary" icon={Wand2} loading={api.busyFix} onClick={() => api.fix(fixable)}>Corriger automatiquement ({fixable.length})</Btn>
-              <p className="text-xs mt-2">L'IA propose des remplacements ciblés (titre, mots-clés, style) ; vous validez chacun dans l'onglet IA.</p>
+              <p className="text-xs mt-2">L'IA propose des remplacements ciblés ({type === "cv" ? "titre, mots-clés, style" : "pourquoi eux, conviction, histoire, recouvrement avec le CV, style"}) ; vous validez chacun dans l'onglet IA.</p>
             </div>
           )}
           {groups.map(([lvl, label]) => {
@@ -7247,8 +7510,8 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 
   /* Contrôle qualité en direct */
   const report = useMemo(
-    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords })),
-    [text, type, pages, app.analysis, prefs.voice, profile.headline, lang], // eslint-disable-line react-hooks/exhaustive-deps
+    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "" })),
+    [text, type, pages, app.analysis, prefs.voice, profile.headline, profile.motivation, lang, type === "letter" ? latestCvText(app) : ""], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const missing = report.kw.filter((k) => k.status !== "absent" && !k.found);
 
@@ -7517,7 +7780,7 @@ function StudioDocCard({ app, offer, type }) {
   const text = useDraft ? draft.text : v?.text;
   const lang = v?.language || app.docLanguage || offer?.language || "fr";
   const rep = useMemo(
-    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords })) : null),
+    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "" })) : null),
     [text, app.analysis, type], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const z = 0.15;
@@ -8213,9 +8476,11 @@ function ProfileView() {
   return (
     <div>
       <PageHeader title="Profil & critères" subtitle={`Version active : ${activeVersion(criteria)?.label}`} />
-      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
+      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "motivations", label: "Motivations" }, { id: "rules", label: "Règles d'écriture" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
       {tab === "criteria" && <CriteriaEditor />}
       {tab === "profile" && <ProfileEditor />}
+      {tab === "motivations" && <MotivationEditor />}
+      {tab === "rules" && <WritingRulesEditor />}
       {tab === "history" && <CriteriaHistory />}
     </div>
   );
@@ -8289,6 +8554,163 @@ function CriteriaEditor() {
           <ListEditor items={d.redFlags} onChange={(v) => set("redFlags", v)} placeholder="Nouveau signal" />
         </Card>
       </div>
+    </div>
+  );
+}
+
+/* ── Motivations : le « pourquoi » (lettre, messages, entretien ; jamais le CV) ── */
+function MotivationEditor() {
+  const T = useT();
+  const { profile, setProfile, draftMotivation, busy, toast } = useApp();
+  const m = motivOf(profile);
+  const setM = (patch) => setProfile((p) => ({ ...p, motivation: { ...motivOf(p), ...patch } }));
+  /* Réponses conservées dans le profil (champ facultatif), pour reprendre l'entretien plus tard. */
+  const answers = profile.motivationAnswers && typeof profile.motivationAnswers === "object" ? profile.motivationAnswers : {};
+  const setAnswer = (id, a) => setProfile((p) => ({ ...p, motivationAnswers: { ...(p.motivationAnswers || {}), [id]: a } }));
+  const [extra, setExtra] = useState([]);
+  const questions = [...MOTIV_QUESTIONS, ...extra];
+  const [step, setStep] = useState(0);
+  const q = questions[Math.min(step, questions.length - 1)];
+  const [prop, setProp] = useState(null);
+  const [pick, setPick] = useState({});
+  const answered = questions.filter((x) => str(answers[x.id])).length;
+  const runDraft = async () => {
+    const r = await draftMotivation(questions.map((x) => ({ field: x.field, q: x.q, a: answers[x.id] || "" })));
+    if (!r) return;
+    setProp(r);
+    setPick({ ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, !!r[f.id]])), convictions: r.convictions.length > 0, stories: r.stories.length > 0, sectors: r.sectors.length > 0 });
+    if (r.followUps.length) {
+      const fu = r.followUps.map((f, i) => ({ id: `fu-${Date.now().toString(36)}-${i}`, field: f.field, q: f.q, followUp: true }));
+      setExtra((l) => [...l, ...fu]);
+    }
+  };
+  const apply = () => {
+    const cur = motivOf(profile);
+    const patch = {};
+    for (const f of MOTIV_TEXT_FIELDS) if (pick[f.id] && prop[f.id]) patch[f.id] = prop[f.id];
+    const nid = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+    if (pick.convictions) { const l = [...cur.convictions]; prop.convictions.forEach((t) => { if (!l.some((c) => normText(c.text) === normText(t))) l.push({ id: nid("c", l), text: t }); }); patch.convictions = l; }
+    if (pick.stories) { const l = [...cur.stories]; prop.stories.forEach((st) => l.push({ id: nid("s", l), ...st })); patch.stories = l; }
+    if (pick.sectors) patch.sectors = [...new Set([...cur.sectors, ...prop.sectors])];
+    setM(patch);
+    setProp(null);
+    toast("Motivations mises à jour", "ok");
+  };
+  const upConv = (id, text) => setM({ convictions: m.convictions.map((c) => (c.id === id ? { ...c, text } : c)) });
+  const upStory = (id, k, v) => setM({ stories: m.stories.map((x) => (x.id === id ? { ...x, [k]: v } : x)) });
+  const newId = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle>Pourquoi cet onglet</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Le CV prouve, la lettre explique. Ce que vous écrivez ici nourrit la lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien. Jamais le CV. L'IA reformule vos mots, elle n'ajoute rien : sans matière, elle écrit [à compléter].</p>
+      </Card>
+
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle action={<span className={`text-xs ${T.muted}`}>{answered}/{questions.length} réponses</span>}>Entretien de motivation (IA)</SectionTitle>
+        <div className="flex flex-wrap gap-1.5">
+          {questions.map((x, i) => (
+            <button key={x.id} type="button" onClick={() => setStep(i)} aria-current={i === step} className={`w-8 h-8 rounded-full text-xs font-medium ${i === step ? "bg-indigo-600 text-white" : str(answers[x.id]) ? T.accentSoft : T.chip} ${T.ring}`} title={x.q}>{x.followUp ? "+" : i + 1}</button>
+          ))}
+        </div>
+        <div>
+          <div className="text-sm font-medium">{q.followUp ? "Relance : " : `${step + 1}. `}{q.q}</div>
+          <Textarea rows={6} className="mt-2" value={answers[q.id] || ""} onChange={(e) => setAnswer(q.id, e.target.value)} placeholder="Répondez librement, comme à l'oral. Les faits et les chiffres que vous donnez sont repris tels quels." aria-label={q.q} />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Btn variant="ghost" icon={ChevronLeft} disabled={step === 0} onClick={() => setStep((n) => n - 1)}>Précédente</Btn>
+          <Btn variant="soft" icon={ChevronRight} disabled={step >= questions.length - 1} onClick={() => setStep((n) => n + 1)}>Suivante</Btn>
+          <Btn variant="primary" icon={Wand2} loading={busy["motiv-draft"]} disabled={answered < 3} onClick={runDraft}>Ranger mes réponses dans la fiche</Btn>
+        </div>
+        {prop && (
+          <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+            <div className="text-sm font-medium">Proposition (reformulation de vos réponses)</div>
+            {prop.inventedNumbers.length > 0 && <Notice tone="warn" icon={AlertTriangle}>Chiffres absents de vos réponses : {prop.inventedNumbers.join(", ")}. Décochez ou corrigez après reprise.</Notice>}
+            {[...MOTIV_TEXT_FIELDS.map((f) => [f.id, f.label, prop[f.id]]), ["convictions", "Convictions (ajoutées)", prop.convictions.join(" · ")], ["stories", "Histoires (ajoutées)", prop.stories.map((x) => x.title || x.situation.slice(0, 50)).join(" · ")], ["sectors", "Secteurs (ajoutés)", prop.sectors.join(" · ")]].map(([id, label, val]) => (
+              <label key={id} className={`flex gap-3 items-start text-sm ${val ? "" : "opacity-50"}`}>
+                <input type="checkbox" className="mt-1" disabled={!val} checked={!!pick[id] && !!val} onChange={(e) => setPick({ ...pick, [id]: e.target.checked })} />
+                <span className="min-w-0"><span className="font-medium">{label}</span><span className={`block text-xs ${T.muted}`}>{val || "rien dans vos réponses"}</span></span>
+              </label>
+            ))}
+            {prop.followUps.length > 0 && <p className={`text-xs ${T.muted}`}>{prop.followUps.length} question(s) de relance ajoutée(s) à l'entretien (« + ») pour préciser des réponses trop vagues.</p>}
+            <div className="flex gap-2">
+              <Btn variant="primary" icon={Check} onClick={apply} disabled={!Object.values(pick).some(Boolean)}>Reprendre la sélection</Btn>
+              <Btn variant="ghost" onClick={() => setProp(null)}>Ignorer</Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <SectionTitle>Votre « pourquoi »</SectionTitle>
+        {MOTIV_TEXT_FIELDS.map((f) => (
+          <Field key={f.id} label={f.label} hint={f.hint}><Textarea rows={3} value={m[f.id]} onChange={(e) => setM({ [f.id]: e.target.value })} /></Field>
+        ))}
+        <Field label="Secteurs et organisations qui vous attirent"><ChipInput values={m.sectors} onChange={(v) => setM({ sectors: v })} placeholder="Ajouter…" /></Field>
+      </Card>
+
+      <div className="space-y-4">
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ convictions: [...m.convictions, { id: newId("c", m.convictions), text: "Nouvelle conviction" }] })}>Ajouter</Btn>}>Convictions</SectionTitle>
+          {!m.convictions.length && <p className={`text-xs ${T.faint}`}>Une phrase par conviction, telle que vous la défendriez en entretien.</p>}
+          {m.convictions.map((c) => (
+            <div key={c.id} className="flex gap-2 items-start">
+              <Chip>{c.id}</Chip>
+              <Textarea rows={2} value={c.text} onChange={(e) => upConv(c.id, e.target.value)} aria-label={`Conviction ${c.id}`} />
+              <IconBtn icon={X} label="Retirer" onClick={() => setM({ convictions: m.convictions.filter((x) => x.id !== c.id) })} />
+            </div>
+          ))}
+        </Card>
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ stories: [...m.stories, { id: newId("s", m.stories), title: "Nouvelle histoire", situation: "", action: "", result: "", lesson: "" }] })}>Ajouter</Btn>}>Banque d'histoires</SectionTitle>
+          {!m.stories.length && <p className={`text-xs ${T.faint}`}>2 à 5 histoires racontables : la lettre en raconte une, l'entretien s'en sert pour les réponses STAR.</p>}
+          {m.stories.map((x) => (
+            <div key={x.id} className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+              <div className="flex gap-2 items-center">
+                <Chip>{x.id}</Chip>
+                <Input value={x.title} onChange={(e) => upStory(x.id, "title", e.target.value)} aria-label="Titre" className="h-8" />
+                <IconBtn icon={Trash2} label="Retirer" onClick={() => setM({ stories: m.stories.filter((y) => y.id !== x.id) })} />
+              </div>
+              {[["situation", "Situation"], ["action", "Ce que vous avez fait"], ["result", "Ce que ça a changé"], ["lesson", "Ce que vous en retenez"]].map(([k, l]) => (
+                <Field key={k} label={l}><Textarea rows={2} value={x[k]} onChange={(e) => upStory(x.id, k, e.target.value)} /></Field>
+              ))}
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ── Règles d'écriture (6a) : injectées dans toutes les rédactions ; prioritaires sur le style, jamais sur la vérité ── */
+function WritingRulesEditor() {
+  const T = useT();
+  const { profile, setProfile } = useApp();
+  const rules = writingRulesOf(profile);
+  const save = (l) => setProfile((p) => ({ ...p, writingRules: l }));
+  const up = (id, patch) => save(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const newId = () => { let i = rules.length + 1; while (rules.some((r) => r.id === `r${i}`)) i++; return `r${i}`; };
+  return (
+    <div className="space-y-4 max-w-4xl">
+      <Card className="p-6 space-y-2">
+        <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => save([...rules, { id: newId(), text: "Nouvelle règle", active: true, origin: "manuelle" }])}>Ajouter</Btn>}>Règles d'écriture</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Injectées dans le CV, la lettre, les messages, les corrections, la relecture et la préparation d'entretien. Elles priment sur les consignes de style, jamais sur la vérité : une preuve absente de votre profil reste [à compléter]. Les règles « départ » sont à valider : modifiez-les ou désactivez-les.</p>
+      </Card>
+      {rules.map((r) => (
+        <Card key={r.id} className="p-4">
+          <div className="flex gap-3 items-start">
+            <input type="checkbox" className="mt-2" checked={!!r.active} onChange={(e) => up(r.id, { active: e.target.checked })} aria-label="Règle active" />
+            <div className="flex-1 min-w-0 space-y-1">
+              <Textarea rows={2} value={r.text} onChange={(e) => up(r.id, { text: e.target.value })} aria-label={`Règle ${r.id}`} />
+              <div className="flex gap-1.5">
+                <Chip tone={r.active ? "ok" : "neutral"}>{r.active ? "active" : "inactive"}</Chip>
+                <Chip>{r.origin || "manuelle"}</Chip>
+              </div>
+            </div>
+            <IconBtn icon={Trash2} label="Supprimer" onClick={() => save(rules.filter((x) => x.id !== r.id))} />
+          </div>
+        </Card>
+      ))}
     </div>
   );
 }
