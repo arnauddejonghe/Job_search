@@ -33,6 +33,7 @@ const KEYS = {
   apps: "radar:apps",
   contacts: "radar:contacts",
   ratings: "radar:ratings",
+  briefs: "radar:briefs",
 };
 
 const STAGES = [
@@ -1024,8 +1025,10 @@ function analyzeDoc(text, kind, ctx = {}) {
     const sec = findSec((h, i) => /\[à compléter/i.test(o.sections[i].lines.join("\n")));
     add("block", "fiabilite", "placeholders", `${ph.length} élément(s) [à compléter]`, `${ph.slice(0, 3).join(" · ")}${ph.length > 3 ? "…" : ""} — complétez avec un fait réel ou supprimez le passage.`, { sec });
   }
-  const emp = mentionsEmployer(text, ctx.employerNames);
-  if (emp.length) add("warn", "fiabilite", "employer", `Employeur actuel cité (${emp.join(", ")})`, "Vous êtes en poste : vérifiez que c'est voulu avant diffusion.", { sec: findSec((h, i) => mentionsEmployer(o.sections[i].lines.join("\n"), ctx.employerNames).length > 0) });
+  /* Employeur actuel : réglage unique CV + lettre (employerNamed). Non nommé → toute mention bloque ; nommé → aucune alerte. */
+  const empNames = [...(ctx.employerNames || []), ...(ctx.employerNamed === false && !genericOrg(ctx.currentOrg) ? [ctx.currentOrg] : [])];
+  const emp = ctx.employerNamed === true ? [] : mentionsEmployer(text, empNames);
+  if (emp.length) add(ctx.employerNamed === false ? "block" : "warn", "fiabilite", "employer", `Employeur actuel cité (${emp.join(", ")})`, ctx.employerNamed === false ? "Cette candidature est réglée sur « employeur non nommé » : remplacez-le par une désignation générique." : "Vous êtes en poste : vérifiez que c'est voulu avant diffusion.", { sec: findSec((h, i) => mentionsEmployer(o.sections[i].lines.join("\n"), empNames).length > 0), autoFix: ctx.employerNamed === false });
 
   /* Clichés et affirmations non prouvées */
   const hits = (list) => (list[lang] || list.fr).filter((c) => kwCount(allHay, { term: c, variants: [] }) > 0);
@@ -1907,6 +1910,69 @@ function withRules(prompt, p) {
   const i = prompt.lastIndexOf("Réponds uniquement");
   return i < 0 ? `${prompt}\n\n${block}` : `${prompt.slice(0, i)}${block}\n\n${prompt.slice(i)}`;
 }
+/* ── Fiches entreprise (companyBriefs) : faits sourcés, valables 60 jours. Un fait sans URL vérifiée est exclu. ── */
+const BRIEF_TTL_DAYS = 60;
+const briefKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
+const briefFresh = (b) => !!b && !!b.expiresAt && new Date(b.expiresAt).getTime() > Date.now();
+const isHttp = (u) => /^https?:\/\/[^\s/]+\.[^\s]+/i.test(String(u || "").trim());
+/* verifiedUrls : URL réellement vues dans les résultats de recherche (null = URL fournie par l'utilisateur ou vérifiée par la Routine). */
+function makeBrief({ company, summary, facts, origin, verifiedUrls = null, createdAt }) {
+  const seen = (u) => verifiedUrls === null || verifiedUrls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+  const list = (Array.isArray(facts) ? facts : []).map((f) => ({ text: str(f?.text), url: str(f?.url || f?.sourceUrl) }))
+    .filter((f) => f.text && isHttp(f.url) && seen(f.url))
+    .slice(0, 12)
+    .map((f, i) => ({ id: `B${i + 1}`, text: f.text, url: f.url, verified: true, source: origin }));
+  const at = createdAt && !isNaN(new Date(createdAt)) ? new Date(createdAt) : new Date();
+  return { company: str(company) || "", summary: str(summary), facts: list, origin, createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + BRIEF_TTL_DAYS * 864e5).toISOString() };
+}
+function mergeBriefs(a, b) {
+  if (!a || !briefFresh(a)) return b;
+  const seen = new Set(a.facts.map((f) => normText(f.text)));
+  const facts = [...a.facts, ...b.facts.filter((f) => !seen.has(normText(f.text)))].slice(0, 16).map((f, i) => ({ ...f, id: `B${i + 1}` }));
+  return { ...b, summary: b.summary || a.summary, facts, origin: a.origin === b.origin ? b.origin : `${a.origin}+${b.origin}` };
+}
+
+/* ── Pourquoi cette candidature (app.motivation, facultatif) ── */
+const appMotivOf = (app) => ({ factIds: [], whyCompany: "", whyRole: "", personalLink: "", convictionId: null, storyId: null, employerNamed: true, ...(app?.motivation && typeof app.motivation === "object" ? app.motivation : {}) });
+/* Faits disponibles : annonce (avec son URL) + fiche entreprise à jour. Les faits sans URL sont exclus. */
+function companyFactsFor(app, offer, briefs) {
+  const out = [];
+  const adUrl = (offer?.sources || []).find((x) => isHttp(x.url))?.url;
+  if (!offer?.spontaneous && adUrl) (app?.analysis?.companyFacts || []).filter(Boolean).forEach((t, i) => out.push({ id: `A${i + 1}`, text: t, url: adUrl, source: "annonce" }));
+  const b = offer?.company ? briefs?.[briefKey(offer.company)] : null;
+  if (briefFresh(b)) b.facts.forEach((f) => out.push({ ...f }));
+  return out;
+}
+function selectedFacts(app, offer, briefs) {
+  const all = companyFactsFor(app, offer, briefs);
+  const ids = appMotivOf(app).factIds;
+  const sel = ids.length ? all.filter((f) => ids.includes(f.id)) : all;
+  return sel.length ? sel : all;
+}
+const genericOrg = (o) => !o || /^(une?|the|a|een)\s/i.test(o) || normText(o) === normText("Fédération patronale belge");
+function employerRule(app, profile) {
+  const org = profile?.experiences?.[0]?.org || "";
+  return appMotivOf(app).employerNamed
+    ? `Employeur actuel : nommé par son libellé exact (« ${org || "voir profil"} ») dans le CV ET dans la lettre.`
+    : "Employeur actuel : JAMAIS nommé, ni dans le CV ni dans la lettre ni dans les messages. Désigne-le de façon générique (« une fédération patronale belge »), y compris dans les lignes « ### Fonction | Organisation… ».";
+}
+/* Bloc « pourquoi cette candidature » : vide → [à compléter] (bloquant au contrôle). */
+function appMotivationBlock(app, offer, profile, facts) {
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const conv = bank.convictions.find((c) => c.id === m.convictionId);
+  const story = bank.stories.find((s) => s.id === m.storyId);
+  const company = offer?.spontaneous === "base" ? "l'entreprise" : show(offer?.company);
+  return [
+    "POURQUOI CETTE CANDIDATURE (choix du candidat pour cette cible)",
+    `Faits retenus sur ${company} : ${facts.length ? facts.map((f) => f.id).join(", ") : "aucun → [à compléter : un fait vérifiable sur l'entreprise, avec sa source]"}`,
+    `Pourquoi ${company} : ${m.whyCompany.trim() || (facts.length ? "non précisé : relie un fait retenu à une conviction" : "[à compléter : pourquoi cette entreprise]")}`,
+    `Pourquoi ce rôle, maintenant : ${m.whyRole.trim() || (bank.whyNow ? `non précisé pour cette cible ; s'appuyer sur « ${bank.whyNow} »` : "[à compléter : pourquoi ce rôle maintenant]")}`,
+    m.personalLink.trim() ? `Lien personnel avec l'entreprise : ${m.personalLink.trim()}` : "",
+    conv ? `Conviction à mettre en avant : [${conv.id}] ${conv.text}` : "Conviction : au choix dans la banque (la plus liée aux faits retenus).",
+    story ? `Histoire à raconter : [${story.id}] ${storyText(story)}` : "Histoire : au choix dans la banque (la plus proche des enjeux de l'entreprise).",
+  ].filter(Boolean).join("\n");
+}
 const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
 const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
 
@@ -1987,8 +2053,11 @@ function normalizeAnalysis(d, offer) {
 
 /* CV de référence pour la lettre : brouillon en cours, sinon dernière version enregistrée. */
 const latestCvText = (app) => app?.drafts?.cv?.text || app?.docs?.cv?.slice(-1)[0]?.text || "";
-const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords, cvText }) => ({
-  cvText: cvText || "", motivation: motivOf(profile), companyFacts: analysis?.companyFacts || [],
+const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords, cvText, app, briefs }) => ({
+  cvText: cvText || "", motivation: motivOf(profile),
+  companyFacts: app ? selectedFacts({ ...app, analysis: analysis || app.analysis }, offer, briefs).map((f) => f.text) : analysis?.companyFacts || [],
+  employerNamed: app ? appMotivOf(app).employerNamed : null,
+  currentOrg: profile?.experiences?.[0]?.org || "",
   lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
   jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
   company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
@@ -2096,7 +2165,7 @@ Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifia
 {"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
-  dossier(offer, profile, types, instruction, analysis) {
+  dossier(offer, profile, types, instruction, analysis, extra = {}) {
     const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
     const head = offer.spontaneous
       ? `${targetBlock(offer, analysis)}
@@ -2116,7 +2185,7 @@ PROFIL
 ${profileDigest(profile, true)}
 
 ${motivationBlock(profile)}
-
+${extra.facts?.length ? `\nFAITS SOURCÉS SUR L'ENTREPRISE (seuls autorisés)\n${extra.facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 DOCUMENTS DEMANDÉS : ${types.join(", ")}
 
 CONSIGNES
@@ -2124,7 +2193,7 @@ CONSIGNES
 - Ton naturel, précis, orienté résultats ; phrases courtes. Aucun cliché ni superlatif (« passionné », « dynamique », « force de proposition », « je me permets », « n'hésitez pas », « fort de », « motivé et rigoureux », « challenge »…).
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
 - Le candidat n'occupe PAS encore le poste visé : présente son poste actuel tel qu'il est, et le poste visé comme un objectif.
-- Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
+- ${extra.employer || "Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom."}
 - linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager : un fait propre à l'entreprise (annonce ou contexte) + une conviction ou une histoire du candidat. Pas de liste de compétences. Test de substitution : le message ne doit pas rester vrai pour un concurrent.
 - answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses. La réponse « Pourquoi nous / votre motivation » s'appuie sur les faits propres à l'entreprise et sur les MOTIVATIONS (conviction, pourquoi maintenant, une histoire), jamais sur un résumé du CV ; manque → [à compléter : …].
 - email : objet et corps courts (120 mots max) mentionnant CV et lettre en pièces jointes.
@@ -2203,7 +2272,7 @@ Réponds uniquement avec ce JSON :
 {"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
   },
 
-  cvWrite(offer, profile, a, prefs, instruction) {
+  cvWrite(offer, profile, a, prefs, instruction, extra = {}) {
     const lang = LANG_NAME[docLang(offer, prefs, a)] || "celle de l'annonce";
     const contact = profileContact(profile);
     const target = a?.jobTitle || offer.title;
@@ -2249,7 +2318,7 @@ MOTS-CLÉS ATS — exigence de couverture
 
 STYLE
 - Zéro cliché ni affirmation creuse (« passionné », « dynamique », « force de proposition », « orienté résultats », « rigoureux », « esprit d'équipe », « challenge »…) : montre-le par un fait.
-- Organisation actuelle : reprends exactement le libellé du profil (« ${profile.experiences?.[0]?.org || "…"} »).
+- ${extra.employer || `Organisation actuelle : reprends exactement le libellé du profil (« ${profile.experiences?.[0]?.org || "…"} »).`}
 - Longueur : ${prefs.cvLength === "1" ? "1 page (420 à 560 mots)" : "1 à 2 pages (600 à 850 mots)"}.
 ${instruction ? `- Consigne du candidat : ${instruction}` : ""}
 
@@ -2277,19 +2346,19 @@ Réponds uniquement avec ce JSON :
 {"cv":"<balisage>","accent":"#RRGGBB ou null","accentSource":"charte connue ou null","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
   },
 
-  letterWrite(offer, profile, a, prefs, instruction, cvText) {
+  letterWrite(offer, profile, a, prefs, instruction, cvText, extra = {}) {
     const code = docLang(offer, prefs, a) || "fr";
     const target = a?.jobTitle || offer.title;
     const city = String(profile.home || "").split(/[(,]/)[0].trim() || "[à compléter : ville]";
     const dateLine = code === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(code)}`;
-    return P.letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine });
+    return P.letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, ...extra });
   },
 
   /* Règle d'or : le CV prouve, la lettre explique. Lettre = pourquoi eux + pourquoi ce rôle maintenant + méthode + 1 preuve racontée. */
-  letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine }) {
+  letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, facts: factsIn, appBlock, employer }) {
     const tg = targetInfo(offer, a);
     const company = tg.base ? "[à compléter : entreprise]" : show(offer.company);
-    const facts = (a?.companyFacts || []).filter(Boolean);
+    const facts = factsIn || [];
     const kws = (a?.keywords || []).filter((k) => k.status !== "absent" && k.importance === 3).slice(0, 6).map((k) => `« ${k.term} »`);
     const subject = tg.spont ? `## Objet : candidature spontanée — ${target}` : `## Objet : candidature au poste de ${target}`;
     return `Mission : rédiger ${tg.base ? "une lettre de candidature spontanée MODÈLE, réutilisable (l'entreprise et ses faits restent à compléter)" : tg.spont ? "une lettre de candidature SPONTANÉE" : "la lettre de motivation"} pour ${tg.spont ? `un rôle de « ${target} »` : `le poste « ${target} »`}${tg.base ? "" : ` chez ${company}`}, prête à envoyer après relecture.
@@ -2299,8 +2368,10 @@ TEST DE SUBSTITUTION : relis chaque phrase en remplaçant ${tg.base ? "l'entrepr
 
 ${targetBlock(offer, a)}
 
-CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (seules sources autorisées sur l'entreprise ; numérote-les F1, F2… dans « used »)
-${facts.length ? facts.map((f, i) => `F${i + 1}. ${f}`).join("\n") : tg.spont && !tg.base && adTextOf(offer) ? `F1. ${adTextOf(offer).slice(0, 1200)}` : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
+CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (faits sourcés, seules informations autorisées sur l'entreprise ; cite leurs identifiants dans « used »)
+${facts.length ? facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n") : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
+
+${appBlock || ""}
 
 ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (repères, pas une liste à recopier)
 ${analysisDigest(a, offer)}
@@ -2332,7 +2403,7 @@ CONTRAINTES
 - 2 à 4 mots-clés de l'annonce au plus, seulement s'ils viennent naturellement${kws.length ? ` (parmi : ${kws.join(", ")})` : ""}. Aucune énumération de compétences.
 - Jamais deux phrases consécutives commençant par « Je » (« Ik », « I »).
 - Intitulé exact « ${target} » dans l'objet ; ${tg.base ? "entreprise laissée en [à compléter]" : `${company} citée au moins une fois`}.
-- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom.
+- ${employer || "Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom."}
 - Motivation, conviction ou histoire absentes des MOTIVATIONS : écris [à compléter : …], n'invente rien. Aucun fait inventé, aucun cliché.
 ${instruction ? `- Consigne du candidat : ${instruction}` : ""}
 
@@ -2346,10 +2417,29 @@ ${subject}
 paragraphes séparés par une ligne vide
 ~ Prénom Nom
 
-« used » décrit honnêtement ce que la lettre utilise : faits entreprise (F1…), conviction (id [c…]), histoire (id [s…]), mots-clés de l'annonce, chiffres écrits, réalisation commune avec le CV (texte ou null).
+« used » décrit honnêtement ce que la lettre utilise : faits entreprise (A1, B1…), conviction (id [c…]), histoire (id [s…]), mots-clés de l'annonce, chiffres écrits, réalisation commune avec le CV (texte ou null).
 
 Réponds uniquement avec ce JSON :
-{"letter":"<balisage>","used":{"companyFacts":["F1"],"convictionId":null,"storyId":null,"keywords":[],"numbers":[],"sharedWithCv":null}}`;
+{"letter":"<balisage>","used":{"companyFacts":["A1"],"convictionId":null,"storyId":null,"keywords":[],"numbers":[],"sharedWithCv":null}}`;
+  },
+
+  companyBrief(company, context) {
+    return `Date du jour : ${todayStr()}.
+Mission : établir une fiche factuelle sur l'entreprise « ${company} » (Belgique de préférence), pour aider un candidat à expliquer « pourquoi cette entreprise ».
+${context ? `Contexte : ${context}` : ""}
+Utilise web_search avec le NOM DE L'ENTREPRISE uniquement (jamais le nom d'une personne). Cherche : activité et modèle, taille et implantation, organisation, stratégie et projets digitaux ou de transformation, actualité des 12 derniers mois, engagements ou valeurs affichés publiquement.
+Règles : 5 à 10 faits, une phrase factuelle chacun, chacun avec l'URL EXACTE du résultat qui le montre. Pas de flatterie, pas d'interprétation, pas de fait sans URL. Information introuvable → ne la mentionne pas.
+Réponds uniquement {"summary":"2 phrases factuelles","facts":[{"text":"","url":""}]}`;
+  },
+
+  briefFromText(company, url, text) {
+    return `Mission : extraire de la source ci-dessous les faits utiles sur l'entreprise « ${company} », pour expliquer « pourquoi cette entreprise » dans une candidature.
+SOURCE (${url})
+<<<
+${String(text || "").slice(0, 15000)}
+>>>
+Règles : uniquement ce que dit la source, une phrase factuelle par fait, 3 à 8 faits, aucune interprétation ni flatterie.
+Réponds uniquement {"summary":"1 phrase","facts":[{"text":""}]}`;
   },
 
   motivationDraft(answers, current) {
@@ -2539,7 +2629,7 @@ Consignes : langue ${LANG_NAME[offerLang(offer)]} ; 90 mots maximum ; courtois e
 Réponds uniquement {"subject":"","body":""}.`;
   },
 
-  prep(offer, profile) {
+  prep(offer, profile, extra = {}) {
     return `Date du jour : ${todayStr()}.
 Mission : préparer un entretien pour le poste « ${offer.title} » chez « ${show(offer.company)} ».
 Annonce : ${show(offer.description)}
@@ -2548,7 +2638,7 @@ PROFIL
 ${profileDigest(profile, true)}
 
 ${motivationBlock(profile)}
-
+${extra.facts?.length ? `\nFICHE ENTREPRISE DÉJÀ VÉRIFIÉE (réutilise ces faits avec leur URL ; ne les recherche pas à nouveau, complète seulement l'actualité récente)\n${extra.facts.map((f) => `- ${f.text} (${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 1. Utilise web_search pour documenter l'entreprise (activité, taille, organisation, actualité des 12 derniers mois, culture, avis publics). Chaque fait doit citer l'URL de sa source. Si une information n'est pas trouvée, ne la mentionne pas.
 2. Questions probables pour ce poste, avec l'angle attendu.
 3. Exemples STAR construits UNIQUEMENT à partir du profil et de la banque d'histoires (priorité aux histoires) ; si un élément manque, écris [à compléter]. Inclure la réponse à « Pourquoi nous ? » à partir des faits trouvés et des motivations du candidat.
@@ -3242,6 +3332,7 @@ export default function RadarApp() {
   const [apps, setApps] = useState([]);
   const [contacts, setContacts] = useState([]);
   const [ratings, setRatings] = useState({});
+  const [briefs, setBriefs] = useState({});
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -3276,7 +3367,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, briefs };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -3382,6 +3473,7 @@ export default function RadarApp() {
             });
           }
           if (out.ratings) setRatings(out.ratings);
+          if (out.briefs) setBriefs(out.briefs);
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -3416,6 +3508,7 @@ export default function RadarApp() {
   usePersist(KEYS.apps, apps, persistOn, setSaveState);
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
+  usePersist(KEYS.briefs, briefs, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -3882,6 +3975,43 @@ export default function RadarApp() {
     setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
   };
 
+  /* ── Fiches entreprise (pourquoi eux) : web_search (API), Routine (page publiée) ou source collée. ── */
+  const requestBrief = (company, context) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name || /confidenti|non communiqu|anonyme|\[à compléter/i.test(name)) throw new Error("Entreprise non identifiée.");
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La recherche passe par la veille planifiée, qui n'est pas reliée à cette page. Ajoutez une source à la main.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « fiche entreprise » uniquement : ${JSON.stringify({ task: "brief", companies: [name] })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      toast(`Fiche demandée pour ${name} : elle s'affichera d'ici quelques minutes.`, "ok");
+      return null;
+    }
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.companyBrief(name, context), web: { maxUses: 6 }, maxTokens: 5000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: res.data?.facts, origin: "web", verifiedUrls: res.urls });
+    const dropped = (res.data?.facts || []).length - b.facts.length;
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) sourcé(s) sur ${name}${dropped > 0 ? ` · ${dropped} écarté(s) faute d'URL vérifiée` : ""}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const addManualBrief = (company, url, text) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name) throw new Error("Entreprise non identifiée.");
+    if (!isHttp(url)) throw new Error("Indiquez l'URL de la source : un fait sans source vérifiable est exclu.");
+    if (String(text || "").trim().length < 80) throw new Error("Collez le texte de la source (au moins quelques phrases).");
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.briefFromText(name, url, text), maxTokens: 3000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: (res.data?.facts || []).map((f) => ({ text: f?.text, url })), origin: "manuel" });
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) ajouté(s) à la fiche ${name}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const removeBriefFact = (company, factId) => setBriefs((cur) => {
+    const k = briefKey(company);
+    if (!cur[k]) return cur;
+    return { ...cur, [k]: { ...cur[k], facts: cur[k].facts.filter((f) => f.id !== factId) } };
+  });
+  const setAppMotivation = (appId, patch) => patchApp(appId, (a) => ({ ...a, motivation: { ...appMotivOf(a), ...patch } }));
+
   /* ── Notes employeur (avis publics type Glassdoor) ───────────────── */
   const requestRatings = (companies) => withBusy("ratings", async () => {
     const list = [...new Set((companies || []).map((c) => str(c)).filter(Boolean))].filter((c) => !/confidenti|non communiqu|anonyme/i.test(c)).slice(0, 25);
@@ -3984,6 +4114,27 @@ export default function RadarApp() {
     }, 4000);
     return () => clearTimeout(t);
   }, [loaded, verifyQueue.sig, settings.autoVerify]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* File des fiches entreprise lue par la Routine : entreprises des candidatures actives sans fiche à jour (5 au plus). */
+  const briefQueue = useMemo(() => {
+    const names = [];
+    apps.filter((a) => !a.demo && a.kind !== "base" && a.stage !== "closed").forEach((a) => {
+      const o = offers.find((x) => x.id === a.offerId);
+      const c = str(o?.company);
+      if (c && !briefFresh(briefs[briefKey(c)]) && !names.some((n) => briefKey(n) === briefKey(c))) names.push(c);
+    });
+    const items = names.slice(0, 5);
+    return { items, sig: items.map(briefKey).join(",") };
+  }, [apps, offers, briefs]);
+  const briefSig = useRef(null);
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db || storageState.readOnly || briefSig.current === briefQueue.sig) return undefined;
+    const t = setTimeout(() => {
+      briefSig.current = briefQueue.sig;
+      RT.db.doc("veille/brief_queue").set({ companies: briefQueue.items, updatedAt: nowISO() }).catch(() => {});
+    }, 4500);
+    return () => clearTimeout(t);
+  }, [loaded, briefQueue.sig]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Tri rapide des offres ──────────────────────────────────────── */
   const nextOfferId = (id) => {
@@ -4210,7 +4361,10 @@ export default function RadarApp() {
       const failed = [];
       const got = {};
       const drafts = {};
-      const qaCtx = (extra) => lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p, ...extra });
+      const appNow = R.current.apps.find((a) => a.id === appId) || app;
+      const facts = selectedFacts(appNow, offer, R.current.briefs);
+      const extra = { facts, appBlock: appMotivationBlock(appNow, offer, p, facts), employer: employerRule(appNow, p) };
+      const qaCtx = (x) => lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p, app: appNow, briefs: R.current.briefs, ...x });
       /* Passe de correction ciblée après rédaction (points « autoFix » du contrôle qualité). */
       const autoFix = async (t, d, extra) => {
         d.autoFixed = 0;
@@ -4227,13 +4381,13 @@ export default function RadarApp() {
         } catch { /* passe facultative : le document reste utilisable */ }
       };
       const restJob = other.length
-        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
+        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis, extra), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
         : Promise.resolve();
       /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
       if (pro.includes("cv")) {
         setGen(appId, { step: 2, label: "Rédaction du CV…" });
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction), p), maxTokens: 9000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, extra), p), maxTokens: 9000 });
           const raw = r.data?.cv;
           if (typeof raw === "string" && raw.trim()) {
             const accent = cleanHex(r.data?.accent, null);
@@ -4247,7 +4401,7 @@ export default function RadarApp() {
         const cvText = drafts.cv?.text || app.drafts?.cv?.text || app.docs?.cv?.slice(-1)[0]?.text || "";
         setGen(appId, { step: 2, label: cvText ? "Rédaction de la lettre à partir du CV (sans le répéter)…" : "Rédaction de la lettre…" });
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText), p), maxTokens: 9000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText, extra), p), maxTokens: 9000 });
           const raw = r.data?.letter;
           if (typeof raw === "string" && raw.trim()) {
             drafts.letter = { text: normalizeDoc(raw, "letter", lang), accent: null, accentSource: null, tips: [], used: normalizeUsed(r.data?.used), cvText };
@@ -4293,7 +4447,8 @@ export default function RadarApp() {
     const { app, offer } = appAndOffer(appId);
     const analysis = app.analysis || null;
     const cvText = latestCvText(app);
-    const args = { cvText, ...payload, analysis, profile: p, offer };
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const args = { cvText, facts, employer: employerRule(app, p), appBlock: appMotivationBlock(app, offer, p, facts), ...payload, analysis, profile: p, offer };
     const prompt = { review: P.review, fix: P.fixDoc, section: P.improveSection, headlines: P.headlines }[action];
     if (!prompt) throw new Error("Action inconnue.");
     const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000 });
@@ -4369,9 +4524,16 @@ export default function RadarApp() {
     const { settings: s, profile: p, apps: A, offers: O } = R.current;
     const app = A.find((a) => a.id === appId);
     const offer = O.find((o) => o.id === app?.offerId);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p), p), web: { maxUses: 6 }, maxTokens: 14000 });
+    const brief = offer?.company ? R.current.briefs[briefKey(offer.company)] : null;
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p, { facts: briefFresh(brief) ? brief.facts : [], appBlock: appMotivationBlock(app, offer, p, facts) }), p), web: { maxUses: briefFresh(brief) ? 3 : 6 }, maxTokens: 14000 });
     const d = res.data || {};
-    const seen = (u) => !!u && res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+    const seen = (u) => !!u && (res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u)) || (briefFresh(brief) && brief.facts.some((f) => canonicalUrl(f.url) === canonicalUrl(u))));
+    /* Les faits vérifiés de la préparation enrichissent la fiche entreprise (réutilisée par la lettre). */
+    if (offer?.company) {
+      const nb = makeBrief({ company: offer.company, summary: d.company?.summary, facts: (d.company?.facts || []).map((f) => ({ text: f?.text, url: f?.sourceUrl })), origin: "prep", verifiedUrls: [...res.urls, ...(briefFresh(brief) ? brief.facts.map((f) => f.url) : [])] });
+      if (nb.facts.length) setBriefs((cur) => ({ ...cur, [briefKey(offer.company)]: mergeBriefs(cur[briefKey(offer.company)], nb) }));
+    }
     const prep = {
       createdAt: nowISO(),
       summary: str(d.company?.summary),
@@ -4445,7 +4607,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -4455,6 +4617,7 @@ export default function RadarApp() {
     setOffers(obj.offers || []);
     setApps(obj.apps || []);
     setContacts(obj.contacts || []);
+    if (obj.briefs && typeof obj.briefs === "object") setBriefs(obj.briefs);
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -4468,6 +4631,7 @@ export default function RadarApp() {
     setOffers([]);
     setApps([]);
     setContacts([]);
+    setBriefs({});
     setTodayAI(null);
     toast("Plateforme réinitialisée", "ok");
   };
@@ -4530,6 +4694,21 @@ export default function RadarApp() {
       subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
       subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
       subs.push(RT.db.collection("veille_verify").onSnapshot((snap) => snap.docs.forEach(ingestVerify), quiet));
+      /* Fiches entreprise déposées par la Routine (tâche « brief ») : seuls les faits avec URL sont repris. */
+      subs.push(RT.db.collection("veille_briefs").onSnapshot((snap) => {
+        setBriefs((cur) => {
+          let changed = false;
+          const next = { ...cur };
+          snap.docs.forEach((d) => {
+            const r = d.data() || {};
+            const key = briefKey(r.company || d.id);
+            if (!key || (cur[key] && cur[key].routineAt === r.createdAt)) return;
+            next[key] = { ...mergeBriefs(cur[key], makeBrief({ company: r.company || d.id, summary: r.summary, facts: r.facts, origin: "routine", createdAt: r.createdAt })), routineAt: r.createdAt };
+            changed = true;
+          });
+          return changed ? next : cur;
+        });
+      }, quiet));
       subs.push(RT.db.collection("veille_ratings").onSnapshot((snap) => {
         setRatings((cur) => {
           let changed = false;
@@ -4587,7 +4766,7 @@ export default function RadarApp() {
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
-    ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
+    ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
     bulkAction, lastBulk, setLastBulk, undoBulk, runRules, dedupeNow, requestVerify, dupePending,
     openDupePending: () => dupePending && setDupeProposals(dupePending), visitPrev, unreadCount,
   };
@@ -7236,6 +7415,96 @@ function GenSteps({ st }) {
   );
 }
 
+/* ── Pourquoi cette candidature : faits sourcés, pourquoi eux / ce rôle, conviction et histoire, employeur nommé ou non ── */
+function AppMotivationCard({ app, offer, types }) {
+  const T = useT();
+  const { profile, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, busy, go } = useApp();
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const set = (patch) => setAppMotivation(app.id, patch);
+  const company = offer?.spontaneous === "base" ? null : str(offer?.company);
+  const brief = company ? briefs[briefKey(company)] : null;
+  const facts = companyFactsFor(app, offer, briefs);
+  const chosen = m.factIds.length ? facts.filter((f) => m.factIds.includes(f.id)) : facts;
+  const [src, setSrc] = useState({ open: false, url: "", text: "" });
+  const bKey = company ? `brief:${briefKey(company)}` : "";
+  const writesLetter = types.some((t) => t !== "cv");
+  const toggleFact = (id) => {
+    const base = m.factIds.length ? m.factIds : facts.map((f) => f.id);
+    set({ factIds: base.includes(id) ? base.filter((x) => x !== id) : [...base, id] });
+  };
+  const missing = [
+    company && !chosen.length && "aucun fait sourcé sur l'entreprise",
+    !m.whyRole.trim() && !bank.whyNow.trim() && "pourquoi ce rôle maintenant",
+    !bank.convictions.length && "aucune conviction dans vos Motivations",
+    !bank.stories.length && "banque d'histoires vide",
+  ].filter(Boolean);
+  return (
+    <Card className="p-6 space-y-4 lg:col-span-3">
+      <div>
+        <div className="text-lg font-medium tracking-tight">Pourquoi cette candidature</div>
+        <p className={`text-sm mt-1 ${T.muted}`}>Le CV prouve, la lettre explique. Ces choix nourrissent la lettre{offer?.spontaneous ? "" : ", le message LinkedIn et la réponse « Pourquoi nous ? »"} ; jamais le CV. Laissé vide, un passage s'écrit [à compléter] et bloque l'envoi.</p>
+      </div>
+
+      <Toggle checked={m.employerNamed} onChange={(v) => set({ employerNamed: v })} label="Nommer mon employeur actuel (CV et lettre)" description={m.employerNamed ? `Le CV et la lettre citent « ${profile.experiences?.[0]?.org || "votre employeur"} ».` : "Ni le CV ni la lettre ne le nomment : « une fédération patronale belge ». Toute mention est bloquée au contrôle."} />
+
+      {writesLetter && (
+        <>
+          {company && (
+            <FieldBox label={`Faits sourcés sur ${company}`} hint={brief ? `Fiche ${briefFresh(brief) ? `valable jusqu'au ${fmtDate(brief.expiresAt)}` : "expirée (plus de 60 jours)"} · origine : ${brief.origin}. Un fait sans URL vérifiée est exclu.` : "Faits de l'annonce et de la fiche entreprise. Un fait sans URL vérifiée est exclu."}>
+              {facts.length ? (
+                <ul className="space-y-1.5">
+                  {facts.map((f) => (
+                    <li key={f.id} className="flex gap-2 items-start text-sm">
+                      <input type="checkbox" className="mt-1" checked={!m.factIds.length || m.factIds.includes(f.id)} onChange={() => toggleFact(f.id)} aria-label={`Retenir ${f.id}`} />
+                      <span className="flex-1 min-w-0">{f.text} <ExtLink href={f.url} className="text-xs">{f.source === "annonce" ? "annonce" : hostOf(f.url)}</ExtLink></span>
+                      {f.source !== "annonce" && <IconBtn icon={X} label="Retirer de la fiche" onClick={() => removeBriefFact(company, f.id)} className="w-7 h-7" />}
+                    </li>
+                  ))}
+                </ul>
+              ) : <p className={`text-sm ${T.faint}`}>Aucun fait sourcé pour l'instant.</p>}
+              <div className="flex flex-wrap gap-2 mt-3">
+                <Btn size="sm" icon={Search} loading={!!busy[bKey]} onClick={() => requestBrief(company, offer?.title ? `poste visé : ${offer.title}` : "")}>{brief ? "Actualiser la fiche" : "Rechercher des faits"}</Btn>
+                <Btn size="sm" variant="ghost" icon={Plus} onClick={() => setSrc((x) => ({ ...x, open: !x.open }))}>Coller une source</Btn>
+              </div>
+              {src.open && (
+                <div className={`rounded-2xl p-3 mt-2 space-y-2 ${T.sub}`}>
+                  <Input value={src.url} onChange={(e) => setSrc({ ...src, url: e.target.value })} placeholder="URL de la source (obligatoire)" aria-label="URL de la source" />
+                  <Textarea rows={5} value={src.text} onChange={(e) => setSrc({ ...src, text: e.target.value })} placeholder="Collez le texte : page « À propos », rapport annuel, article, post LinkedIn de l'entreprise…" aria-label="Texte de la source" />
+                  <Btn size="sm" variant="primary" icon={Wand2} loading={!!busy[bKey]} disabled={!isHttp(src.url) || src.text.trim().length < 80} onClick={async () => { const r = await addManualBrief(company, src.url.trim(), src.text); if (r) setSrc({ open: false, url: "", text: "" }); }}>Extraire les faits</Btn>
+                </div>
+              )}
+            </FieldBox>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {company && <Field label={`Pourquoi ${company} ?`} hint="Votre lien réel avec un fait retenu."><Textarea rows={3} value={m.whyCompany} onChange={(e) => set({ whyCompany: e.target.value })} /></Field>}
+            <Field label="Pourquoi ce rôle, maintenant ?" hint={bank.whyNow ? `Par défaut : « ${bank.whyNow.slice(0, 80)}${bank.whyNow.length > 80 ? "…" : ""} »` : "Rien dans vos Motivations."}><Textarea rows={3} value={m.whyRole} onChange={(e) => set({ whyRole: e.target.value })} /></Field>
+            {company && <Field label="Lien personnel (facultatif)" hint="Client, utilisateur, rencontre, secteur…"><Textarea rows={2} value={m.personalLink} onChange={(e) => set({ personalLink: e.target.value })} /></Field>}
+            <Field label="Conviction à mettre en avant">
+              <Select value={m.convictionId || ""} onChange={(e) => set({ convictionId: e.target.value || null })} className="w-full">
+                <option value="">{bank.convictions.length ? "Au choix de l'IA" : "Aucune conviction renseignée"}</option>
+                {bank.convictions.map((c) => <option key={c.id} value={c.id}>{c.id} · {c.text.slice(0, 70)}</option>)}
+              </Select>
+            </Field>
+            <Field label="Histoire à raconter">
+              <Select value={m.storyId || ""} onChange={(e) => set({ storyId: e.target.value || null })} className="w-full">
+                <option value="">{bank.stories.length ? "Au choix de l'IA" : "Banque d'histoires vide"}</option>
+                {bank.stories.map((x) => <option key={x.id} value={x.id}>{x.id} · {x.title || x.situation.slice(0, 60)}</option>)}
+              </Select>
+            </Field>
+          </div>
+          {missing.length > 0 && (
+            <Notice tone="warn" icon={AlertTriangle}>
+              Manquant : {missing.join(" · ")}. La lettre écrira [à compléter] à ces endroits.{" "}
+              {(!bank.convictions.length || !bank.stories.length) && <button type="button" className="underline underline-offset-4" onClick={() => go("profile")}>Compléter mes Motivations</button>}
+            </Notice>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
 function StudioSetup({ app, offer, type, onDone, onCancel }) {
   const T = useT();
   const { generateDocs, busy, genStatus, setOfferAdText, patchOfferNow, profile, go } = useApp();
@@ -7292,6 +7561,7 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
           <div className={`text-xs ${T.faint}`}>{ad.length} caractères{offer?.sources?.[0]?.url ? <> · <ExtLink href={offer.sources[0].url}>ouvrir l'annonce</ExtLink></> : null}</div>
         </Card>
         )}
+        <AppMotivationCard app={app} offer={offer} types={types} />
         <div className="lg:col-span-2 space-y-4">
           <Card className="p-6 space-y-4">
             <div className="text-lg font-medium tracking-tight">Réglages</div>
@@ -7408,7 +7678,7 @@ function DocStudio({ appId, type, setType, onClose }) {
 
 function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
   const T = useT();
-  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus } = useApp();
+  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs } = useApp();
   const wide = useMedia("(min-width: 1024px)");
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
@@ -7510,8 +7780,8 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 
   /* Contrôle qualité en direct */
   const report = useMemo(
-    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "" })),
-    [text, type, pages, app.analysis, prefs.voice, profile.headline, profile.motivation, lang, type === "letter" ? latestCvText(app) : ""], // eslint-disable-line react-hooks/exhaustive-deps
+    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })),
+    [text, type, pages, app.analysis, app.motivation, briefs, prefs.voice, profile.headline, profile.motivation, lang, type === "letter" ? latestCvText(app) : ""], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const missing = report.kw.filter((k) => k.status !== "absent" && !k.found);
 
@@ -7772,7 +8042,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 /* Carte de document dans la fiche candidature : vignette, score, accès au studio. */
 function StudioDocCard({ app, offer, type }) {
   const T = useT();
-  const { openStudio, settings, profile, genStatus } = useApp();
+  const { openStudio, settings, profile, genStatus, briefs } = useApp();
   const versions = app.docs?.[type] || [];
   const v = versions[versions.length - 1];
   const draft = app.drafts?.[type];
@@ -7780,7 +8050,7 @@ function StudioDocCard({ app, offer, type }) {
   const text = useDraft ? draft.text : v?.text;
   const lang = v?.language || app.docLanguage || offer?.language || "fr";
   const rep = useMemo(
-    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "" })) : null),
+    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })) : null),
     [text, app.analysis, type], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const z = 0.15;

@@ -74,6 +74,10 @@ L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots
 
 **Règles d'écriture** (Profil & critères → *Règles d'écriture*, champ facultatif `profile.writingRules`) : injectées dans toutes les rédactions (CV, lettre, messages, corrections, relecture, réécriture de section, lignes de positionnement, relances, préparation d'entretien), prioritaires sur les consignes de style, jamais sur la vérité. Règles de départ à valider : généraliste de la transformation digitale (jamais « responsable CRM »), trilinguisme dans le Profil, master discret, preuves prioritaires, ton humble.
 
+**Pourquoi cette candidature** (carte du studio, avant génération ; champ facultatif `app.motivation`) : faits retenus (`factIds`), pourquoi eux (`whyCompany`), pourquoi ce rôle maintenant (`whyRole`), lien personnel, conviction et histoire choisies dans la banque, et **`employerNamed`** : réglage unique pour le CV et la lettre (nommé par son libellé exact, ou jamais nommé ; dans ce cas toute mention est bloquée au contrôle). Un choix vide s'écrit [à compléter] dans la lettre, ce qui bloque l'envoi.
+
+**Fiches entreprise** (`companyBriefs`, clé `radar:briefs`, une fiche par entreprise, valable **60 jours**) : faits d'une phrase, chacun avec son URL. Trois sources : `web_search` dans l'artefact (`companyBrief` ; un fait dont l'URL n'apparaît pas dans les résultats est écarté), la Routine dans la page publiée (tâche `{"task":"brief"}` à la demande, et file `veille/brief_queue` des candidatures actives à chaque passage → collection `veille_briefs`, même modèle que les notes employeur), ou une source collée avec son URL obligatoire (`briefFromText`). Les faits de l'annonce sont repris avec l'URL de l'annonce. **Un fait sans URL vérifiée est exclu.** La lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien utilisent la fiche ; la préparation réutilise ses faits et l'enrichit de ses propres faits vérifiés. La Routine cherche avec le nom de l'entreprise, jamais celui du candidat.
+
 **Routine** : le prompt de la Routine « Radar – veille emploi » est versionné dans [`routines/radar-veille-emploi.md`](routines/radar-veille-emploi.md).
 
 ### Modèle de données (`window.storage`, une clé par collection)
@@ -93,6 +97,8 @@ radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, r
                    drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
+radar:briefs    { <entreprise-normalisée>: { company, summary, facts[{id,text,url,verified,source}], origin, createdAt, expiresAt } }
+app.motivation? { factIds[], whyCompany, whyRole, personalLink, convictionId, storyId, employerNamed }
 ```
 
 Les champs inconnus valent `null` et s'affichent « non communiqué ».
@@ -109,6 +115,7 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
 | `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
 | `cvWrite`, puis `letterWrite` → `letterCore` (CV en entrée, offre ou spontanée) | aucun | `{cv, accent, accentSource, tips}` ; `{letter, used{companyFacts, convictionId, storyId, keywords, numbers, sharedWithCv}}` |
+| `companyBrief` / `briefFromText` | `web_search` / aucun | `{summary, facts[{text, url}]}` |
 | `motivationDraft` | aucun | `{purpose, convictions[], stories[], management, method, whyNow, lookingFor, sectors[], followUps[]}` |
 | `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
 | `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
