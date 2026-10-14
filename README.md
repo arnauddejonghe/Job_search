@@ -61,14 +61,39 @@ L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots
 **Génération en trois étapes**
 
 1. **Analyse de l'annonce** (`adAnalysis`), sur le texte complet collé ou importé (`offer.fullText`, à défaut le résumé) : intitulé exact et équivalents, 20 à 35 mots-clés ATS classés (catégorie, importance 1-3, variantes) et confrontés au profil (prouvé, transférable, absent, avec la preuve), exigences clés, angle de l'employeur, ligne de positionnement proposée, écarts. Mise en cache tant que l'annonce et le profil ne changent pas.
-2. **Rédaction** du CV et de la lettre en parallèle (`cvWrite`, `letterWrite`) à partir de cette matrice : sous le nom, la fonction **réelle** et 2-3 expertises (jamais l'intitulé visé comme s'il était occupé) ; profil en trois temps (qui je suis aujourd'hui, preuves, le poste visé cité comme **objectif**) ; poste actuel au présent, postes passés au passé ; chaque mot-clé prouvé ou transférable d'importance 2-3 placé dans une phrase où il est démontré, pas seulement dans une liste ; aucun mot-clé « absent ».
-3. **Contrôle qualité** local puis **corrections ciblées** (`fixDoc`) sur les points détectés : remplacements courts dont le texte d'origine doit exister à l'identique, sinon ignorés.
+2. **Rédaction du CV** (`cvWrite`) à partir de cette matrice : sous le nom, la fonction **réelle** et 2-3 expertises (jamais l'intitulé visé comme s'il était occupé) ; profil en trois temps (qui je suis aujourd'hui, preuves, le poste visé cité comme **objectif**) ; poste actuel au présent, postes passés au passé ; chaque mot-clé prouvé ou transférable d'importance 2-3 placé dans une phrase où il est démontré ; aucun mot-clé « absent ». Contrôle qualité et corrections ciblées.
+3. **Rédaction de la lettre ensuite, avec le CV en entrée** (`letterCore`) : voir « Lettre ≠ CV » ci-dessous. Contrôle qualité et corrections ciblées (`fixDoc`) : remplacements courts dont le texte d'origine doit exister à l'identique, sinon ignorés.
+
+**Lettre ≠ CV** — règle d'or : le CV prouve, la lettre explique.
+
+- **Trame** (250 à 320 mots ; 220 à 300 en spontanée) : appel · pourquoi vous (un fait propre à l'entreprise relié à une conviction) · pourquoi ce rôle, maintenant · une preuve **racontée** (une histoire de la banque) · méthode · demande d'échange. Au plus 2 chiffres, au plus 1 réalisation commune avec le CV (reformulée), 2 à 4 mots-clés, jamais deux phrases consécutives en « Je ». Test de substitution : toute phrase encore vraie pour un concurrent est réécrite. La sortie `used{}` (faits F1…, conviction, histoire, mots-clés, chiffres, réalisation commune) est conservée sur la version.
+- **Contrôle sans IA** : recouvrement de 4-grammes avec le CV (alerte > 15 %, blocage > 30 %), chiffres repris du CV (> 1 = alerte), plus de 2 chiffres, « pourquoi eux » absent ou non étayé, conviction absente, histoire absente, flatterie, enchaînements en « Je ». Plus de pénalité « lettre sans chiffre », plus d'injection de mots-clés dans la lettre.
+- **Score de la lettre** : spécificité 35 · complémentarité 25 · impact 20 · lisibilité 20. Deux jauges dans le studio : recouvrement avec le CV et spécificité. La relecture IA reçoit le CV et applique le test de substitution.
+
+**Motivations** (Profil & critères → *Motivations*, champ facultatif `profile.motivation`) : raison d'être, convictions, banque d'histoires, management, méthode, pourquoi maintenant, ce que vous cherchez, secteurs. **Entretien IA** de 10 questions (réponses conservées dans `profile.motivationAnswers`), puis `motivationDraft` range les réponses en **reformulant seulement** (tout chiffre absent des réponses est signalé) et propose 0 à 3 relances. Injecté dans la lettre, les messages (`dossier`), la réponse « Pourquoi nous ? » et la préparation d'entretien. **Jamais dans le CV.**
+
+**Règles d'écriture** (Profil & critères → *Règles d'écriture*, champ facultatif `profile.writingRules`) : injectées dans toutes les rédactions (CV, lettre, messages, corrections, relecture, réécriture de section, lignes de positionnement, relances, préparation d'entretien), prioritaires sur les consignes de style, jamais sur la vérité. Règles de départ à valider : généraliste de la transformation digitale (jamais « responsable CRM »), trilinguisme dans le Profil, master discret, preuves prioritaires, ton humble.
+
+**Pourquoi cette candidature** (carte du studio, avant génération ; champ facultatif `app.motivation`) : faits retenus (`factIds`), pourquoi eux (`whyCompany`), pourquoi ce rôle maintenant (`whyRole`), lien personnel, conviction et histoire choisies dans la banque, et **`employerNamed`** : réglage unique pour le CV et la lettre (nommé par son libellé exact, ou jamais nommé ; dans ce cas toute mention est bloquée au contrôle). Un choix vide s'écrit [à compléter] dans la lettre, ce qui bloque l'envoi.
+
+**Fiches entreprise** (`companyBriefs`, clé `radar:briefs`, une fiche par entreprise, valable **60 jours**) : faits d'une phrase, chacun avec son URL. Trois sources : `web_search` dans l'artefact (`companyBrief` ; un fait dont l'URL n'apparaît pas dans les résultats est écarté), la Routine dans la page publiée (tâche `{"task":"brief"}` à la demande, et file `veille/brief_queue` des candidatures actives à chaque passage → collection `veille_briefs`, même modèle que les notes employeur), ou une source collée avec son URL obligatoire (`briefFromText`). Les faits de l'annonce sont repris avec l'URL de l'annonce. **Un fait sans URL vérifiée est exclu.** La lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien utilisent la fiche ; la préparation réutilise ses faits et l'enrichit de ses propres faits vérifiés. La Routine cherche avec le nom de l'entreprise, jamais celui du candidat.
+
+**Apprentissage des corrections (6b)** : à chaque version enregistrée à la main, l'écart mot à mot avec la dernière version IA (`editDelta`, à partir de `wordDiff`) est mémorisé dans `profile.ruleLearning` (40 dernières corrections, hors données d'exemple). Après au moins 3 documents corrigés, *Règles d'écriture → Proposer des règles* (`learnRules`) propose 0 à 5 règles observées dans au moins 2 documents, avec leurs exemples. Elles arrivent **inactives** : une règle apprise n'est jamais activée seule.
+
+**CV maître par langue (6c)** et **puces verrouillées (6d)** : studio → panneau d'optimisation → onglet *Maître*. Le CV maître (`profile.masterCv.fr|nl|en`) sert de base : l'IA reçoit la consigne de ne modifier que la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences, et la page le **garantit** (`enforceMaster` : en-tête, postes, texte des puces, langues et formation repris du maître ; puces inventées écartées). Écarts avec le maître affichés en diff. Une puce verrouillée (`profile.lockedBullets`) est recopiée mot pour mot : restaurée si l'IA la reformule, et toute correction proposée qui la touche est écartée.
+
+**Mesures (7)** : carte *Mesures des dossiers* dans l'Assistant : date de génération, corrections manuelles du CV et de la lettre (part des mots modifiés, doit baisser ; tendance première moitié → seconde moitié), recouvrement lettre / CV, nombre de chiffres, ce que la lettre utilise (`used` : faits, conviction, histoire), étape atteinte.
+
+**Routine** : le prompt de la Routine « Radar – veille emploi » est versionné dans [`routines/radar-veille-emploi.md`](routines/radar-veille-emploi.md).
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
 ```
 radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, lastWatchAt, … }
-radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText }
+radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText,
+                  motivation?{purpose, convictions[{id,text}], stories[{id,title,situation,action,result,lesson}], management, method, whyNow, lookingFor, sectors[]},
+                  motivationAnswers?{q1…}, writingRules?[{id,text,active,origin,evidence}], ruleLearning?{edits[], lastLearnAt},
+                  masterCv?{fr|nl|en: {text, at, sourceAppId}}, lockedBullets?[] }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
 radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, publishedApprox, deadline,
@@ -79,6 +104,8 @@ radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, r
                    drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
+radar:briefs    { <entreprise-normalisée>: { company, summary, facts[{id,text,url,verified,source}], origin, createdAt, expiresAt } }
+app.motivation? { factIds[], whyCompany, whyRole, personalLink, convictionId, storyId, employerNamed }
 ```
 
 Les champs inconnus valent `null` et s'affichent « non communiqué ».
@@ -94,7 +121,10 @@ Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si 
 | `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
 | `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
 | `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
-| `cvWrite`, `letterWrite` / `letterSpontaneous` | aucun | `{cv, accent, accentSource, tips}` ; `{letter}` (balisage léger) |
+| `cvWrite`, puis `letterWrite` → `letterCore` (CV en entrée, offre ou spontanée) | aucun | `{cv, accent, accentSource, tips}` ; `{letter, used{companyFacts, convictionId, storyId, keywords, numbers, sharedWithCv}}` |
+| `companyBrief` / `briefFromText` | `web_search` / aucun | `{summary, facts[{text, url}]}` |
+| `learnRules` | aucun | `{rules[{text, evidence, docs}]}` |
+| `motivationDraft` | aucun | `{purpose, convictions[], stories[], management, method, whyNow, lookingFor, sectors[], followUps[]}` |
 | `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
 | `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
 | `dossier` | aucun | `{language, linkedin, answers, email}` |

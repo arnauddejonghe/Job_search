@@ -33,6 +33,7 @@ const KEYS = {
   apps: "radar:apps",
   contacts: "radar:contacts",
   ratings: "radar:ratings",
+  briefs: "radar:briefs",
 };
 
 const STAGES = [
@@ -857,6 +858,99 @@ function wordDiff(a, b) {
   return out;
 }
 
+/* ── 6b · Ce que vous corrigez à la main : écart mot à mot entre la version IA et votre version ── */
+function editDelta(base, edited) {
+  const rows = lineDiff(base || "", edited || "");
+  const wc = (s) => String(s || "").split(/\s+/).filter(Boolean).length;
+  let del = 0, add = 0;
+  const hunks = [];
+  for (const r of rows) {
+    if (r.t === "del") { del += wc(r.text); hunks.push({ del: r.text, add: "" }); }
+    else if (r.t === "add") { add += wc(r.text); hunks.push({ del: "", add: r.text }); }
+    else if (r.t === "chg") {
+      const d = r.segs.filter((x) => x.t === "del").map((x) => x.w).join(" … ");
+      const a = r.segs.filter((x) => x.t === "add").map((x) => x.w).join(" … ");
+      del += wc(d); add += wc(a);
+      if (d || a) hunks.push({ del: d, add: a });
+    }
+  }
+  const total = wc(displayMarkup(base)) + wc(displayMarkup(edited));
+  return { pct: total ? Math.round(((del + add) / total) * 100) : 0, changed: del + add, hunks: hunks.slice(0, 20).map((h) => ({ del: h.del.slice(0, 220), add: h.add.slice(0, 220) })) };
+}
+const learningOf = (p) => (p?.ruleLearning && typeof p.ruleLearning === "object" ? p.ruleLearning : { edits: [], lastLearnAt: null });
+const pendingLearnDocs = (p) => {
+  const l = learningOf(p);
+  const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+  return new Set(l.edits.filter((e) => new Date(e.at).getTime() > since).map((e) => `${e.appId}:${e.type}`)).size;
+};
+
+/* ── 6c · CV maître par langue : seuls la ligne de positionnement, le Profil, les Réalisations, l'ordre des puces et les Compétences changent ── */
+const masterOf = (p, lang) => (p?.masterCv && p.masterCv[lang]?.text ? p.masterCv[lang] : null);
+const ADAPTABLE = ["profile", "achievements", "skills"];
+const secKindOf = (title) => Object.keys(SEC).find((k) => SEC[k].test(String(title || ""))) || null;
+const bulletKey = (s) => normText(String(s || "").replace(/^[-•*]\s*/, ""));
+const similar = (a, b) => { const A = tokens(a), B = tokens(b); return A.length && B.length && jaccard(A, B) >= 0.6; };
+/* 6d · puces verrouillées : recopiées mot pour mot, jamais réécrites. */
+const lockedOf = (p) => (Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => str(x)) : []);
+const touchesLocked = (before, locked) => {
+  const b = normText(before);
+  return !!b && locked.some((l) => { const k = normText(l); return k && (b.includes(k) || (k.includes(b) && b.length > 25)); });
+};
+function restoreLocked(lines, locked) {
+  if (!locked.length) return lines;
+  return lines.map((l) => {
+    const m = l.match(/^(\s*[-•*]\s+)(.*)$/);
+    if (!m) return l;
+    const hit = locked.find((x) => bulletKey(x) !== bulletKey(m[2]) && similar(x, m[2]));
+    return hit ? `${m[1]}${hit.replace(/^[-•*]\s*/, "")}` : l;
+  });
+}
+/* Fusion : tout vient du maître, sauf les sections adaptables et l'ordre des puces de chaque poste. */
+function enforceMaster(genText, masterText, locked = []) {
+  const G = docOutline(genText, "cv"), M = docOutline(masterText, "cv");
+  const gBy = (k) => G.sections.find((s) => secKindOf(s.title) === k);
+  const out = [];
+  let insertedMissing = false;
+  const missingAdaptable = ADAPTABLE.filter((k) => !M.sections.some((s) => secKindOf(s.title) === k) && gBy(k));
+  for (const ms of M.sections) {
+    const k = secKindOf(ms.title);
+    if (ADAPTABLE.includes(k) && gBy(k)) out.push({ title: ms.title, lines: restoreLocked(gBy(k).lines, locked) });
+    else if (k === "experience") {
+      const gs = gBy("experience");
+      const gEntries = [];
+      (gs?.lines || []).forEach((l) => { const t = l.trim(); if (t.startsWith("### ")) gEntries.push({ h: t.slice(4), bullets: [] }); else if (/^[-•*]\s/.test(t) && gEntries.length) gEntries[gEntries.length - 1].bullets.push(t.replace(/^[-•*]\s*/, "")); });
+      const lines = [];
+      let entry = null;
+      const flush = () => {
+        if (!entry) return;
+        const g = gEntries.find((e) => similar(e.h.split("|").slice(0, 2).join(" "), entry.h.split("|").slice(0, 2).join(" ")));
+        let ordered = entry.bullets;
+        if (g) {
+          const used = new Set();
+          const seq = [];
+          g.bullets.forEach((gb) => { const i = entry.bullets.findIndex((mb, j) => !used.has(j) && (bulletKey(mb) === bulletKey(gb) || similar(mb, gb))); if (i >= 0) { used.add(i); seq.push(entry.bullets[i]); } });
+          ordered = [...seq, ...entry.bullets.filter((_, j) => !used.has(j))];
+        }
+        lines.push(`### ${entry.h}`, ...entry.pre, ...ordered.map((b) => `- ${b}`), "");
+        entry = null;
+      };
+      for (const l of ms.lines) {
+        const t = l.trim();
+        if (t.startsWith("### ")) { flush(); entry = { h: t.slice(4), pre: [], bullets: [] }; }
+        else if (entry && /^[-•*]\s/.test(t)) entry.bullets.push(t.replace(/^[-•*]\s*/, ""));
+        else if (entry && t) entry.pre.push(l);
+        else if (!entry) lines.push(l);
+      }
+      flush();
+      out.push({ title: ms.title, lines });
+    } else out.push(ms);
+    if (k === "profile" && !insertedMissing) { missingAdaptable.forEach((mk) => out.push({ title: gBy(mk).title, lines: restoreLocked(gBy(mk).lines, locked) })); insertedMissing = true; }
+  }
+  if (!insertedMissing) missingAdaptable.forEach((mk) => out.unshift({ title: gBy(mk).title, lines: gBy(mk).lines }));
+  const head = [`# ${M.name || G.name}`, (G.headline || M.headline) ? `> ${G.headline || M.headline}` : "", `@ ${M.contact || G.contact}`].filter((x) => x && x !== "@ ");
+  return [...head, "", ...out.flatMap((s) => [s.title ? `## ${s.title}` : "", ...s.lines.map((l) => l.trimEnd()), ""])].join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /* Remplacement ciblé proposé par l'IA : « before » doit exister dans le texte (tolérance typographique). */
 const typoNorm = (s) => String(s || "").replace(/[‘’′]/g, "'").replace(/[“”]/g, '"').replace(/[  ]/g, " ").replace(/[ \t]+/g, " ");
 function applyEdit(text, before, after) {
@@ -912,6 +1006,62 @@ const WEAK_OPENERS = {
 const PRONOUNS = { fr: /(^|[\s(])(je|j'|j’|mon|ma|mes|moi)(?=[\s,.;:!?)]|$)/i, nl: /\b(ik|mijn|mij)\b/i, en: /\b(I|my|me|My)\b/ };
 const REP_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden ensuite egalement notamment".split(" "));
 const LEVEL_ORDER = { block: 0, warn: 1, info: 2 };
+/* ── Lettre ≠ CV : mesures de complémentarité (sans IA) ── */
+const LETTER_FORMULAS = /(madame|monsieur|geachte|mevrouw|heer|dear|hiring manager|agr[ée]er|salutations distingu|met vriendelijke groet|hoogachtend|yours sincerely|kind regards)/i;
+/* Corps de la lettre : paragraphes, sans en-tête, objet, formules d'appel et de politesse ni signature. */
+function letterBody(text) {
+  return parseDoc(text).filter((b) => b.t === "para" && !(LETTER_FORMULAS.test(b.text) && b.text.split(/\s+/).length < 18)).map((b) => b.text).join("\n");
+}
+const ngrams = (s, n = 4) => {
+  const t = normText(s).split(" ").filter(Boolean);
+  const out = [];
+  for (let i = 0; i + n <= t.length; i++) out.push(t.slice(i, i + n).join(" "));
+  return out;
+};
+/* Part des 4-grammes de la lettre déjà présents dans le CV. */
+function overlapPct(letterText, cvText) {
+  const L = ngrams(letterBody(letterText));
+  if (!L.length || !String(cvText || "").trim()) return null;
+  const C = new Set(ngrams(docPlainText(cvText)));
+  return Math.round((L.filter((g) => C.has(g)).length / L.length) * 100);
+}
+/* Chiffres significatifs (années exclues ; 1 200 = 1200 ; 40 % = 40). */
+function sigNumbers(text) {
+  const out = new Set();
+  for (const m of String(text || "").matchAll(/[−-]?\d[\d\s  .,]*\d|\d/g)) {
+    const n = m[0].replace(/[\s  ]/g, "").replace(/^[−-]/, "").replace(/[.,](?=\d{3}\b)/g, "").replace(",", ".");
+    if (/^(19|20)\d\d$/.test(n)) continue;
+    if (n.replace(/\D/g, "").length >= 8) continue;
+    out.add(n);
+  }
+  return [...out];
+}
+function letterMetrics(letterText, cvText) {
+  const body = letterBody(letterText);
+  const nums = sigNumbers(body);
+  const cvNums = new Set(sigNumbers(docPlainText(cvText || "")));
+  return { overlap: overlapPct(letterText, cvText), numbers: nums.length, sharedNumbers: nums.filter((n) => cvNums.has(n)).length, words: body.split(/\s+/).filter(Boolean).length };
+}
+function normalizeUsed(u) {
+  u = u && typeof u === "object" ? u : {};
+  const list = (x) => (Array.isArray(x) ? x.map((y) => str(y)).filter(Boolean) : []);
+  return { companyFacts: list(u.companyFacts), convictionId: str(u.convictionId), storyId: str(u.storyId), keywords: list(u.keywords), numbers: list(u.numbers), sharedWithCv: str(u.sharedWithCv) };
+}
+const SIG_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden comme leur sont etre avoir fait faire tout tous mais donc alors aussi tres bien".split(" "));
+const sigTokens = (s) => new Set(normText(s).split(" ").filter((w) => w.length >= 5 && !SIG_STOP.has(w)));
+/* Une source (fait, conviction, histoire) est « présente » si la lettre en reprend au moins 3 mots significatifs (ou 40 % de ses mots). */
+function echoes(hayTokens, source) {
+  const t = [...sigTokens(source)];
+  if (!t.length) return false;
+  const hit = t.filter((w) => hayTokens.has(w)).length;
+  return hit >= Math.min(3, t.length) || hit / t.length >= 0.4;
+}
+const FLATTERY = {
+  fr: ["leader", "leader incontesté", "acteur majeur", "acteur incontournable", "référence", "renommée", "prestigieuse", "prestigieux", "réputation", "j'admire", "entreprise innovante", "excellence reconnue", "fleuron", "rayonnement"],
+  nl: ["marktleider", "toonaangevend", "gerenommeerd", "prestigieus", "bewonder", "innovatieve organisatie", "vooraanstaand"],
+  en: ["industry leader", "market leader", "renowned", "prestigious", "world-class", "i admire", "leading company", "innovative company", "reputation"],
+};
+
 
 function analyzeDoc(text, kind, ctx = {}) {
   const lang = ctx.lang || "fr";
@@ -947,7 +1097,7 @@ function analyzeDoc(text, kind, ctx = {}) {
   const titleIn = (hay) => titleForms.some((t) => kwCount(hay, { term: t, variants: [] }) > 0);
   const titleFound = titleForms.length ? titleIn(allHay) : null;
   const missingKw = eligible.filter((k) => !k.found);
-  if (missingKw.length) {
+  if (missingKw.length && kind === "cv") {
     const top = missingKw.filter((k) => k.importance >= 2);
     if (top.length) add(kind === "cv" && top.some((k) => k.importance === 3) ? "warn" : "info", "ats", "kw-missing", `${top.length} mot(s)-clé(s) ${kind === "cv" ? "justifiable(s)" : "essentiel(s)"} absent(s)`, `${top.slice(0, 6).map((k) => `« ${k.term} »`).join(", ")}${top.length > 6 ? "…" : ""} : votre profil les justifie, ${kind === "cv" ? "l'ATS les cherche" : "citez-les naturellement"}.`, { tab: "kw" });
   }
@@ -968,8 +1118,10 @@ function analyzeDoc(text, kind, ctx = {}) {
     const sec = findSec((h, i) => /\[à compléter/i.test(o.sections[i].lines.join("\n")));
     add("block", "fiabilite", "placeholders", `${ph.length} élément(s) [à compléter]`, `${ph.slice(0, 3).join(" · ")}${ph.length > 3 ? "…" : ""} — complétez avec un fait réel ou supprimez le passage.`, { sec });
   }
-  const emp = mentionsEmployer(text, ctx.employerNames);
-  if (emp.length) add("warn", "fiabilite", "employer", `Employeur actuel cité (${emp.join(", ")})`, "Vous êtes en poste : vérifiez que c'est voulu avant diffusion.", { sec: findSec((h, i) => mentionsEmployer(o.sections[i].lines.join("\n"), ctx.employerNames).length > 0) });
+  /* Employeur actuel : réglage unique CV + lettre (employerNamed). Non nommé → toute mention bloque ; nommé → aucune alerte. */
+  const empNames = [...(ctx.employerNames || []), ...(ctx.employerNamed === false && !genericOrg(ctx.currentOrg) ? [ctx.currentOrg] : [])];
+  const emp = ctx.employerNamed === true ? [] : mentionsEmployer(text, empNames);
+  if (emp.length) add(ctx.employerNamed === false ? "block" : "warn", "fiabilite", "employer", `Employeur actuel cité (${emp.join(", ")})`, ctx.employerNamed === false ? "Cette candidature est réglée sur « employeur non nommé » : remplacez-le par une désignation générique." : "Vous êtes en poste : vérifiez que c'est voulu avant diffusion.", { sec: findSec((h, i) => mentionsEmployer(o.sections[i].lines.join("\n"), empNames).length > 0), autoFix: ctx.employerNamed === false });
 
   /* Clichés et affirmations non prouvées */
   const hits = (list) => (list[lang] || list.fr).filter((c) => kwCount(allHay, { term: c, variants: [] }) > 0);
@@ -985,7 +1137,7 @@ function analyzeDoc(text, kind, ctx = {}) {
   const reps = Object.entries(freq).filter(([, n]) => n >= (kind === "cv" ? 6 : 4)).sort((a, b) => b[1] - a[1]).slice(0, 4);
   if (reps.length) add("info", "style", "reps", `Répétitions : ${reps.map(([w, n]) => `« ${w} » ×${n}`).join(", ")}`, "Variez le vocabulaire (sauf mots-clés de l'annonce).");
 
-  let impact = 70, read = 100;
+  let impact = 70, read = 100, letterScores = null;
   const pages = ctx.pages || null;
   if (kind === "cv") {
     const hl = o.headline;
@@ -1050,12 +1202,49 @@ function analyzeDoc(text, kind, ctx = {}) {
     if (!/(madame|monsieur|dear|geachte|beste)/i.test(bodyText)) add("info", "format", "salutation", "Formule d'appel absente", "FR : « Madame, Monsieur, » ; NL : « Geachte heer, mevrouw, » ; EN : « Dear … ».");
     if (!String(o.recipients.join(" ")).trim()) add("info", "format", "recipient", "Destinataire absent", null, { sec: "head" });
     if (!o.date) add("info", "format", "date", "Lieu et date absents", null, { sec: "head" });
-    const je = lang === "fr" ? (bodyText.match(/(^|[.!?]\s+)(je |j'|j’)/gi) || []).length : lang === "en" ? (bodyText.match(/(^|[.!?]\s+)I /g) || []).length : (bodyText.match(/(^|[.!?]\s+)ik /gi) || []).length;
-    if (je > 4) add("info", "style", "je", `${je} phrases commencent par « ${lang === "en" ? "I" : lang === "nl" ? "Ik" : "Je"} »`, "Variez les débuts de phrase (le poste, l'entreprise, un résultat).", { autoFix: true });
-    const nums = /\d/.test(bodyText.replace(/\b(19|20)\d{2}\b/g, ""));
-    if (!nums) add("info", "impact", "nums", "Aucun résultat chiffré dans la lettre", "Une preuve chiffrée rend la candidature crédible.");
-    impact = 100 - (companyIn ? 0 : 25) - (cta ? 0 : 10) - (nums ? 0 : 15) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - Math.max(0, je - 4) * 4 - cl.length * 8;
-    const [minW, maxW] = ctx.spontaneous ? [200, 300] : [260, 340];
+    /* Débuts de phrase : jamais deux phrases consécutives en « Je ». */
+    const jeRe = lang === "en" ? /^I\b/ : lang === "nl" ? /^ik\b/i : /^(je\b|j'|j’)/i;
+    const sentences = letterBody(text).split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+    const jeFlags = sentences.map((x) => jeRe.test(x));
+    const jeRuns = jeFlags.filter((f, i) => f && jeFlags[i - 1]).length;
+    const je = jeFlags.filter(Boolean).length;
+    if (jeRuns) add("warn", "style", "je-run", `${jeRuns + 1 > 2 ? `${jeRuns} enchaînements` : "Deux phrases consécutives"} en « ${lang === "en" ? "I" : lang === "nl" ? "Ik" : "Je"} »`, "Commencez l'une par l'entreprise, le rôle ou un fait.", { autoFix: true });
+
+    /* Lettre ≠ CV : complémentarité (recouvrement, chiffres). */
+    const m = letterMetrics(text, ctx.cvText);
+    if (m.overlap !== null) {
+      if (m.overlap > 30) add("block", "complementarite", "overlap", `La lettre recopie le CV (${m.overlap} % de recouvrement)`, "Au-delà de 30 %, la lettre résume le CV. Remplacez les preuves par le « pourquoi » : entreprise, rôle, méthode, une histoire racontée.", { autoFix: true });
+      else if (m.overlap > 15) add("warn", "complementarite", "overlap", `Recouvrement avec le CV : ${m.overlap} %`, "Visez 15 % maximum : la lettre explique, le CV prouve.", { autoFix: true });
+    } else add("info", "complementarite", "no-cv", "Recouvrement non mesuré : aucun CV pour cette candidature", "Générez ou enregistrez d'abord le CV.");
+    if (m.sharedNumbers > 1) add("warn", "complementarite", "shared-nums", `${m.sharedNumbers} chiffres repris du CV`, "Gardez au plus un chiffre commun : le CV porte les résultats.", { autoFix: true });
+    if (m.numbers > 2) add("warn", "complementarite", "nums", `${m.numbers} chiffres dans la lettre`, "2 au maximum : une preuve racontée vaut mieux qu'une série de résultats.", { autoFix: true });
+
+    /* Spécificité : pourquoi eux, conviction, histoire, sans flatterie. */
+    const bodyTok = sigTokens(letterBody(text));
+    const facts = (ctx.companyFacts || []).filter(Boolean);
+    const whyThem = facts.some((f) => echoes(bodyTok, f));
+    if (!ctx.spontaneous || ctx.spontaneous === "company") {
+      if (!facts.length) add("warn", "specificite", "why-them", "« Pourquoi eux » non étayé", "Aucun fait vérifié sur l'entreprise : collez l'annonce complète ou complétez le contexte de l'entreprise.");
+      else if (!whyThem) add("warn", "specificite", "why-them", "« Pourquoi eux » absent", "Aucun fait propre à l'entreprise n'est repris : une phrase qui resterait vraie pour un concurrent est interchangeable.", { autoFix: true });
+    }
+    const motiv = ctx.motivation || emptyMotivation();
+    const convOk = motiv.convictions.some((c) => echoes(bodyTok, c.text));
+    const storyOk = motiv.stories.some((st) => echoes(bodyTok, [st.situation, st.action, st.result].join(" ")));
+    if (!motiv.convictions.length) add("info", "specificite", "conviction", "Aucune conviction dans votre profil", "Renseignez vos convictions (Profil & critères → Motivations) : elles rendent la lettre personnelle.");
+    else if (!convOk) add("warn", "specificite", "conviction", "Aucune de vos convictions n'apparaît", "Reliez « pourquoi ce rôle » à une conviction que vous défendez.", { autoFix: true });
+    if (!motiv.stories.length) add("info", "specificite", "story", "Banque d'histoires vide", "Ajoutez 2 ou 3 histoires (Motivations) : la lettre en raconte une.");
+    else if (!storyOk) add("warn", "specificite", "story", "Aucune histoire racontée", "Racontez une histoire de votre banque (situation → action → effet) plutôt qu'une liste de résultats.", { autoFix: true });
+    const flat = (FLATTERY[lang] || FLATTERY.fr).filter((c) => kwCount(bodyHay, { term: c, variants: [] }) > 0);
+    if (flat.length) add("warn", "specificite", "flattery", `Flatterie : ${flat.slice(0, 4).join(", ")}`, "Remplacez le compliment par un fait précis sur l'entreprise.", { autoFix: true });
+    const kwUsed = kw.filter((k) => k.found && k.status !== "absent" && k.importance >= 2).length;
+    if (kwUsed > 6) add("info", "complementarite", "kw-many", `${kwUsed} mots-clés de l'annonce dans la lettre`, "2 à 4 suffisent : la lettre n'est pas un second CV.");
+
+    const spec = clamp(100 - (facts.length ? (whyThem ? 0 : 35) : 25) - (motiv.convictions.length ? (convOk ? 0 : 25) : 15) - (motiv.stories.length ? (storyOk ? 0 : 25) : 15) - flat.length * 10 - (companyIn ? 0 : 15), 0, 100);
+    const compl = m.overlap === null ? null : clamp(100 - Math.max(0, m.overlap - 10) * 4 - Math.max(0, m.sharedNumbers - 1) * 15 - Math.max(0, m.numbers - 2) * 10, 0, 100);
+    impact = 100 - (cta ? 0 : 20) - (storyOk ? 0 : 20) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - cl.length * 8;
+    read -= jeRuns * 8 + Math.max(0, je - 4) * 3;
+    letterScores = { spec, compl, overlap: m.overlap, numbers: m.numbers, sharedNumbers: m.sharedNumbers };
+    const [minW, maxW] = ctx.spontaneous ? [220, 300] : [250, 320];
     if (words < minW - 40) { add("info", "format", "short", `Lettre courte (${words} mots)`, `Visez ${minW} à ${maxW} mots.`); read -= 10; }
     if (words > maxW + 80) { add("warn", "format", "long", `Lettre longue (${words} mots)`, `Une page maximum : visez ${minW} à ${maxW} mots.`); read -= 15; }
     if (pages && pages > 1) { add("warn", "format", "pages", `La lettre tient sur ${pages} pages`, "Une page maximum."); read -= 20; }
@@ -1064,8 +1253,13 @@ function analyzeDoc(text, kind, ctx = {}) {
   if (!o.contact) read -= 20;
   const ats = kwPct === null ? (titleFound === null ? null : titleFound ? 80 : 50) : Math.round(0.78 * kwPct + (titleFound === false ? 0 : 22));
   const sc = (n) => (n === null ? null : clamp(Math.round(n), 0, 100));
-  const scores = { ats: sc(ats), impact: sc(impact), read: sc(read) };
-  const parts = [[scores.ats, 0.4], [scores.impact, 0.35], [scores.read, 0.25]].filter(([v]) => v !== null);
+  /* CV : ATS 40 / impact 35 / lisibilité 25. Lettre : spécificité 35 / complémentarité 25 / impact 20 / lisibilité 20 (plus de mots-clés). */
+  const scores = kind === "cv"
+    ? { ats: sc(ats), impact: sc(impact), read: sc(read) }
+    : { ats: null, spec: sc(letterScores?.spec ?? null), compl: sc(letterScores?.compl ?? null), impact: sc(impact), read: sc(read), overlap: letterScores?.overlap ?? null, numbers: letterScores?.numbers ?? null };
+  const parts = (kind === "cv"
+    ? [[scores.ats, 0.4], [scores.impact, 0.35], [scores.read, 0.25]]
+    : [[scores.spec, 0.35], [scores.compl, 0.25], [scores.impact, 0.2], [scores.read, 0.2]]).filter(([v]) => v !== null);
   let total = Math.round(parts.reduce((n, [v, w]) => n + v * w, 0) / parts.reduce((n, [, w]) => n + w, 0));
   const blockers = issues.filter((i) => i.level === "block").length;
   if (blockers) total = Math.min(total, 69);
@@ -1076,7 +1270,8 @@ function analyzeDoc(text, kind, ctx = {}) {
 /* Points que la passe de correction automatique traite après génération. */
 function autoFixList(rep) {
   const list = rep.issues.filter((i) => i.autoFix).map((i) => ({ title: i.title, detail: i.detail }));
-  rep.kw.filter((k) => k.status !== "absent" && !k.found && k.importance >= (rep.kind === "cv" ? 2 : 3)).slice(0, rep.kind === "cv" ? 10 : 5)
+  /* Lettre : aucune injection de mots-clés. */
+  if (rep.kind === "cv") rep.kw.filter((k) => k.status !== "absent" && !k.found && k.importance >= 2).slice(0, 10)
     .forEach((k) => list.push({ title: `Intégrer le mot-clé « ${k.term} »`, detail: k.evidence ? `preuve dans le profil : ${k.evidence}` : "justifié par le profil" }));
   return list.slice(0, 14);
 }
@@ -1733,6 +1928,147 @@ const profileBlock = (p) => [
   `Formation : ${(p.education || []).join(" ; ") || "non renseignée"}`,
   `Certifications : ${(p.certifications || []).join(" ; ") || "aucune"}`,
 ].join("\n");
+/* ── Motivations (profil) : le « pourquoi », source de la lettre, des messages et de la préparation d'entretien. Jamais du CV. ──
+   Champ facultatif profile.motivation ; absent = vide. */
+const MOTIV_TEXT_FIELDS = [
+  { id: "purpose", label: "Raison d'être professionnelle", hint: "Ce qui vous fait avancer dans votre travail, avec vos mots." },
+  { id: "whyNow", label: "Pourquoi changer maintenant", hint: "Le déclencheur réel, formulé positivement." },
+  { id: "lookingFor", label: "Ce que vous cherchez", hint: "Rôle, périmètre, culture, type de direction." },
+  { id: "method", label: "Votre méthode", hint: "Comment vous menez une transformation, du cadrage à l'adoption." },
+  { id: "management", label: "Votre management", hint: "Comment vous dirigez une équipe, avec un exemple." },
+];
+const emptyMotivation = () => ({ purpose: "", convictions: [], stories: [], management: "", method: "", whyNow: "", lookingFor: "", sectors: [] });
+function motivOf(p) {
+  const m = p?.motivation && typeof p.motivation === "object" ? p.motivation : {};
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  return {
+    ...emptyMotivation(),
+    ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, String(m[f.id] || "")])),
+    convictions: arr(m.convictions).map((c, i) => ({ id: c?.id || `c${i + 1}`, text: String(c?.text ?? c ?? "") })).filter((c) => c.text.trim()),
+    stories: arr(m.stories).map((s, i) => ({ id: s?.id || `s${i + 1}`, title: String(s?.title || ""), situation: String(s?.situation || ""), action: String(s?.action || ""), result: String(s?.result || ""), lesson: String(s?.lesson || "") })).filter((s) => s.title.trim() || s.situation.trim() || s.action.trim()),
+    sectors: arr(m.sectors).map(String).filter((x) => x.trim()),
+  };
+}
+const motivFilled = (m) => MOTIV_TEXT_FIELDS.filter((f) => m[f.id].trim()).length + (m.convictions.length ? 1 : 0) + (m.stories.length ? 1 : 0) + (m.sectors.length ? 1 : 0);
+const storyText = (s) => [s.title && `« ${s.title} »`, s.situation && `situation : ${s.situation}`, s.action && `action : ${s.action}`, s.result && `résultat : ${s.result}`, s.lesson && `leçon : ${s.lesson}`].filter(Boolean).join(" · ");
+/* Bloc « pourquoi » injecté dans la lettre, les messages et la préparation d'entretien (jamais dans le CV). */
+function motivationBlock(p) {
+  const m = motivOf(p);
+  if (!motivFilled(m)) return "MOTIVATIONS DU CANDIDAT : non renseignées. Toute phrase de motivation personnelle s'écrit [à compléter : …].";
+  return [
+    "MOTIVATIONS DU CANDIDAT (ses propres mots, seule source autorisée pour le « pourquoi » ; reformule sans rien ajouter)",
+    m.purpose && `Raison d'être : ${m.purpose}`,
+    m.whyNow && `Pourquoi maintenant : ${m.whyNow}`,
+    m.lookingFor && `Ce qu'il cherche : ${m.lookingFor}`,
+    m.method && `Méthode : ${m.method}`,
+    m.management && `Management : ${m.management}`,
+    m.sectors.length && `Secteurs qui l'attirent : ${m.sectors.join(" ; ")}`,
+    m.convictions.length && `Convictions :\n${m.convictions.map((c) => `- [${c.id}] ${c.text}`).join("\n")}`,
+    m.stories.length && `Banque d'histoires (à raconter, pas à lister) :\n${m.stories.map((s) => `- [${s.id}] ${storyText(s)}`).join("\n")}`,
+  ].filter(Boolean).join("\n");
+}
+
+/* Entretien de motivation : 10 questions ; l'IA reformule les réponses, sans rien ajouter. */
+const MOTIV_QUESTIONS = [
+  { id: "q1", field: "purpose", q: "Qu'est-ce qui vous fait avancer dans votre travail ? Un moment où vous vous êtes dit « c'est pour ça que je fais ce métier »." },
+  { id: "q2", field: "convictions", q: "Quelles convictions défendez-vous sur la transformation digitale, et qu'est-ce qui les a forgées ?" },
+  { id: "q3", field: "stories", q: "Racontez le projet dont vous êtes le plus fier : contexte, ce que VOUS avez fait, résultat." },
+  { id: "q4", field: "stories", q: "Racontez une résistance au changement ou un échec, et ce que vous en avez appris." },
+  { id: "q5", field: "management", q: "Comment dirigez-vous une équipe ? Donnez un exemple concret." },
+  { id: "q6", field: "method", q: "Quelle est votre méthode pour mener une transformation, du cadrage à l'adoption par les utilisateurs ?" },
+  { id: "q7", field: "whyNow", q: "Pourquoi chercher un nouveau poste maintenant ?" },
+  { id: "q8", field: "lookingFor", q: "Que cherchez-vous dans votre prochain poste : rôle, périmètre, culture, type de direction ?" },
+  { id: "q9", field: "sectors", q: "Quels secteurs ou types d'organisations vous attirent, et pourquoi ?" },
+  { id: "q10", field: "stories", q: "Que diraient de vous votre direction ou vos collègues ? Appuyez-vous sur une situation réelle." },
+];
+
+/* ── Règles d'écriture (6a) : prioritaires sur les consignes de style, jamais sur la vérité. Champ facultatif profile.writingRules. ── */
+const SEED_RULES = [
+  "Positionnement : généraliste de la transformation digitale, pont entre le métier et la technique. Jamais « responsable CRM », ni un rôle réduit au seul CRM.",
+  "Trilinguisme FR / NL / EN cité dans le Profil du CV.",
+  "Master mentionné discrètement : section Formation uniquement, sans mise en avant.",
+  "Preuves prioritaires, quand le profil les contient : plus de 20 projets ; 120 utilisateurs et 80 000 contacts ; 1,5 ETP ; −40 % ; comité IA ; rôle de conseil auprès du COO et du CEO.",
+  "Ton humble : les faits parlent, aucune autopromotion.",
+].map((text, i) => ({ id: `r${i + 1}`, text, active: true, origin: "départ" }));
+const writingRulesOf = (p) => (Array.isArray(p?.writingRules) ? p.writingRules : SEED_RULES);
+function rulesBlock(p) {
+  const act = writingRulesOf(p).filter((r) => r.active && String(r.text || "").trim());
+  const locked = Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => String(x || "").trim()) : [];
+  const parts = [];
+  if (act.length) parts.push(`RÈGLES D'ÉCRITURE DU CANDIDAT (prioritaires sur toutes les consignes de style et de ton ci-dessus ; jamais sur la vérité : un fait absent du profil reste [à compléter : …])\n${act.map((r) => `- ${r.text}`).join("\n")}`);
+  if (locked.length) parts.push(`PUCES VERROUILLÉES (si tu en utilises une, recopie-la mot pour mot ; ne propose jamais de la modifier)\n${locked.map((b) => `- ${b}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+/* Insère les règles juste avant la consigne de format JSON finale. */
+function withRules(prompt, p) {
+  const block = rulesBlock(p);
+  if (!block) return prompt;
+  const i = prompt.lastIndexOf("Réponds uniquement");
+  return i < 0 ? `${prompt}\n\n${block}` : `${prompt.slice(0, i)}${block}\n\n${prompt.slice(i)}`;
+}
+/* ── Fiches entreprise (companyBriefs) : faits sourcés, valables 60 jours. Un fait sans URL vérifiée est exclu. ── */
+const BRIEF_TTL_DAYS = 60;
+const briefKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
+const briefFresh = (b) => !!b && !!b.expiresAt && new Date(b.expiresAt).getTime() > Date.now();
+const isHttp = (u) => /^https?:\/\/[^\s/]+\.[^\s]+/i.test(String(u || "").trim());
+/* verifiedUrls : URL réellement vues dans les résultats de recherche (null = URL fournie par l'utilisateur ou vérifiée par la Routine). */
+function makeBrief({ company, summary, facts, origin, verifiedUrls = null, createdAt }) {
+  const seen = (u) => verifiedUrls === null || verifiedUrls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+  const list = (Array.isArray(facts) ? facts : []).map((f) => ({ text: str(f?.text), url: str(f?.url || f?.sourceUrl) }))
+    .filter((f) => f.text && isHttp(f.url) && seen(f.url))
+    .slice(0, 12)
+    .map((f, i) => ({ id: `B${i + 1}`, text: f.text, url: f.url, verified: true, source: origin }));
+  const at = createdAt && !isNaN(new Date(createdAt)) ? new Date(createdAt) : new Date();
+  return { company: str(company) || "", summary: str(summary), facts: list, origin, createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + BRIEF_TTL_DAYS * 864e5).toISOString() };
+}
+function mergeBriefs(a, b) {
+  if (!a || !briefFresh(a)) return b;
+  const seen = new Set(a.facts.map((f) => normText(f.text)));
+  const facts = [...a.facts, ...b.facts.filter((f) => !seen.has(normText(f.text)))].slice(0, 16).map((f, i) => ({ ...f, id: `B${i + 1}` }));
+  return { ...b, summary: b.summary || a.summary, facts, origin: a.origin === b.origin ? b.origin : `${a.origin}+${b.origin}` };
+}
+
+/* ── Pourquoi cette candidature (app.motivation, facultatif) ── */
+const appMotivOf = (app) => ({ factIds: [], whyCompany: "", whyRole: "", personalLink: "", convictionId: null, storyId: null, employerNamed: true, ...(app?.motivation && typeof app.motivation === "object" ? app.motivation : {}) });
+/* Faits disponibles : annonce (avec son URL) + fiche entreprise à jour. Les faits sans URL sont exclus. */
+function companyFactsFor(app, offer, briefs) {
+  const out = [];
+  const adUrl = (offer?.sources || []).find((x) => isHttp(x.url))?.url;
+  if (!offer?.spontaneous && adUrl) (app?.analysis?.companyFacts || []).filter(Boolean).forEach((t, i) => out.push({ id: `A${i + 1}`, text: t, url: adUrl, source: "annonce" }));
+  const b = offer?.company ? briefs?.[briefKey(offer.company)] : null;
+  if (briefFresh(b)) b.facts.forEach((f) => out.push({ ...f }));
+  return out;
+}
+function selectedFacts(app, offer, briefs) {
+  const all = companyFactsFor(app, offer, briefs);
+  const ids = appMotivOf(app).factIds;
+  const sel = ids.length ? all.filter((f) => ids.includes(f.id)) : all;
+  return sel.length ? sel : all;
+}
+const genericOrg = (o) => !o || /^(une?|the|a|een)\s/i.test(o) || normText(o) === normText("Fédération patronale belge");
+function employerRule(app, profile) {
+  const org = profile?.experiences?.[0]?.org || "";
+  return appMotivOf(app).employerNamed
+    ? `Employeur actuel : nommé par son libellé exact (« ${org || "voir profil"} ») dans le CV ET dans la lettre.`
+    : "Employeur actuel : JAMAIS nommé, ni dans le CV ni dans la lettre ni dans les messages. Désigne-le de façon générique (« une fédération patronale belge »), y compris dans les lignes « ### Fonction | Organisation… ».";
+}
+/* Bloc « pourquoi cette candidature » : vide → [à compléter] (bloquant au contrôle). */
+function appMotivationBlock(app, offer, profile, facts) {
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const conv = bank.convictions.find((c) => c.id === m.convictionId);
+  const story = bank.stories.find((s) => s.id === m.storyId);
+  const company = offer?.spontaneous === "base" ? "l'entreprise" : show(offer?.company);
+  return [
+    "POURQUOI CETTE CANDIDATURE (choix du candidat pour cette cible)",
+    `Faits retenus sur ${company} : ${facts.length ? facts.map((f) => f.id).join(", ") : "aucun → [à compléter : un fait vérifiable sur l'entreprise, avec sa source]"}`,
+    `Pourquoi ${company} : ${m.whyCompany.trim() || (facts.length ? "non précisé : relie un fait retenu à une conviction" : "[à compléter : pourquoi cette entreprise]")}`,
+    `Pourquoi ce rôle, maintenant : ${m.whyRole.trim() || (bank.whyNow ? `non précisé pour cette cible ; s'appuyer sur « ${bank.whyNow} »` : "[à compléter : pourquoi ce rôle maintenant]")}`,
+    m.personalLink.trim() ? `Lien personnel avec l'entreprise : ${m.personalLink.trim()}` : "",
+    conv ? `Conviction à mettre en avant : [${conv.id}] ${conv.text}` : "Conviction : au choix dans la banque (la plus liée aux faits retenus).",
+    story ? `Histoire à raconter : [${story.id}] ${storyText(story)}` : "Histoire : au choix dans la banque (la plus proche des enjeux de l'entreprise).",
+  ].filter(Boolean).join("\n");
+}
 const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
 const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
 
@@ -1811,7 +2147,13 @@ function normalizeAnalysis(d, offer) {
   };
 }
 
-const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords }) => ({
+/* CV de référence pour la lettre : brouillon en cours, sinon dernière version enregistrée. */
+const latestCvText = (app) => app?.drafts?.cv?.text || app?.docs?.cv?.slice(-1)[0]?.text || "";
+const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords, cvText, app, briefs }) => ({
+  cvText: cvText || "", motivation: motivOf(profile),
+  companyFacts: app ? selectedFacts({ ...app, analysis: analysis || app.analysis }, offer, briefs).map((f) => f.text) : analysis?.companyFacts || [],
+  employerNamed: app ? appMotivOf(app).employerNamed : null,
+  currentOrg: profile?.experiences?.[0]?.org || "",
   lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
   jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
   company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
@@ -1919,7 +2261,7 @@ Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifia
 {"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
-  dossier(offer, profile, types, instruction, analysis) {
+  dossier(offer, profile, types, instruction, analysis, extra = {}) {
     const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
     const head = offer.spontaneous
       ? `${targetBlock(offer, analysis)}
@@ -1938,6 +2280,8 @@ ${analysis ? `\nANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+${extra.facts?.length ? `\nFAITS SOURCÉS SUR L'ENTREPRISE (seuls autorisés)\n${extra.facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 DOCUMENTS DEMANDÉS : ${types.join(", ")}
 
 CONSIGNES
@@ -1945,9 +2289,9 @@ CONSIGNES
 - Ton naturel, précis, orienté résultats ; phrases courtes. Aucun cliché ni superlatif (« passionné », « dynamique », « force de proposition », « je me permets », « n'hésitez pas », « fort de », « motivé et rigoureux », « challenge »…).
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
 - Le candidat n'occupe PAS encore le poste visé : présente son poste actuel tel qu'il est, et le poste visé comme un objectif.
-- Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
-- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager, personnalisé (un élément précis de l'annonce + une preuve).
-- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses.
+- ${extra.employer || "Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom."}
+- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager : un fait propre à l'entreprise (annonce ou contexte) + une conviction ou une histoire du candidat. Pas de liste de compétences. Test de substitution : le message ne doit pas rester vrai pour un concurrent.
+- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses. La réponse « Pourquoi nous / votre motivation » s'appuie sur les faits propres à l'entreprise et sur les MOTIVATIONS (conviction, pourquoi maintenant, une histoire), jamais sur un résumé du CV ; manque → [à compléter : …].
 - email : objet et corps courts (120 mots max) mentionnant CV et lettre en pièces jointes.
 ${instruction ? `- Instruction spécifique de l'utilisateur : ${instruction}` : ""}
 
@@ -2024,7 +2368,7 @@ Réponds uniquement avec ce JSON :
 {"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
   },
 
-  cvWrite(offer, profile, a, prefs, instruction) {
+  cvWrite(offer, profile, a, prefs, instruction, extra = {}) {
     const lang = LANG_NAME[docLang(offer, prefs, a)] || "celle de l'annonce";
     const contact = profileContact(profile);
     const target = a?.jobTitle || offer.title;
@@ -2037,8 +2381,15 @@ Réponds uniquement avec ce JSON :
       : tg.spont
         ? `c) la projection : ce qu'il veut apporter à ${show(offer.company)} dans un rôle de « ${target} », formulé comme un OBJECTIF (aucune offre n'existe : jamais « en réponse à votre annonce »).`
         : `c) la projection : ce qu'il veut apporter, en citant l'intitulé exact « ${target} » comme OBJECTIF (par ex. « … souhaite mettre cette expérience au service de ${show(offer.company)} en tant que ${target} »), jamais comme une fonction déjà exercée.`;
+    const masterBlock = extra.master ? `
+CV MAÎTRE (${LANG_NAME[extra.masterLang] || "même langue"}) — base OBLIGATOIRE. Tu l'ADAPTES, tu ne le réécris pas.
+Tu ne peux modifier QUE : la ligne de positionnement (« > »), la section Profil, la section Réalisations clés (choisir et ordonner des réalisations du maître ou du profil), l'ORDRE des puces dans chaque poste (sans changer leur texte) et la section Compétences. Tout le reste (en-tête, postes, puces, langues, formation) est recopié à l'identique ; toute autre modification sera annulée.
+<<<
+${extra.master}
+>>>
+` : "";
     return `Mission : rédiger le CV du candidat, adapté à la cible ci-dessous et prêt à envoyer après relecture.
-
+${masterBlock}
 ${targetBlock(offer, a)}
 
 ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (déjà confrontée au profil)
@@ -2070,7 +2421,7 @@ MOTS-CLÉS ATS — exigence de couverture
 
 STYLE
 - Zéro cliché ni affirmation creuse (« passionné », « dynamique », « force de proposition », « orienté résultats », « rigoureux », « esprit d'équipe », « challenge »…) : montre-le par un fait.
-- Organisation actuelle : reprends exactement le libellé du profil (« ${profile.experiences?.[0]?.org || "…"} »).
+- ${extra.employer || `Organisation actuelle : reprends exactement le libellé du profil (« ${profile.experiences?.[0]?.org || "…"} »).`}
 - Longueur : ${prefs.cvLength === "1" ? "1 page (420 à 560 mots)" : "1 à 2 pages (600 à 850 mots)"}.
 ${instruction ? `- Consigne du candidat : ${instruction}` : ""}
 
@@ -2098,101 +2449,141 @@ Réponds uniquement avec ce JSON :
 {"cv":"<balisage>","accent":"#RRGGBB ou null","accentSource":"charte connue ou null","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
   },
 
-  letterWrite(offer, profile, a, prefs, instruction) {
+  letterWrite(offer, profile, a, prefs, instruction, cvText, extra = {}) {
     const code = docLang(offer, prefs, a) || "fr";
     const target = a?.jobTitle || offer.title;
     const city = String(profile.home || "").split(/[(,]/)[0].trim() || "[à compléter : ville]";
     const dateLine = code === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(code)}`;
-    if (offer.spontaneous) return P.letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine });
-    return `Mission : rédiger la lettre de motivation du candidat pour l'offre ci-dessous, prête à envoyer après relecture.
-
-OFFRE
-Intitulé : ${offer.title} · Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)}
-
-ANALYSE DE L'ANNONCE (déjà confrontée au profil)
-${analysisDigest(a, offer)}
-
-PROFIL (seule source de faits)
-Nom : ${profile.name || "[à compléter : prénom nom]"}
-Coordonnées : ${profileContact(profile)}
-${profileBlock(profile)}
-
-CONSIGNES
-Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}. Corps de 260 à 340 mots (hors en-tête et signature) : une page.
-Corps, paragraphes séparés par une ligne vide :
-1. Formule d'appel seule sur sa ligne (FR : « Madame, Monsieur, » sauf destinataire nommé ; NL : « Geachte mevrouw, geachte heer, » ; EN : « Dear Hiring Manager, »).
-2. Accroche (2-3 phrases) : un élément précis de l'annonce ou du contexte de l'entreprise (uniquement ce que dit l'annonce), puis qui est le candidat aujourd'hui en une phrase (fonction réelle, périmètre). Jamais « je me permets », « c'est avec un grand intérêt », « suite à votre annonce ».
-3. Preuves (4-5 phrases) : 2 ou 3 exigences clés de l'annonce, chacune reliée à une réalisation concrète et chiffrée du profil.
-4. Projection (2-3 phrases) : ce que le candidat apportera à ${show(offer.company)} sur les missions du poste, formulé comme une intention (« je souhaite », « je compte »), jamais comme un acquis.
-5. Conclusion (1-2 phrases) : disponibilité pour un entretien, sans insistance.
-6. Formule de politesse sobre adaptée à la langue (FR : « Je vous prie d'agréer, Madame, Monsieur, mes salutations distinguées. »).
-Règles :
-- Cite l'entreprise par son nom au moins une fois, et l'intitulé exact « ${target} » dans l'objet et une fois dans le corps.
-- Intègre naturellement 6 à 10 mots-clés « prouvés » ou « transférables », sans énumération.
-- Au plus 3 phrases commençant par « Je » ; varie les débuts de phrase.
-- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom.
-- Exigence non prouvée : ne la mentionne pas, sauf si une compétence voisine permet de la traiter honnêtement en une demi-phrase.
-- Aucun cliché ni superlatif. Aucun fait inventé.
-${instruction ? `- Consigne du candidat : ${instruction}` : ""}
-
-FORMAT (balisage léger, une instruction par ligne)
-# Prénom Nom
-@ coordonnées
-= ${dateLine}
-> Destinataire (service recrutement, ou nom si connu)
-> ${show(offer.company)}
-## Objet : candidature au poste de ${target}
-paragraphes séparés par une ligne vide
-~ Prénom Nom
-
-Réponds uniquement avec ce JSON :
-{"letter":"<balisage>"}`;
+    return P.letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, ...extra });
   },
 
-  letterSpontaneous(offer, profile, a, prefs, instruction, { code, target, dateLine }) {
-    const base = offer.spontaneous === "base";
-    const company = base ? "[à compléter : entreprise]" : show(offer.company);
-    return `Mission : rédiger ${base ? "une lettre de candidature spontanée MODÈLE, réutilisable : l'entreprise et son contexte restent à compléter" : "une lettre de candidature SPONTANÉE"} pour un rôle de « ${target} », prête à envoyer après relecture.
+  /* Règle d'or : le CV prouve, la lettre explique. Lettre = pourquoi eux + pourquoi ce rôle maintenant + méthode + 1 preuve racontée. */
+  letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, facts: factsIn, appBlock, employer }) {
+    const tg = targetInfo(offer, a);
+    const company = tg.base ? "[à compléter : entreprise]" : show(offer.company);
+    const facts = factsIn || [];
+    const kws = (a?.keywords || []).filter((k) => k.status !== "absent" && k.importance === 3).slice(0, 6).map((k) => `« ${k.term} »`);
+    const subject = tg.spont ? `## Objet : candidature spontanée — ${target}` : `## Objet : candidature au poste de ${target}`;
+    return `Mission : rédiger ${tg.base ? "une lettre de candidature spontanée MODÈLE, réutilisable (l'entreprise et ses faits restent à compléter)" : tg.spont ? "une lettre de candidature SPONTANÉE" : "la lettre de motivation"} pour ${tg.spont ? `un rôle de « ${target} »` : `le poste « ${target} »`}${tg.base ? "" : ` chez ${company}`}, prête à envoyer après relecture.
 
-${targetBlock(offer, a)}
+RÈGLE D'OR : le CV prouve, la lettre explique. Le CV ci-dessous est déjà joint : la lettre ne le résume pas. Elle dit pourquoi CETTE entreprise, pourquoi CE rôle MAINTENANT, comment le candidat travaille, et raconte UNE preuve.
+TEST DE SUBSTITUTION : relis chaque phrase en remplaçant ${tg.base ? "l'entreprise" : company} par un concurrent. Si elle reste vraie, réécris-la avec un fait propre à ${tg.base ? "l'entreprise" : company}, ou supprime-la.
 
-ANALYSE DU RÔLE VISÉ (déjà confrontée au profil)
+${targetBlock(offer, a).split("\n").filter((l) => !l.startsWith("Contexte fourni par le candidat")).join("\n")}
+${tg.spont && adTextOf(offer) ? `\nNOTES DU CANDIDAT SUR L'ENTREPRISE (son point de vue, pas des faits vérifiés : à utiliser pour le « pourquoi » personnel, jamais citées comme faits sur l'entreprise)\n${adTextOf(offer).slice(0, 1500)}\n` : ""}
+CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (faits sourcés, seules informations autorisées sur l'entreprise ; cite leurs identifiants dans « used »)
+${facts.length ? facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n") : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
+
+${appBlock || ""}
+
+ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (repères, pas une liste à recopier)
 ${analysisDigest(a, offer)}
 
-PROFIL (seule source de faits)
+${motivationBlock(profile)}
+
+PROFIL (faits autorisés)
 Nom : ${profile.name || "[à compléter : prénom nom]"}
 Coordonnées : ${profileContact(profile)}
 ${profileBlock(profile)}
 
-CONSIGNES
-Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}. Corps de 220 à 300 mots : une page, plus court qu'une réponse à une annonce.
-Aucune offre n'existe : n'écris jamais « suite à votre annonce », « le poste à pourvoir » ni « votre offre ».
-Corps, paragraphes séparés par une ligne vide :
-1. Formule d'appel (FR : « Madame, Monsieur, » ; si un interlocuteur est nommé avec sa civilité, adresse-toi à lui ; NL : « Geachte mevrouw, geachte heer, » ; EN : « Dear … »).
-2. Pourquoi ${base ? "cette entreprise" : show(offer.company)} (2-3 phrases) : ${base ? "laisse un emplacement « [à compléter : un fait précis sur l'entreprise] »" : "uniquement à partir du contexte fourni par le candidat ; s'il est vide, parle du rôle et du secteur sans inventer de fait sur l'entreprise"}. Puis qui est le candidat aujourd'hui en une phrase (fonction réelle, périmètre).
-3. Preuves (3-4 phrases) : 2 ou 3 réalisations concrètes et chiffrées du profil, reliées aux attentes du rôle.
-4. Apport (2 phrases) : ce que le candidat pourrait apporter, formulé comme une proposition (« je pourrais », « je serais heureux de contribuer à »), jamais comme une certitude sur leurs besoins.
-5. Demande (1-2 phrases) : un échange de 20 à 30 minutes pour présenter son parcours, même sans poste ouvert.
-6. Formule de politesse sobre adaptée à la langue.
-Règles :
-- Intègre naturellement 5 à 8 mots-clés « prouvés » ou « transférables », sans énumération.
-- Au plus 3 phrases commençant par « Je ».
-- Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique.
-- Aucun cliché, aucun fait inventé.
+CV DÉJÀ JOINT (à NE PAS répéter)
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 9000)}
+>>>
+
+TRAME (corps de ${tg.spont ? "220 à 300" : "250 à 320"} mots, paragraphes séparés par une ligne vide)
+1. Appel : formule seule sur sa ligne (FR « Madame, Monsieur, » ; NL « Geachte mevrouw, geachte heer, » ; EN « Dear Hiring Manager, » ; interlocuteur nommé si connu).
+2. Pourquoi vous (2-3 phrases) : un ou deux faits propres à ${tg.base ? "l'entreprise" : company} (liste ci-dessus) reliés à une conviction ou à un intérêt réel du candidat. Aucune flatterie (« leader », « référence », « renommée », « prestigieuse », « j'admire »…).${tg.spont ? " Aucune offre n'existe : jamais « votre annonce », « le poste à pourvoir »." : ""}
+3. Pourquoi ce rôle, maintenant (2-3 phrases) : à partir de « pourquoi maintenant », « ce qu'il cherche » et d'une conviction. Le candidat n'occupe pas le poste visé.
+4. Preuve racontée (3-4 phrases) : UNE histoire de la banque, racontée (situation → ce qu'il a fait → ce que ça a changé), pas une liste de réalisations.
+5. Méthode (2 phrases) : comment il aborderait les enjeux de ${tg.base ? "l'entreprise" : company}, à partir de sa méthode, formulé comme une intention.
+6. Échange (1-2 phrases) : ${tg.spont ? "proposer un échange de 20 à 30 minutes, même sans poste ouvert" : "disponibilité pour un entretien, sans insistance"}, puis formule de politesse sobre adaptée à la langue.
+
+CONTRAINTES
+- Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}, humble.
+- 2 chiffres au maximum dans toute la lettre.
+- Au plus 1 réalisation commune avec le CV, et formulée autrement qu'en puce de CV.
+- 2 à 4 mots-clés de l'annonce au plus, seulement s'ils viennent naturellement${kws.length ? ` (parmi : ${kws.join(", ")})` : ""}. Aucune énumération de compétences.
+- Jamais deux phrases consécutives commençant par « Je » (« Ik », « I »).
+- Intitulé exact « ${target} » dans l'objet ; ${tg.base ? "entreprise laissée en [à compléter]" : `${company} citée au moins une fois`}.
+- ${employer || "Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom."}
+- Motivation, conviction ou histoire absentes des MOTIVATIONS : écris [à compléter : …], n'invente rien. Aucun fait inventé, aucun cliché.
 ${instruction ? `- Consigne du candidat : ${instruction}` : ""}
 
 FORMAT (balisage léger, une instruction par ligne)
 # Prénom Nom
 @ coordonnées
 = ${dateLine}
-> ${offer.contactName || "Destinataire (direction ou service des ressources humaines)"}
+> ${offer.contactName || "Destinataire (service recrutement, ou nom si connu)"}
 > ${company}
-## Objet : candidature spontanée — ${target}
+${subject}
 paragraphes séparés par une ligne vide
 ~ Prénom Nom
 
+« used » décrit honnêtement ce que la lettre utilise : faits entreprise (A1, B1…), conviction (id [c…]), histoire (id [s…]), mots-clés de l'annonce, chiffres écrits, réalisation commune avec le CV (texte ou null).
+
 Réponds uniquement avec ce JSON :
-{"letter":"<balisage>"}`;
+{"letter":"<balisage>","used":{"companyFacts":["A1"],"convictionId":null,"storyId":null,"keywords":[],"numbers":[],"sharedWithCv":null}}`;
+  },
+
+  companyBrief(company, context) {
+    return `Date du jour : ${todayStr()}.
+Mission : établir une fiche factuelle sur l'entreprise « ${company} » (Belgique de préférence), pour aider un candidat à expliquer « pourquoi cette entreprise ».
+${context ? `Contexte : ${context}` : ""}
+Utilise web_search avec le NOM DE L'ENTREPRISE uniquement (jamais le nom d'une personne). Cherche : activité et modèle, taille et implantation, organisation, stratégie et projets digitaux ou de transformation, actualité des 12 derniers mois, engagements ou valeurs affichés publiquement.
+Règles : 5 à 10 faits, une phrase factuelle chacun, chacun avec l'URL EXACTE du résultat qui le montre. Pas de flatterie, pas d'interprétation, pas de fait sans URL. Information introuvable → ne la mentionne pas.
+Réponds uniquement {"summary":"2 phrases factuelles","facts":[{"text":"","url":""}]}`;
+  },
+
+  briefFromText(company, url, text) {
+    return `Mission : extraire de la source ci-dessous les faits utiles sur l'entreprise « ${company} », pour expliquer « pourquoi cette entreprise » dans une candidature.
+SOURCE (${url})
+<<<
+${String(text || "").slice(0, 15000)}
+>>>
+Règles : uniquement ce que dit la source, une phrase factuelle par fait, 3 à 8 faits, aucune interprétation ni flatterie.
+Réponds uniquement {"summary":"1 phrase","facts":[{"text":""}]}`;
+  },
+
+  learnRules(edits, rules) {
+    return `Mission : déduire des corrections manuelles d'un candidat les règles d'écriture qu'il applique de façon RÉCURRENTE à ses CV et lettres générés par IA.
+
+RÈGLES DÉJÀ CONNUES (ne pas les reproposer)
+${rules.map((r) => `- ${r.text}`).join("\n") || "(aucune)"}
+
+CORRECTIONS (supprimé → ajouté), regroupées par document
+${edits.map((e) => `[${e.type} · ${e.appId.slice(-6)}]\n${e.hunks.slice(0, 12).map((h) => `- « ${h.del || "∅"} » → « ${h.add || "∅"} »`).join("\n")}`).join("\n\n").slice(0, 14000)}
+
+RÈGLES
+- Une règle n'est proposée que si le même type de correction apparaît dans AU MOINS 2 documents différents. Cite ces exemples dans evidence.
+- Règle courte, impérative, applicable par un rédacteur (ex. « Ne jamais écrire "responsable CRM" : préférer "transformation digitale" »).
+- Style, vocabulaire, ton, structure seulement : une règle ne peut jamais autoriser un fait absent du profil.
+- 0 à 5 règles. Aucune si rien n'est récurrent.
+
+Réponds uniquement {"rules":[{"text":"","evidence":"2 exemples courts","docs":2}]}`;
+  },
+
+  motivationDraft(answers, current) {
+    return `Mission : ranger les réponses d'un candidat à un entretien de motivation dans sa fiche « Motivations ».
+
+RÈGLE ABSOLUE : tu REFORMULES seulement. Aucune idée, aucun fait, aucun chiffre, aucun adjectif valorisant qui ne soit pas dans ses réponses. Garde ses mots quand ils sont précis. Un champ sans matière reste vide ("" ou []). Langue : français, sauf si les réponses sont dans une autre langue.
+
+RÉPONSES
+${answers.map((x) => `Q (${x.field}) : ${x.q}\nR : ${x.a || "(pas de réponse)"}`).join("\n\n")}
+
+FICHE ACTUELLE (ne la répète pas ; propose seulement ce que les réponses apportent)
+${JSON.stringify(current).slice(0, 6000)}
+
+CHAMPS
+- purpose : raison d'être professionnelle (1-2 phrases).
+- convictions : 1 phrase chacune, affirmée, telle qu'il la défend.
+- stories : histoires racontables { title (5 mots), situation, action (ce qu'IL a fait), result (avec ses chiffres exacts s'il en donne), lesson }.
+- management, method, whyNow, lookingFor : 1-3 phrases chacun.
+- sectors : secteurs ou types d'organisations cités.
+- followUps : 0 à 3 questions de relance quand une réponse est trop vague pour écrire une lettre spécifique (ex. histoire sans résultat, conviction sans exemple). Chaque relance vise un champ.
+
+Réponds uniquement avec ce JSON :
+{"purpose":"","convictions":[],"stories":[{"title":"","situation":"","action":"","result":"","lesson":""}],"management":"","method":"","whyNow":"","lookingFor":"","sectors":[],"followUps":[{"field":"","q":""}]}`;
   },
 
   fixDoc({ kind, text, issues, analysis, profile, offer }) {
@@ -2216,7 +2607,7 @@ ${profileBlock(profile)}
 
 RÈGLES
 - Chaque correction remplace un passage court (une ligne ou une phrase) : "before" = texte exact du document, "after" = nouvelle version, avec le même balisage en début de ligne (« - », « > », « ### »…).
-- Pour ajouter un mot-clé, réécris la phrase ou la puce où le profil le démontre ; jamais de liste de mots ajoutée.
+- ${kind === "cv" ? "Pour ajouter un mot-clé, réécris la phrase ou la puce où le profil le démontre ; jamais de liste de mots ajoutée." : "Lettre : n'ajoute ni mot-clé ni chiffre ; elle explique le « pourquoi » (entreprise, rôle, méthode, une histoire), le CV porte les preuves."}
 - Le candidat n'occupe pas le poste visé : la ligne sous le nom part de sa fonction réelle ; l'intitulé visé ne s'écrit que comme objectif.
 - Aucun fait, chiffre ou outil absent du profil. Aucun cliché. Même langue que le document.
 - Un point qui ne peut pas être corrigé honnêtement est ignoré.
@@ -2225,7 +2616,7 @@ Réponds uniquement avec ce JSON :
 {"edits":[{"before":"","after":"","reason":"10 mots max"}]}`;
   },
 
-  review({ kind, text, analysis, profile, offer }) {
+  review({ kind, text, analysis, profile, offer, cvText }) {
     const tg = targetInfo(offer, analysis);
     const reader = tg.base
       ? `un recruteur exigeant qui cherche un profil de « ${tg.role} »`
@@ -2244,7 +2635,19 @@ ${analysisDigest(analysis, offer)}
 
 PROFIL (faits autorisés)
 ${profileBlock(profile)}
+${kind === "cv" ? "" : `
+${motivationBlock(profile)}
 
+CV JOINT À LA LETTRE
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 8000)}
+>>>
+
+LETTRE : le CV prouve, la lettre explique. Vérifie en priorité :
+- TEST DE SUBSTITUTION : chaque phrase qui resterait vraie si l'on remplaçait ${show(offer.company)} par un concurrent est à réécrire (fait propre à l'entreprise, ou [à compléter : fait vérifiable]).
+- Répétition du CV : toute phrase qui reformule une puce du CV est à remplacer par du « pourquoi » (conviction, pourquoi maintenant, méthode) ou par l'histoire racontée.
+- Présence de : pourquoi eux, pourquoi ce rôle maintenant, une histoire racontée, la méthode, la demande d'échange. Au plus 2 chiffres. Aucune flatterie.
+`}
 Évalue : positionnement compris en 10 secondes, preuves chiffrées, adéquation aux exigences clés, couverture des mots-clés prouvés, honnêteté (aucune prétention d'occuper déjà le poste visé), style (clichés, répétitions, phrases longues), cohérence des temps.
 Propose 4 à 10 corrections, les plus utiles d'abord : "before" = copie EXACTE d'un passage court du document (une ligne ou une phrase), "after" = version améliorée avec le même balisage de début de ligne, "reason" = pourquoi (12 mots max), "severity" = haute | moyenne | basse. Aucun fait absent du profil.
 
@@ -2347,7 +2750,7 @@ Consignes : langue ${LANG_NAME[offerLang(offer)]} ; 90 mots maximum ; courtois e
 Réponds uniquement {"subject":"","body":""}.`;
   },
 
-  prep(offer, profile) {
+  prep(offer, profile, extra = {}) {
     return `Date du jour : ${todayStr()}.
 Mission : préparer un entretien pour le poste « ${offer.title} » chez « ${show(offer.company)} ».
 Annonce : ${show(offer.description)}
@@ -2355,9 +2758,11 @@ Annonce : ${show(offer.description)}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+${extra.facts?.length ? `\nFICHE ENTREPRISE DÉJÀ VÉRIFIÉE (réutilise ces faits avec leur URL ; ne les recherche pas à nouveau, complète seulement l'actualité récente)\n${extra.facts.map((f) => `- ${f.text} (${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 1. Utilise web_search pour documenter l'entreprise (activité, taille, organisation, actualité des 12 derniers mois, culture, avis publics). Chaque fait doit citer l'URL de sa source. Si une information n'est pas trouvée, ne la mentionne pas.
 2. Questions probables pour ce poste, avec l'angle attendu.
-3. Exemples STAR construits UNIQUEMENT à partir du profil ; si un élément manque, écris [à compléter].
+3. Exemples STAR construits UNIQUEMENT à partir du profil et de la banque d'histoires (priorité aux histoires) ; si un élément manque, écris [à compléter]. Inclure la réponse à « Pourquoi nous ? » à partir des faits trouvés et des motivations du candidat.
 4. Questions pertinentes à poser.
 5. Points de négociation. Fourchette salariale uniquement si une source publique chiffrée existe (avec URL), sinon null.
 
@@ -3048,6 +3453,7 @@ export default function RadarApp() {
   const [apps, setApps] = useState([]);
   const [contacts, setContacts] = useState([]);
   const [ratings, setRatings] = useState({});
+  const [briefs, setBriefs] = useState({});
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -3082,7 +3488,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, briefs };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -3188,6 +3594,7 @@ export default function RadarApp() {
             });
           }
           if (out.ratings) setRatings(out.ratings);
+          if (out.briefs) setBriefs(out.briefs);
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -3222,6 +3629,7 @@ export default function RadarApp() {
   usePersist(KEYS.apps, apps, persistOn, setSaveState);
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
+  usePersist(KEYS.briefs, briefs, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -3688,6 +4096,43 @@ export default function RadarApp() {
     setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
   };
 
+  /* ── Fiches entreprise (pourquoi eux) : web_search (API), Routine (page publiée) ou source collée. ── */
+  const requestBrief = (company, context) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name || /confidenti|non communiqu|anonyme|\[à compléter/i.test(name)) throw new Error("Entreprise non identifiée.");
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La recherche passe par la veille planifiée, qui n'est pas reliée à cette page. Ajoutez une source à la main.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « fiche entreprise » uniquement : ${JSON.stringify({ task: "brief", companies: [name] })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      toast(`Fiche demandée pour ${name} : elle s'affichera d'ici quelques minutes.`, "ok");
+      return null;
+    }
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.companyBrief(name, context), web: { maxUses: 6 }, maxTokens: 5000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: res.data?.facts, origin: "web", verifiedUrls: res.urls });
+    const dropped = (res.data?.facts || []).length - b.facts.length;
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) sourcé(s) sur ${name}${dropped > 0 ? ` · ${dropped} écarté(s) faute d'URL vérifiée` : ""}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const addManualBrief = (company, url, text) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name) throw new Error("Entreprise non identifiée.");
+    if (!isHttp(url)) throw new Error("Indiquez l'URL de la source : un fait sans source vérifiable est exclu.");
+    if (String(text || "").trim().length < 80) throw new Error("Collez le texte de la source (au moins quelques phrases).");
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.briefFromText(name, url, text), maxTokens: 3000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: (res.data?.facts || []).map((f) => ({ text: f?.text, url })), origin: "manuel" });
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) ajouté(s) à la fiche ${name}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const removeBriefFact = (company, factId) => setBriefs((cur) => {
+    const k = briefKey(company);
+    if (!cur[k]) return cur;
+    return { ...cur, [k]: { ...cur[k], facts: cur[k].facts.filter((f) => f.id !== factId) } };
+  });
+  const setAppMotivation = (appId, patch) => patchApp(appId, (a) => ({ ...a, motivation: { ...appMotivOf(a), ...patch } }));
+
   /* ── Notes employeur (avis publics type Glassdoor) ───────────────── */
   const requestRatings = (companies) => withBusy("ratings", async () => {
     const list = [...new Set((companies || []).map((c) => str(c)).filter(Boolean))].filter((c) => !/confidenti|non communiqu|anonyme/i.test(c)).slice(0, 25);
@@ -3790,6 +4235,27 @@ export default function RadarApp() {
     }, 4000);
     return () => clearTimeout(t);
   }, [loaded, verifyQueue.sig, settings.autoVerify]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* File des fiches entreprise lue par la Routine : entreprises des candidatures actives sans fiche à jour (5 au plus). */
+  const briefQueue = useMemo(() => {
+    const names = [];
+    apps.filter((a) => !a.demo && a.kind !== "base" && a.stage !== "closed").forEach((a) => {
+      const o = offers.find((x) => x.id === a.offerId);
+      const c = str(o?.company);
+      if (c && !briefFresh(briefs[briefKey(c)]) && !names.some((n) => briefKey(n) === briefKey(c))) names.push(c);
+    });
+    const items = names.slice(0, 5);
+    return { items, sig: items.map(briefKey).join(",") };
+  }, [apps, offers, briefs]);
+  const briefSig = useRef(null);
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db || storageState.readOnly || briefSig.current === briefQueue.sig) return undefined;
+    const t = setTimeout(() => {
+      briefSig.current = briefQueue.sig;
+      RT.db.doc("veille/brief_queue").set({ companies: briefQueue.items, updatedAt: nowISO() }).catch(() => {});
+    }, 4500);
+    return () => clearTimeout(t);
+  }, [loaded, briefQueue.sig]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Tri rapide des offres ──────────────────────────────────────── */
   const nextOfferId = (id) => {
@@ -3986,7 +4452,7 @@ export default function RadarApp() {
     const { app, offer } = appAndOffer(appId);
     const adText = adTextOf(offer);
     if (offer.spontaneous ? !str(offer.title) : adText.length < 40) throw new Error(offer.spontaneous ? "Indiquez le rôle visé." : "Annonce trop courte pour être analysée : collez son texte complet.");
-    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify(p)}`);
+    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify({ ...p, motivation: undefined, motivationAnswers: undefined, writingRules: undefined })}`);
     if (!force && app.analysis?.sig === sig) return app.analysis;
     const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000 });
     const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.spontaneous && !offer.fullText, adChars: adText.length, spontaneous: offer.spontaneous || null };
@@ -4012,49 +4478,67 @@ export default function RadarApp() {
       setGen(appId, { step: 1, label: offer.spontaneous ? "Analyse du rôle visé et confrontation à votre profil…" : "Analyse de l'annonce et confrontation à votre profil…" });
       let analysis = null;
       try { analysis = await analyzeAd(appId); } catch (e) { toast(`Analyse de l'annonce impossible (${e.message}) : rédaction à partir de l'annonce seule.`, "warn"); }
-      setGen(appId, { step: 2, label: `Rédaction ${[pro.includes("cv") && "du CV", pro.includes("letter") && "de la lettre", other.length && "des messages"].filter(Boolean).join(", ")}…` });
-      const jobs = pro.map((t) => () => askJSON(s, {
-        system: SYSTEM_WRITER,
-        prompt: t === "cv" ? P.cvWrite(offer, p, analysis, prefs, instruction) : P.letterWrite(offer, p, analysis, prefs, instruction),
-        maxTokens: 9000,
-      }).then((r) => [t, r.data]));
-      if (other.length) jobs.push(() => askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, other, instruction, analysis), maxTokens: 8000 }).then((r) => ["rest", r.data]));
-      const settled = await settleLimited(jobs, RT.mode === "published" ? 2 : 3);
-      const failed = settled.filter((x) => x.status === "rejected").map((x) => x.reason?.message || String(x.reason));
-      const got = Object.fromEntries(settled.filter((x) => x.status === "fulfilled").map((x) => x.value));
       const lang = docLang(offer, prefs, analysis);
+      const failed = [];
+      const got = {};
       const drafts = {};
-      for (const t of pro) {
-        const raw = got[t]?.[t];
-        if (typeof raw !== "string" || !raw.trim()) continue;
-        const accent = t === "cv" ? cleanHex(got.cv?.accent, null) : null;
-        drafts[t] = {
-          text: normalizeDoc(raw, t, lang), accent,
-          accentSource: accent ? str(got.cv?.accentSource) || "suggérée" : null,
-          tips: t === "cv" ? (got.cv?.tips || []).map(String).filter(Boolean).slice(0, 4) : [],
-        };
+      const appNow = R.current.apps.find((a) => a.id === appId) || app;
+      const facts = selectedFacts(appNow, offer, R.current.briefs);
+      const extra = { facts, appBlock: appMotivationBlock(appNow, offer, p, facts), employer: employerRule(appNow, p) };
+      const qaCtx = (x) => lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p, app: appNow, briefs: R.current.briefs, ...x });
+      /* Passe de correction ciblée après rédaction (points « autoFix » du contrôle qualité). */
+      const autoFix = async (t, d, extra) => {
+        d.autoFixed = 0;
+        const issues = autoFixList(analyzeDoc(d.text, t, qaCtx(extra)));
+        if (!issues.length) return;
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000 });
+          let txt = d.text;
+          for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
+            if (touchesLocked(e?.before, lockedOf(p))) continue;
+            const nt = applyEdit(txt, e?.before, e?.after);
+            if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
+          }
+          d.text = normalizeDoc(txt, t, lang);
+        } catch { /* passe facultative : le document reste utilisable */ }
+      };
+      const restJob = other.length
+        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis, extra), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
+        : Promise.resolve();
+      /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
+      if (pro.includes("cv")) {
+        const master = masterOf(p, lang);
+        setGen(appId, { step: 2, label: master ? "Adaptation du CV maître…" : "Rédaction du CV…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, { ...extra, master: master?.text, masterLang: lang }), p), maxTokens: 9000 });
+          const raw = r.data?.cv;
+          if (typeof raw === "string" && raw.trim()) {
+            const accent = cleanHex(r.data?.accent, null);
+            const written = normalizeDoc(raw, "cv", lang);
+            drafts.cv = { text: master ? normalizeDoc(enforceMaster(written, master.text, lockedOf(p)), "cv", lang) : written, masterAt: master?.at || null, accent, accentSource: accent ? str(r.data?.accentSource) || "suggérée" : null, tips: (r.data?.tips || []).map(String).filter(Boolean).slice(0, 4) };
+            setGen(appId, { step: 3, label: "Contrôle qualité du CV…" });
+            await autoFix("cv", drafts.cv);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
       }
-      if (Object.keys(drafts).length) {
-        setGen(appId, { step: 3, label: "Contrôle qualité et corrections ciblées…" });
-        await Promise.all(Object.entries(drafts).map(async ([t, d]) => {
-          const rep = analyzeDoc(d.text, t, lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p }));
-          const issues = autoFixList(rep);
-          d.autoFixed = 0;
-          if (!issues.length) return;
-          try {
-            const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), maxTokens: 5000 });
-            let txt = d.text;
-            for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
-              const nt = applyEdit(txt, e?.before, e?.after);
-              if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
-            }
-            d.text = normalizeDoc(txt, t, lang);
-          } catch { /* passe facultative : le document reste utilisable */ }
-        }));
+      if (pro.includes("letter")) {
+        const cvText = drafts.cv?.text || app.drafts?.cv?.text || app.docs?.cv?.slice(-1)[0]?.text || "";
+        setGen(appId, { step: 2, label: cvText ? "Rédaction de la lettre à partir du CV (sans le répéter)…" : "Rédaction de la lettre…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText, extra), p), maxTokens: 9000 });
+          const raw = r.data?.letter;
+          if (typeof raw === "string" && raw.trim()) {
+            drafts.letter = { text: normalizeDoc(raw, "letter", lang), accent: null, accentSource: null, tips: [], used: normalizeUsed(r.data?.used), cvText };
+            setGen(appId, { step: 3, label: "Contrôle qualité de la lettre…" });
+            await autoFix("letter", drafts.letter, { cvText });
+            drafts.letter.metrics = letterMetrics(drafts.letter.text, cvText);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
       }
+      await restJob;
       const versions = {};
       const meta = () => ({ id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction), prefs, analysisSig: analysis?.sig || null });
-      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed };
+      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed, ...(t === "letter" ? { used: d.used, metrics: d.metrics } : { masterAt: d.masterAt || null }) };
       const rest = got.rest || {};
       for (const t of other) {
         const d = rest[t];
@@ -4086,14 +4570,65 @@ export default function RadarApp() {
     const { settings: s, profile: p } = R.current;
     const { app, offer } = appAndOffer(appId);
     const analysis = app.analysis || null;
-    const args = { ...payload, analysis, profile: p, offer };
+    const cvText = latestCvText(app);
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const args = { cvText, facts, employer: employerRule(app, p), appBlock: appMotivationBlock(app, offer, p, facts), ...payload, analysis, profile: p, offer };
     const prompt = { review: P.review, fix: P.fixDoc, section: P.improveSection, headlines: P.headlines }[action];
     if (!prompt) throw new Error("Action inconnue.");
-    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: prompt(args), maxTokens: action === "headlines" ? 2500 : 6000 });
+    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000 });
     return data || {};
   });
 
   /* « J'ai cette compétence » : ajoutée au profil et marquée comme prouvée pour cette candidature. */
+  /* 6b : règles apprises de vos corrections (au moins 3 documents corrigés) ; jamais activées seules. */
+  const learnRules = () => withBusy("learn-rules", async () => {
+    const { settings: s, profile: p } = R.current;
+    const l = learningOf(p);
+    const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+    const edits = l.edits.filter((e) => new Date(e.at).getTime() > since);
+    if (new Set(edits.map((e) => `${e.appId}:${e.type}`)).size < 3) throw new Error("Corrigez et enregistrez au moins 3 documents générés avant l'apprentissage.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.learnRules(edits, writingRulesOf(p)), maxTokens: 3000 });
+    const found = (Array.isArray(data?.rules) ? data.rules : []).map((r) => ({ text: str(r?.text), evidence: str(r?.evidence) })).filter((r) => r.text).slice(0, 5);
+    setProfile((pp) => {
+      const cur = writingRulesOf(pp);
+      const nid = (i) => `L${Date.now().toString(36)}${i}`;
+      const add = found.filter((r) => !cur.some((c) => normText(c.text) === normText(r.text))).map((r, i) => ({ id: nid(i), text: r.text, evidence: r.evidence, active: false, origin: "apprise", createdAt: nowISO() }));
+      return { ...pp, writingRules: [...cur, ...add], ruleLearning: { ...learningOf(pp), lastLearnAt: nowISO() } };
+    });
+    toast(found.length ? `${found.length} règle(s) proposée(s), inactives : activez celles qui vous conviennent.` : "Aucune correction récurrente détectée.", found.length ? "ok" : "neutral");
+    return found.length;
+  });
+  /* 6c / 6d : CV maître par langue et puces verrouillées. */
+  const setMasterCv = (lang, text, sourceAppId) => setProfile((p) => ({ ...p, masterCv: { ...(p.masterCv || {}), [lang]: { text, at: nowISO(), sourceAppId: sourceAppId || null } } }));
+  const clearMasterCv = (lang) => setProfile((p) => { const m = { ...(p.masterCv || {}) }; delete m[lang]; return { ...p, masterCv: m }; });
+  const toggleLockedBullet = (text) => setProfile((p) => {
+    const cur = lockedOf(p);
+    const k = bulletKey(text);
+    return { ...p, lockedBullets: cur.some((x) => bulletKey(x) === k) ? cur.filter((x) => bulletKey(x) !== k) : [...cur, String(text).replace(/^[-•*]\s*/, "").trim()] };
+  });
+
+  /* Entretien de motivation : l'IA range les réponses dans la fiche, en reformulant seulement. */
+  const draftMotivation = (answers) => withBusy("motiv-draft", async () => {
+    const { settings: s, profile: p } = R.current;
+    const filled = answers.filter((x) => str(x.a));
+    if (filled.length < 3) throw new Error("Répondez à au moins 3 questions.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.motivationDraft(filled, motivOf(p)), maxTokens: 6000 });
+    const d = data && typeof data === "object" ? data : {};
+    const t = (x) => (typeof x === "string" ? x.trim() : "");
+    const proposal = {
+      ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, t(d[f.id])])),
+      convictions: (Array.isArray(d.convictions) ? d.convictions : []).map((c) => t(c?.text ?? c)).filter(Boolean),
+      stories: (Array.isArray(d.stories) ? d.stories : []).map((x) => ({ title: t(x?.title), situation: t(x?.situation), action: t(x?.action), result: t(x?.result), lesson: t(x?.lesson) })).filter((x) => x.title || x.situation || x.action),
+      sectors: (Array.isArray(d.sectors) ? d.sectors : []).map(t).filter(Boolean),
+      followUps: (Array.isArray(d.followUps) ? d.followUps : []).map((f) => ({ field: t(f?.field), q: t(f?.q) })).filter((f) => f.q).slice(0, 3),
+    };
+    /* Garde-fou « rien ajouté » : tout chiffre absent des réponses est signalé. */
+    const src = new Set(sigNumbers(filled.map((x) => x.a).join("\n")));
+    const out = JSON.stringify({ ...proposal, followUps: [] });
+    proposal.inventedNumbers = sigNumbers(out).filter((n) => !src.has(n));
+    return proposal;
+  });
+
   const declareSkill = (appId, term) => {
     setProfile((p) => (p.skills.some((x) => normText(x) === normText(term)) ? p : { ...p, skills: [...p.skills, term] }));
     patchApp(appId, (a) => (a.analysis ? { ...a, analysis: { ...a.analysis, keywords: a.analysis.keywords.map((k) => (k.term === term ? { ...k, status: "prouvé", evidence: "déclarée par vous (ajoutée au profil)" } : k)) } } : a));
@@ -4102,8 +4637,18 @@ export default function RadarApp() {
 
   const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
     const prev = a.docs?.[type]?.slice(-1)[0];
-    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, ...keep } = prev || {};
-    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition" };
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, edits: _e, ...keep } = prev || {};
+    /* 6b / 7 : écart avec la dernière version IA (mesure des corrections manuelles, matière de l'apprentissage des règles). */
+    const base = [...(a.docs?.[type] || [])].reverse().find((x) => x.origin === "IA");
+    const delta = base && (type === "cv" || type === "letter") ? editDelta(base.text, text) : null;
+    if (delta && delta.hunks.length && !a.demo) {
+      setProfile((p) => {
+        const l = learningOf(p);
+        const entry = { id: uid("ed"), appId, type, lang: base.language || null, at: nowISO(), pct: delta.pct, hunks: delta.hunks };
+        return { ...p, ruleLearning: { ...l, edits: [...l.edits.filter((e) => !(e.appId === appId && e.type === type && e.baseId === base.id)), { ...entry, baseId: base.id }].slice(-40) } };
+      });
+    }
+    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition", ...(delta ? { edits: { baseId: base.id, pct: delta.pct, changed: delta.changed } } : {}) };
     const drafts = { ...(a.drafts || {}) };
     delete drafts[type];
     return addLogEntry({ ...a, drafts, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
@@ -4122,7 +4667,7 @@ export default function RadarApp() {
     const fu = app?.followUps.find((f) => f.id === fuId);
     const offer = O.find((o) => o.id === app?.offerId);
     const contact = C.find((c) => app?.contactIds?.includes(c.id));
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.followUp(app, offer, fu, p, contact), maxTokens: 3000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.followUp(app, offer, fu, p, contact), p), maxTokens: 3000 });
     if (!data?.body) throw new Error("Aucun texte reçu.");
     setFollowUp(appId, fuId, { draft: { subject: data.subject || "", body: data.body, createdAt: nowISO() } });
     toast("Relance rédigée — à relire", "ok");
@@ -4140,9 +4685,16 @@ export default function RadarApp() {
     const { settings: s, profile: p, apps: A, offers: O } = R.current;
     const app = A.find((a) => a.id === appId);
     const offer = O.find((o) => o.id === app?.offerId);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.prep(offer, p), web: { maxUses: 6 }, maxTokens: 14000 });
+    const brief = offer?.company ? R.current.briefs[briefKey(offer.company)] : null;
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p, { facts: briefFresh(brief) ? brief.facts : [], appBlock: appMotivationBlock(app, offer, p, facts) }), p), web: { maxUses: briefFresh(brief) ? 3 : 6 }, maxTokens: 14000 });
     const d = res.data || {};
-    const seen = (u) => !!u && res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+    const seen = (u) => !!u && (res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u)) || (briefFresh(brief) && brief.facts.some((f) => canonicalUrl(f.url) === canonicalUrl(u))));
+    /* Les faits vérifiés de la préparation enrichissent la fiche entreprise (réutilisée par la lettre). */
+    if (offer?.company) {
+      const nb = makeBrief({ company: offer.company, summary: d.company?.summary, facts: (d.company?.facts || []).map((f) => ({ text: f?.text, url: f?.sourceUrl })), origin: "prep", verifiedUrls: [...res.urls, ...(briefFresh(brief) ? brief.facts.map((f) => f.url) : [])] });
+      if (nb.facts.length) setBriefs((cur) => ({ ...cur, [briefKey(offer.company)]: mergeBriefs(cur[briefKey(offer.company)], nb) }));
+    }
     const prep = {
       createdAt: nowISO(),
       summary: str(d.company?.summary),
@@ -4216,7 +4768,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -4226,6 +4778,7 @@ export default function RadarApp() {
     setOffers(obj.offers || []);
     setApps(obj.apps || []);
     setContacts(obj.contacts || []);
+    if (obj.briefs && typeof obj.briefs === "object") setBriefs(obj.briefs);
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -4239,6 +4792,7 @@ export default function RadarApp() {
     setOffers([]);
     setApps([]);
     setContacts([]);
+    setBriefs({});
     setTodayAI(null);
     toast("Plateforme réinitialisée", "ok");
   };
@@ -4301,6 +4855,21 @@ export default function RadarApp() {
       subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
       subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
       subs.push(RT.db.collection("veille_verify").onSnapshot((snap) => snap.docs.forEach(ingestVerify), quiet));
+      /* Fiches entreprise déposées par la Routine (tâche « brief ») : seuls les faits avec URL sont repris. */
+      subs.push(RT.db.collection("veille_briefs").onSnapshot((snap) => {
+        setBriefs((cur) => {
+          let changed = false;
+          const next = { ...cur };
+          snap.docs.forEach((d) => {
+            const r = d.data() || {};
+            const key = briefKey(r.company || d.id);
+            if (!key || (cur[key] && cur[key].routineAt === r.createdAt)) return;
+            next[key] = { ...mergeBriefs(cur[key], makeBrief({ company: r.company || d.id, summary: r.summary, facts: r.facts, origin: "routine", createdAt: r.createdAt })), routineAt: r.createdAt };
+            changed = true;
+          });
+          return changed ? next : cur;
+        });
+      }, quiet));
       subs.push(RT.db.collection("veille_ratings").onSnapshot((snap) => {
         setRatings((cur) => {
           let changed = false;
@@ -4351,14 +4920,14 @@ export default function RadarApp() {
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, draftMotivation, learnRules, setMasterCv, clearMasterCv, toggleLockedBullet, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
     openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText, patchOfferNow, createSpontaneous, setSpontOpen,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
-    ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
+    ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
     bulkAction, lastBulk, setLastBulk, undoBulk, runRules, dedupeNow, requestVerify, dupePending,
     openDupePending: () => dupePending && setDupeProposals(dupePending), visitPrev, unreadCount,
   };
@@ -6569,7 +7138,7 @@ function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, ai
       {aiOpen && (
         <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
           <div className="flex flex-wrap gap-1.5">
-            {AI_GOALS.map(([g, l]) => (
+            {AI_GOALS.filter(([g]) => kind === "cv" || g !== "keywords").map(([g, l]) => (
               <Btn key={g} size="sm" variant="soft" disabled={aiBusy || (g === "keywords" && !missingCount)} onClick={() => onAI(g)}>
                 {l}{g === "keywords" ? ` (${missingCount || 0})` : ""}
               </Btn>
@@ -6681,6 +7250,28 @@ function ScoreRing({ value }) {
     </svg>
   );
 }
+/* Lettre : deux jauges — recouvrement avec le CV (≤ 15 %) et spécificité. */
+function LetterGauges({ scores }) {
+  const T = useT();
+  const ov = scores.overlap;
+  const ovTone = ov === null ? T.faint : ov > 30 ? "text-rose-600" : ov > 15 ? "text-amber-600" : "text-emerald-600";
+  const spTone = scores.spec === null ? T.faint : scores.spec >= 80 ? "text-emerald-600" : scores.spec >= 60 ? "text-amber-600" : "text-rose-600";
+  const Gauge = ({ label, value, unit, tone, hint, max }) => (
+    <div className={`rounded-2xl p-3 ${T.sub}`} title={hint}>
+      <div className={`text-xs ${T.muted}`}>{label}</div>
+      <div className={`text-2xl font-semibold tabular-nums ${tone}`}>{value === null || value === undefined ? "—" : `${value}${unit}`}</div>
+      <div className={`h-1.5 mt-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}>
+        <div className={`h-full rounded-full ${tone.replace("text-", "bg-")}`} style={{ width: `${value == null ? 0 : clamp((value / max) * 100, 0, 100)}%` }} />
+      </div>
+    </div>
+  );
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <Gauge label="Recouvrement CV" value={ov} unit=" %" tone={ovTone} max={50} hint="Part des suites de 4 mots de la lettre déjà présentes dans le CV. Cible ≤ 15 %, bloquant au-delà de 30 %." />
+      <Gauge label="Spécificité" value={scores.spec} unit="/100" tone={spTone} max={100} hint="Pourquoi eux (fait vérifié), conviction, histoire racontée, aucune flatterie." />
+    </div>
+  );
+}
 function ScoreBar({ label, value, hint }) {
   const T = useT();
   if (value === null || value === undefined) return null;
@@ -6737,6 +7328,55 @@ function ProposalCard({ p, text, api }) {
   );
 }
 
+/* 6c / 6d : CV maître par langue (base des CV adaptés) et puces verrouillées. */
+function MasterPanel({ app, offer, text }) {
+  const T = useT();
+  const { profile, setMasterCv, clearMasterCv, toggleLockedBullet } = useApp();
+  const lang = docLang(offer, { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, app.analysis);
+  const master = masterOf(profile, lang);
+  const locked = lockedOf(profile);
+  const bullets = master ? docOutline(master.text, "cv").sections.filter((s) => ["experience", "achievements"].includes(secKindOf(s.title))).flatMap((s) => s.lines.map((l) => l.trim()).filter((l) => /^[-•*]\s/.test(l)).map((l) => l.replace(/^[-•*]\s*/, ""))) : [];
+  return (
+    <div className="p-4 space-y-4">
+      <p className={`text-xs ${T.muted}`}>Le CV maître ({LANG_NAME[lang] || lang}) sert de base à chaque CV adapté : seuls la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences changent. Le reste est recopié à l'identique, même si l'IA s'en écarte.</p>
+      {!master ? (
+        <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+          <div className="text-sm font-medium">Aucun CV maître en {LANG_NAME[lang] || lang}</div>
+          <Btn size="sm" variant="primary" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Faire de ce CV le CV maître</Btn>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-2 items-center">
+            <Chip tone="accent">maître {String(lang).toUpperCase()} du {fmtDate(master.at)}</Chip>
+            <Btn size="sm" variant="soft" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Remplacer par ce CV</Btn>
+            <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => clearMasterCv(lang)}>Supprimer</Btn>
+          </div>
+          <div>
+            <SectionTitle>Écarts avec le maître</SectionTitle>
+            {normText(master.text) === normText(text) ? <p className={`text-xs ${T.faint}`}>Identique au maître.</p> : <DiffView before={master.text} after={text} compact />}
+          </div>
+          <div>
+            <SectionTitle>Puces verrouillées</SectionTitle>
+            <p className={`text-xs mb-2 ${T.muted}`}>Une puce verrouillée est recopiée mot pour mot : ni la génération, ni les corrections, ni la relecture ne la modifient.</p>
+            <ul className="space-y-1.5">
+              {bullets.map((b, i) => {
+                const on = locked.some((x) => bulletKey(x) === bulletKey(b));
+                return (
+                  <li key={i} className="flex gap-2 items-start text-sm">
+                    <button type="button" onClick={() => toggleLockedBullet(b)} aria-pressed={on} title={on ? "Déverrouiller" : "Verrouiller"} className={`shrink-0 mt-0.5 text-xs rounded-full px-2 py-0.5 ${on ? "bg-indigo-600 text-white" : T.chip} ${T.ring}`}>{on ? "verrouillée" : "libre"}</button>
+                    <span className="min-w-0">{b}</span>
+                  </li>
+                );
+              })}
+              {!bullets.length && <li className={`text-xs ${T.faint}`}>Aucune puce d'expérience ou de réalisation dans le maître.</li>}
+            </ul>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function OptimPanel({ app, offer, type, report, pages, text, api }) {
   const T = useT();
   const { busy, runAnalysis, setOfferAdText } = useApp();
@@ -6762,9 +7402,21 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
             <div className={`text-xs ${T.muted}`}>{report.words} mots · {pages || "…"} page(s){!analysis ? " · annonce non analysée" : ""}</div>
           </div>
         </div>
-        <ScoreBar label="Mots-clés ATS" value={report.scores.ats} hint="Couverture pondérée des mots-clés justifiables + intitulé exact" />
-        <ScoreBar label={type === "cv" ? "Impact" : "Pertinence"} value={report.scores.impact} hint={type === "cv" ? "Puces chiffrées, verbes d'action, absence de clichés" : "Entreprise citée, preuves chiffrées, objet, conclusion"} />
-        <ScoreBar label="Lisibilité" value={report.scores.read} hint="Longueur, pages, sections, répétitions" />
+        {type === "cv" ? (
+          <>
+            <ScoreBar label="Mots-clés ATS" value={report.scores.ats} hint="Couverture pondérée des mots-clés justifiables + intitulé exact" />
+            <ScoreBar label="Impact" value={report.scores.impact} hint="Puces chiffrées, verbes d'action, absence de clichés" />
+            <ScoreBar label="Lisibilité" value={report.scores.read} hint="Longueur, pages, sections, répétitions" />
+          </>
+        ) : (
+          <>
+            <LetterGauges scores={report.scores} />
+            <ScoreBar label="Spécificité (35 %)" value={report.scores.spec} hint="Faits propres à l'entreprise, conviction, histoire racontée, aucune flatterie" />
+            <ScoreBar label="Complémentarité avec le CV (25 %)" value={report.scores.compl} hint="Recouvrement de 4-grammes avec le CV ≤ 15 %, chiffres communs ≤ 1, 2 chiffres au plus" />
+            <ScoreBar label="Impact (20 %)" value={report.scores.impact} hint="Histoire racontée, objet, demande d'échange, aucun cliché" />
+            <ScoreBar label="Lisibilité (20 %)" value={report.scores.read} hint="Longueur, débuts de phrase, répétitions, une page" />
+          </>
+        )}
       </div>
       <div className="px-4 pt-3 overflow-x-auto">
         <Tabs
@@ -6776,6 +7428,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
             { id: "kw", label: "Mots-clés", count: report.kwPct !== null ? `${report.kwPct} %` : undefined },
             { id: "ai", label: "IA", count: pending.length || undefined },
             { id: "ad", label: offer?.spontaneous ? "Cible" : "Annonce" },
+            ...(type === "cv" ? [{ id: "master", label: "Maître" }] : []),
           ]}
         />
       </div>
@@ -6785,7 +7438,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
           {fixable.length > 0 && (
             <div className={`rounded-2xl p-3 ${T.accentSoft}`}>
               <Btn variant="primary" icon={Wand2} loading={api.busyFix} onClick={() => api.fix(fixable)}>Corriger automatiquement ({fixable.length})</Btn>
-              <p className="text-xs mt-2">L'IA propose des remplacements ciblés (titre, mots-clés, style) ; vous validez chacun dans l'onglet IA.</p>
+              <p className="text-xs mt-2">L'IA propose des remplacements ciblés ({type === "cv" ? "titre, mots-clés, style" : "pourquoi eux, conviction, histoire, recouvrement avec le CV, style"}) ; vous validez chacun dans l'onglet IA.</p>
             </div>
           )}
           {groups.map(([lvl, label]) => {
@@ -6902,6 +7555,7 @@ function OptimPanel({ app, offer, type, report, pages, text, api }) {
         </div>
       )}
 
+      {tab === "master" && <MasterPanel app={app} offer={offer} text={text} />}
       {tab === "ad" && (
         <div className="p-4 space-y-5">
           {analysis ? (
@@ -6973,6 +7627,96 @@ function GenSteps({ st }) {
   );
 }
 
+/* ── Pourquoi cette candidature : faits sourcés, pourquoi eux / ce rôle, conviction et histoire, employeur nommé ou non ── */
+function AppMotivationCard({ app, offer, types }) {
+  const T = useT();
+  const { profile, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, busy, go } = useApp();
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const set = (patch) => setAppMotivation(app.id, patch);
+  const company = offer?.spontaneous === "base" ? null : str(offer?.company);
+  const brief = company ? briefs[briefKey(company)] : null;
+  const facts = companyFactsFor(app, offer, briefs);
+  const chosen = m.factIds.length ? facts.filter((f) => m.factIds.includes(f.id)) : facts;
+  const [src, setSrc] = useState({ open: false, url: "", text: "" });
+  const bKey = company ? `brief:${briefKey(company)}` : "";
+  const writesLetter = types.some((t) => t !== "cv");
+  const toggleFact = (id) => {
+    const base = m.factIds.length ? m.factIds : facts.map((f) => f.id);
+    set({ factIds: base.includes(id) ? base.filter((x) => x !== id) : [...base, id] });
+  };
+  const missing = [
+    company && !chosen.length && "aucun fait sourcé sur l'entreprise",
+    !m.whyRole.trim() && !bank.whyNow.trim() && "pourquoi ce rôle maintenant",
+    !bank.convictions.length && "aucune conviction dans vos Motivations",
+    !bank.stories.length && "banque d'histoires vide",
+  ].filter(Boolean);
+  return (
+    <Card className="p-6 space-y-4 lg:col-span-3">
+      <div>
+        <div className="text-lg font-medium tracking-tight">Pourquoi cette candidature</div>
+        <p className={`text-sm mt-1 ${T.muted}`}>Le CV prouve, la lettre explique. Ces choix nourrissent la lettre{offer?.spontaneous ? "" : ", le message LinkedIn et la réponse « Pourquoi nous ? »"} ; jamais le CV. Laissé vide, un passage s'écrit [à compléter] et bloque l'envoi.</p>
+      </div>
+
+      <Toggle checked={m.employerNamed} onChange={(v) => set({ employerNamed: v })} label="Nommer mon employeur actuel (CV et lettre)" description={m.employerNamed ? `Le CV et la lettre citent « ${profile.experiences?.[0]?.org || "votre employeur"} ».` : "Ni le CV ni la lettre ne le nomment : « une fédération patronale belge ». Toute mention est bloquée au contrôle."} />
+
+      {writesLetter && (
+        <>
+          {company && (
+            <FieldBox label={`Faits sourcés sur ${company}`} hint={brief ? `Fiche ${briefFresh(brief) ? `valable jusqu'au ${fmtDate(brief.expiresAt)}` : "expirée (plus de 60 jours)"} · origine : ${brief.origin}. Un fait sans URL vérifiée est exclu.` : "Faits de l'annonce et de la fiche entreprise. Un fait sans URL vérifiée est exclu."}>
+              {facts.length ? (
+                <ul className="space-y-1.5">
+                  {facts.map((f) => (
+                    <li key={f.id} className="flex gap-2 items-start text-sm">
+                      <input type="checkbox" className="mt-1" checked={!m.factIds.length || m.factIds.includes(f.id)} onChange={() => toggleFact(f.id)} aria-label={`Retenir ${f.id}`} />
+                      <span className="flex-1 min-w-0">{f.text} <ExtLink href={f.url} className="text-xs">{f.source === "annonce" ? "annonce" : hostOf(f.url)}</ExtLink></span>
+                      {f.source !== "annonce" && <IconBtn icon={X} label="Retirer de la fiche" onClick={() => removeBriefFact(company, f.id)} className="w-7 h-7" />}
+                    </li>
+                  ))}
+                </ul>
+              ) : <p className={`text-sm ${T.faint}`}>Aucun fait sourcé pour l'instant.</p>}
+              <div className="flex flex-wrap gap-2 mt-3">
+                <Btn size="sm" icon={Search} loading={!!busy[bKey]} onClick={() => requestBrief(company, offer?.title ? `poste visé : ${offer.title}` : "")}>{brief ? "Actualiser la fiche" : "Rechercher des faits"}</Btn>
+                <Btn size="sm" variant="ghost" icon={Plus} onClick={() => setSrc((x) => ({ ...x, open: !x.open }))}>Coller une source</Btn>
+              </div>
+              {src.open && (
+                <div className={`rounded-2xl p-3 mt-2 space-y-2 ${T.sub}`}>
+                  <Input value={src.url} onChange={(e) => setSrc({ ...src, url: e.target.value })} placeholder="URL de la source (obligatoire)" aria-label="URL de la source" />
+                  <Textarea rows={5} value={src.text} onChange={(e) => setSrc({ ...src, text: e.target.value })} placeholder="Collez le texte : page « À propos », rapport annuel, article, post LinkedIn de l'entreprise…" aria-label="Texte de la source" />
+                  <Btn size="sm" variant="primary" icon={Wand2} loading={!!busy[bKey]} disabled={!isHttp(src.url) || src.text.trim().length < 80} onClick={async () => { const r = await addManualBrief(company, src.url.trim(), src.text); if (r) setSrc({ open: false, url: "", text: "" }); }}>Extraire les faits</Btn>
+                </div>
+              )}
+            </FieldBox>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {company && <Field label={`Pourquoi ${company} ?`} hint="Votre lien réel avec un fait retenu."><Textarea rows={3} value={m.whyCompany} onChange={(e) => set({ whyCompany: e.target.value })} /></Field>}
+            <Field label="Pourquoi ce rôle, maintenant ?" hint={bank.whyNow ? `Par défaut : « ${bank.whyNow.slice(0, 80)}${bank.whyNow.length > 80 ? "…" : ""} »` : "Rien dans vos Motivations."}><Textarea rows={3} value={m.whyRole} onChange={(e) => set({ whyRole: e.target.value })} /></Field>
+            {company && <Field label="Lien personnel (facultatif)" hint="Client, utilisateur, rencontre, secteur…"><Textarea rows={2} value={m.personalLink} onChange={(e) => set({ personalLink: e.target.value })} /></Field>}
+            <Field label="Conviction à mettre en avant">
+              <Select value={m.convictionId || ""} onChange={(e) => set({ convictionId: e.target.value || null })} className="w-full">
+                <option value="">{bank.convictions.length ? "Au choix de l'IA" : "Aucune conviction renseignée"}</option>
+                {bank.convictions.map((c) => <option key={c.id} value={c.id}>{c.id} · {c.text.slice(0, 70)}</option>)}
+              </Select>
+            </Field>
+            <Field label="Histoire à raconter">
+              <Select value={m.storyId || ""} onChange={(e) => set({ storyId: e.target.value || null })} className="w-full">
+                <option value="">{bank.stories.length ? "Au choix de l'IA" : "Banque d'histoires vide"}</option>
+                {bank.stories.map((x) => <option key={x.id} value={x.id}>{x.id} · {x.title || x.situation.slice(0, 60)}</option>)}
+              </Select>
+            </Field>
+          </div>
+          {missing.length > 0 && (
+            <Notice tone="warn" icon={AlertTriangle}>
+              Manquant : {missing.join(" · ")}. La lettre écrira [à compléter] à ces endroits.{" "}
+              {(!bank.convictions.length || !bank.stories.length) && <button type="button" className="underline underline-offset-4" onClick={() => go("profile")}>Compléter mes Motivations</button>}
+            </Notice>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
 function StudioSetup({ app, offer, type, onDone, onCancel }) {
   const T = useT();
   const { generateDocs, busy, genStatus, setOfferAdText, patchOfferNow, profile, go } = useApp();
@@ -7029,6 +7773,7 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
           <div className={`text-xs ${T.faint}`}>{ad.length} caractères{offer?.sources?.[0]?.url ? <> · <ExtLink href={offer.sources[0].url}>ouvrir l'annonce</ExtLink></> : null}</div>
         </Card>
         )}
+        <AppMotivationCard app={app} offer={offer} types={types} />
         <div className="lg:col-span-2 space-y-4">
           <Card className="p-6 space-y-4">
             <div className="text-lg font-medium tracking-tight">Réglages</div>
@@ -7145,7 +7890,7 @@ function DocStudio({ appId, type, setType, onClose }) {
 
 function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
   const T = useT();
-  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus } = useApp();
+  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs } = useApp();
   const wide = useMedia("(min-width: 1024px)");
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
@@ -7247,8 +7992,8 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 
   /* Contrôle qualité en direct */
   const report = useMemo(
-    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords })),
-    [text, type, pages, app.analysis, prefs.voice, profile.headline, lang], // eslint-disable-line react-hooks/exhaustive-deps
+    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })),
+    [text, type, pages, app.analysis, app.motivation, briefs, prefs.voice, profile.headline, profile.motivation, lang, type === "letter" ? latestCvText(app) : ""], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const missing = report.kw.filter((k) => k.status !== "absent" && !k.found);
 
@@ -7278,7 +8023,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   const [hlOpts, setHlOpts] = useState([]);
   const addProposals = (edits, source) => {
     const list = (Array.isArray(edits) ? edits : [])
-      .filter((e) => e && typeof e.before === "string" && typeof e.after === "string" && e.before.trim() && e.before !== e.after)
+      .filter((e) => e && typeof e.before === "string" && typeof e.after === "string" && e.before.trim() && e.before !== e.after && !touchesLocked(e.before, lockedOf(profile)))
       .map((e) => ({ id: uid("p"), before: e.before, after: e.after, reason: str(e.reason), severity: ["haute", "moyenne", "basse"].includes(e.severity) ? e.severity : null, source, status: "pending" }));
     setProposals((l) => [...list, ...l.filter((x) => x.status === "pending")]);
     return list.length;
@@ -7509,7 +8254,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 /* Carte de document dans la fiche candidature : vignette, score, accès au studio. */
 function StudioDocCard({ app, offer, type }) {
   const T = useT();
-  const { openStudio, settings, profile, genStatus } = useApp();
+  const { openStudio, settings, profile, genStatus, briefs } = useApp();
   const versions = app.docs?.[type] || [];
   const v = versions[versions.length - 1];
   const draft = app.drafts?.[type];
@@ -7517,7 +8262,7 @@ function StudioDocCard({ app, offer, type }) {
   const text = useDraft ? draft.text : v?.text;
   const lang = v?.language || app.docLanguage || offer?.language || "fr";
   const rep = useMemo(
-    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords })) : null),
+    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })) : null),
     [text, app.analysis, type], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const z = 0.15;
@@ -7722,6 +8467,55 @@ function AppContacts({ app }) {
    14. ASSISTANT CANDIDATURE
    ════════════════════════════════════════════════════════════════════════ */
 
+/* Ch.7 · Mesures : ce que la lettre utilise, recouvrement avec le CV, corrections manuelles par document (doit baisser), étape atteinte. */
+function docMeasures(app) {
+  const pick = (t) => {
+    const list = app.docs?.[t] || [];
+    const ia = [...list].reverse().find((v) => v.origin === "IA");
+    const ed = [...list].reverse().find((v) => v.origin === "édition" && v.edits && (!ia || v.edits.baseId === ia.id));
+    return { ia, pct: ed ? ed.edits.pct : ia ? null : undefined };
+  };
+  const cv = pick("cv"), letter = pick("letter");
+  const lm = letter.ia?.metrics || (letter.ia ? letterMetrics(letter.ia.text, cv.ia?.text || "") : null);
+  return { at: (letter.ia || cv.ia)?.createdAt || null, cvPct: cv.pct, letterPct: letter.pct, overlap: lm?.overlap ?? null, numbers: lm?.numbers ?? null, used: letter.ia?.used || null, reached: app.reached ?? STAGE_INDEX[app.stage] };
+}
+function QualityStats() {
+  const T = useT();
+  const { allApps, offers } = useApp();
+  const rows = (allApps || []).filter((a) => a.docs?.cv?.length || a.docs?.letter?.length).map((a) => ({ a, o: offers.find((o) => o.id === a.offerId), m: docMeasures(a) })).filter((r) => r.m.at).sort((x, y) => new Date(x.m.at) - new Date(y.m.at));
+  if (!rows.length) return null;
+  const edited = rows.map((r) => [r.m.cvPct, r.m.letterPct].filter((x) => typeof x === "number")).filter((l) => l.length).map((l) => l.reduce((n, x) => n + x, 0) / l.length);
+  const half = Math.floor(edited.length / 2);
+  const avg = (l) => (l.length ? Math.round(l.reduce((n, x) => n + x, 0) / l.length) : null);
+  const early = avg(edited.slice(0, half)), late = avg(edited.slice(half));
+  const pctCell = (x) => (typeof x === "number" ? `${x} %` : x === null ? "non retouché" : "—");
+  return (
+    <Card className="p-6 lg:col-span-3">
+      <SectionTitle action={edited.length >= 4 && early !== null && late !== null ? <Chip tone={late <= early ? "ok" : "warn"}>corrections : {early} % → {late} %</Chip> : null}>Mesures des dossiers</SectionTitle>
+      <p className={`text-xs mb-3 ${T.muted}`}>Corrections manuelles = part des mots modifiés entre la version IA et votre version enregistrée (doit baisser au fil des candidatures). Recouvrement = part de la lettre déjà présente dans le CV (cible ≤ 15 %).</p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className={`text-left ${T.muted}`}><th className="py-1 pr-3 font-medium">Candidature</th><th className="pr-3 font-medium">Généré</th><th className="pr-3 font-medium">Corrections CV</th><th className="pr-3 font-medium">Corrections lettre</th><th className="pr-3 font-medium">Recouvrement</th><th className="pr-3 font-medium">Chiffres</th><th className="pr-3 font-medium">Lettre utilise</th><th className="font-medium">Étape atteinte</th></tr></thead>
+          <tbody>
+            {rows.slice(-15).reverse().map(({ a, o, m }) => (
+              <tr key={a.id} className={`border-t ${T.line}`}>
+                <td className="py-1.5 pr-3">{o?.title || "—"}<span className={T.faint}> · {show(o?.company)}</span></td>
+                <td className="pr-3 tabular-nums">{fmtDate(m.at)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.cvPct)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.letterPct)}</td>
+                <td className={`pr-3 tabular-nums ${m.overlap > 30 ? "text-rose-600" : m.overlap > 15 ? "text-amber-600" : ""}`}>{m.overlap === null ? "—" : `${m.overlap} %`}</td>
+                <td className={`pr-3 tabular-nums ${m.numbers > 2 ? "text-amber-600" : ""}`}>{m.numbers ?? "—"}</td>
+                <td className="pr-3">{m.used ? [m.used.companyFacts?.length ? `${m.used.companyFacts.length} fait(s)` : "0 fait", m.used.convictionId ? "conviction" : null, m.used.storyId ? "histoire" : null].filter(Boolean).join(" · ") : "—"}</td>
+                <td>{STAGES[m.reached]?.label || "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
 function AssistantView() {
   const T = useT();
   const { apps, allApps, offers, settings, openApp, openStudio, addToPipeline, go, setSpontOpen } = useApp();
@@ -7818,6 +8612,7 @@ function AssistantView() {
             </div>
           )}
         </Card>
+        <QualityStats />
       </div>
     </div>
   );
@@ -8213,9 +9008,11 @@ function ProfileView() {
   return (
     <div>
       <PageHeader title="Profil & critères" subtitle={`Version active : ${activeVersion(criteria)?.label}`} />
-      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
+      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "motivations", label: "Motivations" }, { id: "rules", label: "Règles d'écriture" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
       {tab === "criteria" && <CriteriaEditor />}
       {tab === "profile" && <ProfileEditor />}
+      {tab === "motivations" && <MotivationEditor />}
+      {tab === "rules" && <WritingRulesEditor />}
       {tab === "history" && <CriteriaHistory />}
     </div>
   );
@@ -8289,6 +9086,175 @@ function CriteriaEditor() {
           <ListEditor items={d.redFlags} onChange={(v) => set("redFlags", v)} placeholder="Nouveau signal" />
         </Card>
       </div>
+    </div>
+  );
+}
+
+/* ── Motivations : le « pourquoi » (lettre, messages, entretien ; jamais le CV) ── */
+function MotivationEditor() {
+  const T = useT();
+  const { profile, setProfile, draftMotivation, busy, toast } = useApp();
+  const m = motivOf(profile);
+  const setM = (patch) => setProfile((p) => ({ ...p, motivation: { ...motivOf(p), ...patch } }));
+  /* Réponses conservées dans le profil (champ facultatif), pour reprendre l'entretien plus tard. */
+  const answers = profile.motivationAnswers && typeof profile.motivationAnswers === "object" ? profile.motivationAnswers : {};
+  const setAnswer = (id, a) => setProfile((p) => ({ ...p, motivationAnswers: { ...(p.motivationAnswers || {}), [id]: a } }));
+  const [extra, setExtra] = useState([]);
+  const questions = [...MOTIV_QUESTIONS, ...extra];
+  const [step, setStep] = useState(0);
+  const q = questions[Math.min(step, questions.length - 1)];
+  const [prop, setProp] = useState(null);
+  const [pick, setPick] = useState({});
+  const answered = questions.filter((x) => str(answers[x.id])).length;
+  const runDraft = async () => {
+    const r = await draftMotivation(questions.map((x) => ({ field: x.field, q: x.q, a: answers[x.id] || "" })));
+    if (!r) return;
+    setProp(r);
+    setPick({ ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, !!r[f.id]])), convictions: r.convictions.length > 0, stories: r.stories.length > 0, sectors: r.sectors.length > 0 });
+    if (r.followUps.length) {
+      const fu = r.followUps.map((f, i) => ({ id: `fu-${Date.now().toString(36)}-${i}`, field: f.field, q: f.q, followUp: true }));
+      setExtra((l) => [...l, ...fu]);
+    }
+  };
+  const apply = () => {
+    const cur = motivOf(profile);
+    const patch = {};
+    for (const f of MOTIV_TEXT_FIELDS) if (pick[f.id] && prop[f.id]) patch[f.id] = prop[f.id];
+    const nid = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+    if (pick.convictions) { const l = [...cur.convictions]; prop.convictions.forEach((t) => { if (!l.some((c) => normText(c.text) === normText(t))) l.push({ id: nid("c", l), text: t }); }); patch.convictions = l; }
+    if (pick.stories) { const l = [...cur.stories]; prop.stories.forEach((st) => l.push({ id: nid("s", l), ...st })); patch.stories = l; }
+    if (pick.sectors) patch.sectors = [...new Set([...cur.sectors, ...prop.sectors])];
+    setM(patch);
+    setProp(null);
+    toast("Motivations mises à jour", "ok");
+  };
+  const upConv = (id, text) => setM({ convictions: m.convictions.map((c) => (c.id === id ? { ...c, text } : c)) });
+  const upStory = (id, k, v) => setM({ stories: m.stories.map((x) => (x.id === id ? { ...x, [k]: v } : x)) });
+  const newId = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle>Pourquoi cet onglet</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Le CV prouve, la lettre explique. Ce que vous écrivez ici nourrit la lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien. Jamais le CV. L'IA reformule vos mots, elle n'ajoute rien : sans matière, elle écrit [à compléter].</p>
+      </Card>
+
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle action={<span className={`text-xs ${T.muted}`}>{answered}/{questions.length} réponses</span>}>Entretien de motivation (IA)</SectionTitle>
+        <div className="flex flex-wrap gap-1.5">
+          {questions.map((x, i) => (
+            <button key={x.id} type="button" onClick={() => setStep(i)} aria-current={i === step} className={`w-8 h-8 rounded-full text-xs font-medium ${i === step ? "bg-indigo-600 text-white" : str(answers[x.id]) ? T.accentSoft : T.chip} ${T.ring}`} title={x.q}>{x.followUp ? "+" : i + 1}</button>
+          ))}
+        </div>
+        <div>
+          <div className="text-sm font-medium">{q.followUp ? "Relance : " : `${step + 1}. `}{q.q}</div>
+          <Textarea rows={6} className="mt-2" value={answers[q.id] || ""} onChange={(e) => setAnswer(q.id, e.target.value)} placeholder="Répondez librement, comme à l'oral. Les faits et les chiffres que vous donnez sont repris tels quels." aria-label={q.q} />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Btn variant="ghost" icon={ChevronLeft} disabled={step === 0} onClick={() => setStep((n) => n - 1)}>Précédente</Btn>
+          <Btn variant="soft" icon={ChevronRight} disabled={step >= questions.length - 1} onClick={() => setStep((n) => n + 1)}>Suivante</Btn>
+          <Btn variant="primary" icon={Wand2} loading={busy["motiv-draft"]} disabled={answered < 3} onClick={runDraft}>Ranger mes réponses dans la fiche</Btn>
+        </div>
+        {prop && (
+          <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+            <div className="text-sm font-medium">Proposition (reformulation de vos réponses)</div>
+            {prop.inventedNumbers.length > 0 && <Notice tone="warn" icon={AlertTriangle}>Chiffres absents de vos réponses : {prop.inventedNumbers.join(", ")}. Décochez ou corrigez après reprise.</Notice>}
+            {[...MOTIV_TEXT_FIELDS.map((f) => [f.id, f.label, prop[f.id]]), ["convictions", "Convictions (ajoutées)", prop.convictions.join(" · ")], ["stories", "Histoires (ajoutées)", prop.stories.map((x) => x.title || x.situation.slice(0, 50)).join(" · ")], ["sectors", "Secteurs (ajoutés)", prop.sectors.join(" · ")]].map(([id, label, val]) => (
+              <label key={id} className={`flex gap-3 items-start text-sm ${val ? "" : "opacity-50"}`}>
+                <input type="checkbox" className="mt-1" disabled={!val} checked={!!pick[id] && !!val} onChange={(e) => setPick({ ...pick, [id]: e.target.checked })} />
+                <span className="min-w-0"><span className="font-medium">{label}</span><span className={`block text-xs ${T.muted}`}>{val || "rien dans vos réponses"}</span></span>
+              </label>
+            ))}
+            {prop.followUps.length > 0 && <p className={`text-xs ${T.muted}`}>{prop.followUps.length} question(s) de relance ajoutée(s) à l'entretien (« + ») pour préciser des réponses trop vagues.</p>}
+            <div className="flex gap-2">
+              <Btn variant="primary" icon={Check} onClick={apply} disabled={!Object.values(pick).some(Boolean)}>Reprendre la sélection</Btn>
+              <Btn variant="ghost" onClick={() => setProp(null)}>Ignorer</Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <SectionTitle>Votre « pourquoi »</SectionTitle>
+        {MOTIV_TEXT_FIELDS.map((f) => (
+          <Field key={f.id} label={f.label} hint={f.hint}><Textarea rows={3} value={m[f.id]} onChange={(e) => setM({ [f.id]: e.target.value })} /></Field>
+        ))}
+        <Field label="Secteurs et organisations qui vous attirent"><ChipInput values={m.sectors} onChange={(v) => setM({ sectors: v })} placeholder="Ajouter…" /></Field>
+      </Card>
+
+      <div className="space-y-4">
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ convictions: [...m.convictions, { id: newId("c", m.convictions), text: "Nouvelle conviction" }] })}>Ajouter</Btn>}>Convictions</SectionTitle>
+          {!m.convictions.length && <p className={`text-xs ${T.faint}`}>Une phrase par conviction, telle que vous la défendriez en entretien.</p>}
+          {m.convictions.map((c) => (
+            <div key={c.id} className="flex gap-2 items-start">
+              <Chip>{c.id}</Chip>
+              <Textarea rows={2} value={c.text} onChange={(e) => upConv(c.id, e.target.value)} aria-label={`Conviction ${c.id}`} />
+              <IconBtn icon={X} label="Retirer" onClick={() => setM({ convictions: m.convictions.filter((x) => x.id !== c.id) })} />
+            </div>
+          ))}
+        </Card>
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ stories: [...m.stories, { id: newId("s", m.stories), title: "Nouvelle histoire", situation: "", action: "", result: "", lesson: "" }] })}>Ajouter</Btn>}>Banque d'histoires</SectionTitle>
+          {!m.stories.length && <p className={`text-xs ${T.faint}`}>2 à 5 histoires racontables : la lettre en raconte une, l'entretien s'en sert pour les réponses STAR.</p>}
+          {m.stories.map((x) => (
+            <div key={x.id} className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+              <div className="flex gap-2 items-center">
+                <Chip>{x.id}</Chip>
+                <Input value={x.title} onChange={(e) => upStory(x.id, "title", e.target.value)} aria-label="Titre" className="h-8" />
+                <IconBtn icon={Trash2} label="Retirer" onClick={() => setM({ stories: m.stories.filter((y) => y.id !== x.id) })} />
+              </div>
+              {[["situation", "Situation"], ["action", "Ce que vous avez fait"], ["result", "Ce que ça a changé"], ["lesson", "Ce que vous en retenez"]].map(([k, l]) => (
+                <Field key={k} label={l}><Textarea rows={2} value={x[k]} onChange={(e) => upStory(x.id, k, e.target.value)} /></Field>
+              ))}
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ── Règles d'écriture (6a) : injectées dans toutes les rédactions ; prioritaires sur le style, jamais sur la vérité ── */
+function WritingRulesEditor() {
+  const T = useT();
+  const { profile, setProfile, learnRules, busy } = useApp();
+  const rules = writingRulesOf(profile);
+  const learning = learningOf(profile);
+  const pending = pendingLearnDocs(profile);
+  const save = (l) => setProfile((p) => ({ ...p, writingRules: l }));
+  const up = (id, patch) => save(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const newId = () => { let i = rules.length + 1; while (rules.some((r) => r.id === `r${i}`)) i++; return `r${i}`; };
+  return (
+    <div className="space-y-4 max-w-4xl">
+      <Card className="p-6 space-y-2">
+        <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => save([...rules, { id: newId(), text: "Nouvelle règle", active: true, origin: "manuelle" }])}>Ajouter</Btn>}>Règles d'écriture</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Injectées dans le CV, la lettre, les messages, les corrections, la relecture et la préparation d'entretien. Elles priment sur les consignes de style, jamais sur la vérité : une preuve absente de votre profil reste [à compléter]. Les règles « départ » sont à valider : modifiez-les ou désactivez-les.</p>
+      </Card>
+      <Card className="p-6 space-y-2">
+        <SectionTitle>Apprendre de mes corrections</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Chaque fois que vous enregistrez un CV ou une lettre retouché à la main, l'écart avec la version IA est mémorisé ({learning.edits.length} correction(s) en mémoire). À partir de 3 documents corrigés, l'IA propose les règles que vous appliquez de façon récurrente. Elles arrivent <strong>inactives</strong> : rien n'est activé sans vous.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Chip tone={pending >= 3 ? "ok" : "neutral"}>{pending} document(s) corrigé(s) depuis le dernier apprentissage</Chip>
+          {learning.lastLearnAt && <span className={`text-xs ${T.faint}`}>dernier : {fmtDate(learning.lastLearnAt)}</span>}
+          <Btn size="sm" variant="primary" icon={Wand2} loading={busy["learn-rules"]} disabled={pending < 3} onClick={learnRules}>Proposer des règles</Btn>
+        </div>
+      </Card>
+      {rules.map((r) => (
+        <Card key={r.id} className="p-4">
+          <div className="flex gap-3 items-start">
+            <input type="checkbox" className="mt-2" checked={!!r.active} onChange={(e) => up(r.id, { active: e.target.checked })} aria-label="Règle active" />
+            <div className="flex-1 min-w-0 space-y-1">
+              <Textarea rows={2} value={r.text} onChange={(e) => up(r.id, { text: e.target.value })} aria-label={`Règle ${r.id}`} />
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <Chip tone={r.active ? "ok" : r.origin === "apprise" ? "warn" : "neutral"}>{r.active ? "active" : r.origin === "apprise" ? "à valider" : "inactive"}</Chip>
+                <Chip>{r.origin || "manuelle"}</Chip>
+                {r.evidence && <span className={`text-xs ${T.muted}`}>Observé : {r.evidence}</span>}
+              </div>
+            </div>
+            <IconBtn icon={Trash2} label="Supprimer" onClick={() => save(rules.filter((x) => x.id !== r.id))} />
+          </div>
+        </Card>
+      ))}
     </div>
   );
 }
