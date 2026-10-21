@@ -5,13 +5,14 @@
  * IA : API Claude appelée depuis l'artefact (web_search + serveurs MCP Gmail / Google Calendar).
  * Principe : l'IA prépare, l'utilisateur valide. Rien n'est envoyé sans action explicite.
  */
-import React, { useState, useEffect, useMemo, useRef, useCallback, useContext, createContext } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback, useContext, createContext, useDeferredValue } from "react";
 import {
   LayoutDashboard, Briefcase, Columns, Sparkles, BellRing, Users, Radio, User, ShieldCheck, Search,
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
   Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
   Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Star, Palette, ChevronLeft,
+  RotateCw, Crop, GripVertical, ArrowUp, ArrowDown, ArrowLeftRight, Languages, FileDown, Redo2, ZoomIn, ZoomOut, Archive,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -32,6 +33,8 @@ const KEYS = {
   apps: "radar:apps",
   contacts: "radar:contacts",
   ratings: "radar:ratings",
+  media: "radar:media",
+  inbox: "radar:inbox",
 };
 
 const STAGES = [
@@ -50,6 +53,7 @@ const OUTCOMES = [
   { id: "refused", label: "Refus" },
   { id: "withdrawn", label: "Abandon" },
   { id: "accepted", label: "Acceptée" },
+  { id: "noresponse", label: "Sans réponse" },
 ];
 const OUTCOME_LABEL = Object.fromEntries(OUTCOMES.map((o) => [o.id, o.label]));
 const FU_KINDS = { relance1: "1re relance", relance2: "2e relance", merci: "Remerciement", custom: "Relance" };
@@ -62,7 +66,9 @@ const DOC_TYPES = [
 ];
 const DOC_LABEL = Object.fromEntries(DOC_TYPES.map((d) => [d.id, d.label]));
 const REPLY_KINDS = {
+  confirmation_candidature: "Candidature confirmée",
   accuse_reception: "Accusé de réception",
+  test_evaluation: "Test / évaluation",
   invitation_entretien: "Invitation à un entretien",
   refus: "Refus",
   demande_info: "Demande d'information",
@@ -70,6 +76,17 @@ const REPLY_KINDS = {
   autre: "Autre",
 };
 const CONTACT_TYPES = { recruiter: "Recruteur", agency: "Cabinet", hiring: "Hiring manager", network: "Réseau" };
+/* Expéditeurs des logiciels de recrutement (accusés de réception, invitations) et confirmations des job boards. */
+const ATS_SENDERS = ["myworkday.com", "workday.com", "smartrecruiters.com", "greenhouse.io", "lever.co", "teamtailor.com", "recruitee.com", "successfactors.com", "successfactors.eu", "taleo.net", "icims.com", "personio.de", "workablemail.com", "jobvite.com", "bamboohr.com", "softgarden.io", "join.com", "homerun.co", "cornerstoneondemand.com", "jobs-noreply@linkedin.com", "indeedapply.com", "indeed.com"];
+/* Silence d'une candidature envoyée : jours depuis le dernier signal (envoi, e-mail reçu, appel, entretien). */
+function silenceDays(a) {
+  if (!a || !["sent", "followup"].includes(a.stage) || !a.sentAt) return null;
+  const last = [a.sentAt, ...(a.emails || []).map((m) => m.date || m.at), ...(a.log || []).filter((l) => ["email", "call", "interview"].includes(l.type)).map((l) => l.at)]
+    .map((d) => new Date(d).getTime()).filter(Number.isFinite).reduce((m, x) => Math.max(m, x), 0);
+  return last ? Math.floor((Date.now() - last) / 864e5) : null;
+}
+const lastEmail = (a) => [...(a?.emails || [])].sort((x, y) => new Date(y.date || y.at) - new Date(x.date || x.at))[0] || null;
+const gmailLink = (m) => (m?.threadId ? `https://mail.google.com/mail/u/0/#all/${m.threadId}` : m?.subject ? `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(`subject:"${m.subject}"`)}` : null);
 
 const DEFAULT_SETTINGS = {
   theme: "system",
@@ -80,6 +97,16 @@ const DEFAULT_SETTINGS = {
   employerNames: ["FEB", "VBO", "Fédération des Entreprises de Belgique", "Verbond van Belgische Ondernemingen"],
   model: "claude-opus-5-5",
   fallbackModel: "claude-sonnet-5-5",
+  modelBalanced: "claude-sonnet-5-5",
+  modelFast: "claude-haiku-5-5",
+  routing: true,
+  effortTuning: true,
+  promptCache: true,
+  designDefault: null,
+  autoReplies: true,
+  autoRepliesHours: 12,
+  ghostDays: 21,
+  seenUntracked: [],
   mcpMode: "auto",
   mcp: { gmail: "https://gmail.mcp.claude.com/mcp", gcal: "https://gcal.mcp.claude.com/mcp" },
   restrictTools: true,
@@ -95,6 +122,7 @@ const DEFAULT_SETTINGS = {
   lastWatchAt: null,
   lastGmailImportAt: null,
   lastReplyCheckAt: null,
+  lastReplyWindowAt: null,
   autoWatch: false,
   autoWatchHours: 24,
   autoGmail: false,
@@ -446,28 +474,30 @@ const isOldOffer = (o, days) => {
 const ratingKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
 const fmtRating = (r) => (r && typeof r.rating === "number" ? r.rating.toFixed(1).replace(".", ",") : null);
 
-/* ── Documents « prêts à envoyer » : balisage léger → aperçu, texte ATS et PDF ──
+/* ── Documents « prêts à envoyer » : balisage léger → modèle → mise en page ──
    # Nom · > accroche (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section / objet
-   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe */
+   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe
+   Chaque bloc garde ses lignes sources (l0, l1) : un clic dans l'aperçu édite exactement ces lignes. */
 function parseDoc(text) {
   const blocks = [];
-  let para = [];
-  const flush = () => { if (para.length) { blocks.push({ t: "para", text: para.join(" ") }); para = []; } };
-  for (const raw of String(text || "").split("\n")) {
+  let para = null;
+  const flush = () => { if (para) { blocks.push({ t: "para", text: para.lines.join(" "), l0: para.l0, l1: para.l1 }); para = null; } };
+  const push = (b, i) => { flush(); blocks.push({ ...b, l0: i, l1: i }); };
+  String(text || "").split("\n").forEach((raw, i) => {
     const l = raw.trim();
     let m;
-    if (!l) { flush(); continue; }
-    if (l.startsWith("### ")) { flush(); blocks.push({ t: "h3", text: l.slice(4) }); }
-    else if (l.startsWith("## ")) { flush(); blocks.push({ t: "h2", text: l.slice(3) }); }
-    else if (l.startsWith("# ")) { flush(); blocks.push({ t: "name", text: l.slice(2) }); }
-    else if (/^[-•*] /.test(l)) { flush(); blocks.push({ t: "bullet", text: l.slice(2) }); }
-    else if (l.startsWith("> ")) { flush(); blocks.push({ t: "quote", text: l.slice(2) }); }
-    else if (l.startsWith("@ ")) { flush(); blocks.push({ t: "contact", text: l.slice(2) }); }
-    else if (l.startsWith("= ")) { flush(); blocks.push({ t: "date", text: l.slice(2) }); }
-    else if (l.startsWith("~ ")) { flush(); blocks.push({ t: "sign", text: l.slice(2) }); }
-    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) { flush(); blocks.push({ t: "kv", label: m[1], text: m[2] }); }
-    else para.push(l);
-  }
+    if (!l) { flush(); return; }
+    if (l.startsWith("### ")) push({ t: "h3", text: l.slice(4) }, i);
+    else if (l.startsWith("## ")) push({ t: "h2", text: l.slice(3) }, i);
+    else if (l.startsWith("# ")) push({ t: "name", text: l.slice(2) }, i);
+    else if (/^[-•*] /.test(l)) push({ t: "bullet", text: l.slice(2) }, i);
+    else if (l.startsWith("> ")) push({ t: "quote", text: l.slice(2) }, i);
+    else if (l.startsWith("@ ")) push({ t: "contact", text: l.slice(2) }, i);
+    else if (l.startsWith("= ")) push({ t: "date", text: l.slice(2) }, i);
+    else if (l.startsWith("~ ")) push({ t: "sign", text: l.slice(2) }, i);
+    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) push({ t: "kv", label: m[1], text: m[2] }, i);
+    else { if (!para) para = { lines: [], l0: i, l1: i }; para.lines.push(l); para.l1 = i; }
+  });
   flush();
   return blocks.map((b) => ({ ...b, text: String(b.text || "").replace(/\*\*/g, ""), label: b.label && b.label.replace(/\*\*/g, "") }));
 }
@@ -484,10 +514,14 @@ function docPlainText(text) {
 const HEX = /^#?([0-9a-f]{6})$/i;
 const cleanHex = (h, fallback = "#3f3d56") => (HEX.test(String(h || "").trim()) ? `#${String(h).trim().replace("#", "").toLowerCase()}` : fallback);
 const hexRgb = (h) => { const x = cleanHex(h).slice(1); return [0, 2, 4].map((i) => parseInt(x.slice(i, i + 2), 16)); };
+const rgbHex = (r) => `#${r.map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("")}`;
+const mixHex = (a, b, t) => { const A = hexRgb(a), B = hexRgb(b); return rgbHex(A.map((v, i) => v + (B[i] - v) * t)); };
+const luminance = (h) => { const [r, g, b] = hexRgb(h).map((v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
 function keywordCoverage(text, terms) {
   const hay = ` ${normText(text)} `;
   const list = (terms || []).filter(Boolean);
-  const covered = list.filter((t) => hay.includes(` ${normText(t)} `) || hay.includes(normText(t)));
+  // Correspondance sur mots entiers : « IT » n'est plus compté présent dans « digital ».
+  const covered = list.filter((t) => { const n = normText(t); return n && hay.includes(` ${n} `); });
   return { covered, missing: list.filter((t) => !covered.includes(t)), pct: list.length ? Math.round((covered.length / list.length) * 100) : null };
 }
 
@@ -506,83 +540,911 @@ function loadJsPDF() {
   }
   return jspdfPromise;
 }
+/* Les polices PDF standard couvrent le jeu Windows-1252 (€, œ, ’, “ ”, – …). Hors de ce jeu, on retire
+   les accents (Dvořák → Dvorak) au lieu de supprimer la lettre. */
+const CP1252_EXTRA = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ";
+const TRANSLIT = { "\u0141": "L", "\u0142": "l", "\u0110": "D", "\u0111": "d", "\u0131": "i", "\u2192": "->", "\u2713": "v" };
 const pdfSafe = (t) => String(t || "")
-  .replace(/[\u2018\u2019\u201A\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u2033]/g, '"')
-  .replace(/[\u2013\u2014\u2212]/g, "-").replace(/\u2026/g, "...").replace(/\u20AC/g, "EUR")
-  .replace(/\u0153/g, "oe").replace(/\u0152/g, "OE").replace(/[\u00A0\u202F\u2009]/g, " ").replace(/[\u2022\u25CF\u25AA]/g, "-")
-  .replace(/[^\x00-\xFF]/g, "");
+  .replace(/[\u00A0\u202F\u2009]/g, " ").replace(/\u2212/g, "-").replace(/\u2032/g, "'").replace(/\u2033/g, '"')
+  .replace(/[^\x00-\xFF]/g, (ch) => (CP1252_EXTRA.includes(ch) ? ch : TRANSLIT[ch] ?? ch.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\x00-\xFF]/g, "")));
 
-async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
-  const { jsPDF } = await loadJsPDF();
-  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
-  doc.setProperties({ title: pdfSafe(title), subject: kind === "cv" ? "Curriculum vitae" : "Lettre de motivation", author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
-  const A = hexRgb(accent);
-  const M = 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
-  let y = 18;
-  const lh = (size) => size * 0.3528 * 1.38;
-  const ensure = (h) => { if (y + h > BOTTOM) { doc.addPage(); y = 18; } };
-  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color); };
-  const write = (txt, { size = 10, style = "normal", color = [45, 45, 45], indent = 0, after = 1.4, align } = {}) => {
-    font(size, style, color);
-    const lines = doc.splitTextToSize(pdfSafe(txt), W - indent);
-    for (const line of lines) {
-      ensure(lh(size));
-      if (align === "right") doc.text(line, M + W, y + lh(size) * 0.78, { align: "right" });
-      else doc.text(line, M + indent, y + lh(size) * 0.78);
-      y += lh(size);
-    }
-    y += after;
-  };
+/* ── Langues, sections, icônes ─────────────────────────────────────────── */
+const DOC_LANGS = ["fr", "nl", "en", "de"];
+const SECTION_ALIASES = {
+  profile: ["profil", "profiel", "profile", "summary", "professional summary", "résumé", "à propos", "about me", "over mij", "kurzprofil", "profil professionnel"],
+  achievements: ["réalisations clés", "réalisations", "belangrijkste realisaties", "realisaties", "key achievements", "achievements", "wichtigste erfolge", "erfolge"],
+  experience: ["expérience professionnelle", "expérience", "expériences", "parcours professionnel", "werkervaring", "beroepservaring", "ervaring", "professional experience", "work experience", "experience", "berufserfahrung", "berufliche erfahrung"],
+  skills: ["compétences", "compétences clés", "vaardigheden", "competenties", "skills", "core skills", "key skills", "kompetenzen", "kenntnisse", "fähigkeiten"],
+  languages: ["langues", "talen", "talenkennis", "languages", "sprachen", "sprachkenntnisse"],
+  education: ["formation", "formations", "études", "opleiding", "opleidingen", "education", "ausbildung", "bildung"],
+  certifications: ["certifications", "certificats", "certificaties", "certificaten", "certificates", "zertifikate", "zertifizierungen"],
+  interests: ["centres d'intérêt", "intérêts", "loisirs", "interesses", "hobby's", "interests", "hobbies", "interessen"],
+  projects: ["projets", "projets clés", "projecten", "projects", "key projects", "projekte"],
+};
+const SECTION_TITLES = {
+  fr: { profile: "Profil", achievements: "Réalisations clés", experience: "Expérience professionnelle", skills: "Compétences", languages: "Langues", education: "Formation", certifications: "Certifications", interests: "Centres d'intérêt", projects: "Projets" },
+  nl: { profile: "Profiel", achievements: "Belangrijkste realisaties", experience: "Werkervaring", skills: "Vaardigheden", languages: "Talen", education: "Opleiding", certifications: "Certificaten", interests: "Interesses", projects: "Projecten" },
+  en: { profile: "Profile", achievements: "Key achievements", experience: "Professional experience", skills: "Skills", languages: "Languages", education: "Education", certifications: "Certifications", interests: "Interests", projects: "Projects" },
+  de: { profile: "Profil", achievements: "Wichtigste Erfolge", experience: "Berufserfahrung", skills: "Kompetenzen", languages: "Sprachen", education: "Ausbildung", certifications: "Zertifikate", interests: "Interessen", projects: "Projekte" },
+};
+const ALIAS_INDEX = Object.entries(SECTION_ALIASES).flatMap(([k, l]) => l.map((a) => [normText(a), k]));
+function sectionKey(title) {
+  const n = normText(title);
+  const hit = ALIAS_INDEX.find(([a]) => a === n) || ALIAS_INDEX.find(([a]) => a.length > 5 && n.startsWith(a));
+  return hit ? hit[1] : `x_${n.replace(/\s+/g, "_").slice(0, 30) || "section"}`;
+}
+const baseKey = (k) => String(k || "").replace(/_\d+$/, "");
+const sectionLabel = (sec) => sec?.title || SECTION_TITLES.fr[baseKey(sec?.key)] || "Introduction";
+const SIDE_DEFAULT = ["skills", "languages", "certifications", "interests"];
+const PHOTO_SRC = { l0: -1, l1: -1, photo: true };
+
+/* Icônes vectorielles (24 × 24, trait), dessinées à l'identique dans l'aperçu, le PDF et le Word. */
+const DOC_ICONS = {
+  mail: ["M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M22 6l-10 7L2 6"],
+  phone: ["M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"],
+  pin: ["M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z", "M12 7a3 3 0 1 0 0 6a3 3 0 1 0 0-6z"],
+  linkedin: ["M16 8a6 6 0 0 1 6 6v7h-4v-7a2 2 0 0 0-4 0v7h-4v-7a6 6 0 0 1 6-6z", "M2 9h4v12H2z", "M4 2a2 2 0 1 0 0 4a2 2 0 1 0 0-4z"],
+  globe: ["M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z", "M2 12h20", "M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"],
+  user: ["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 3a4 4 0 1 0 0 8a4 4 0 1 0 0-8z"],
+  award: ["M12 2a7 7 0 1 0 0 14a7 7 0 1 0 0-14z", "M8.21 13.89L7 23l5-3 5 3-1.21-9.12"],
+  briefcase: ["M4 7h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z", "M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"],
+  zap: ["M13 2L3 14h9l-1 8 10-12h-9l1-8z"],
+  chat: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
+  cap: ["M22 10L12 5 2 10l10 5 10-5z", "M6 12v5c3 3 9 3 12 0v-5"],
+  check: ["M22 11.08V12a10 10 0 1 1-5.93-9.14", "M22 4L12 14.01l-3-3"],
+  heart: ["M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"],
+  folder: ["M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"],
+};
+const SECTION_ICON = { profile: "user", achievements: "award", experience: "briefcase", skills: "zap", languages: "chat", education: "cap", certifications: "check", interests: "heart", projects: "folder" };
+const contactIcon = (s) => (/^\S+@\S+\.\S+$/.test(s) ? "mail" : /linkedin\./i.test(s) ? "linkedin" : /^\+?[\d\s().\/-]{7,}$/.test(s) ? "phone" : /^(https?:\/\/|www\.)|\.(com|be|eu|net|org|io|dev|me|lu|nl|fr)(\/\S*)?$/i.test(s) ? "globe" : "pin");
+
+/* ── Modèle de document ────────────────────────────────────────────────── */
+function docModel(text, kind) {
   const blocks = parseDoc(text);
-  let seenName = false;
+  const head = { name: null, headline: [], contact: [] };
+  const letter = { date: null, recipient: [], subject: null, body: [], sign: null };
+  const sections = [];
+  const seen = {};
+  let cur = null;
   for (const b of blocks) {
-    if (b.t === "name") { seenName = true; write(b.text, { size: kind === "cv" ? 22 : 16, style: "bold", color: A, after: 0.6 }); }
-    else if (b.t === "quote") {
-      if (kind === "cv") write(b.text, { size: 12, color: [70, 70, 70], after: 1 });
-      else write(b.text, { size: 10, after: 0.2 });
+    if (kind === "letter") {
+      if (b.t === "name" && !head.name) head.name = b;
+      else if (b.t === "contact" && !letter.body.length) head.contact.push(b);
+      else if (b.t === "date" && !letter.date) letter.date = b;
+      else if (b.t === "quote" && !letter.subject && !letter.body.length) letter.recipient.push(b);
+      else if (b.t === "h2" && !letter.subject && !letter.body.length) letter.subject = b;
+      else if (b.t === "sign") letter.sign = b;
+      else letter.body.push(b);
+      continue;
     }
-    else if (b.t === "contact") {
-      write(b.text, { size: 9, color: [110, 110, 110], after: 1.6 });
-      if (seenName) { doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5; }
+    if (b.t === "h2") {
+      let key = sectionKey(b.text);
+      seen[key] = (seen[key] || 0) + 1;
+      if (seen[key] > 1) key = `${key}_${seen[key]}`;
+      cur = { key, title: b.text, heading: b, blocks: [] };
+      sections.push(cur);
+      continue;
     }
-    else if (b.t === "date") { y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
-    else if (b.t === "h2") {
-      if (kind === "cv") {
-        ensure(16); y += 2.5;
-        write(b.text.toUpperCase(), { size: 10.5, style: "bold", color: A, after: 0.4 });
-        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6;
-      } else { y += 2; write(b.text, { size: 10.5, style: "bold", color: [30, 30, 30], after: 3 }); }
+    if (!cur) {
+      if (b.t === "name" && !head.name) { head.name = b; continue; }
+      if (b.t === "quote") { head.headline.push(b); continue; }
+      if (b.t === "contact") { head.contact.push(b); continue; }
+      cur = { key: "intro", title: null, heading: null, blocks: [] };
+      sections.push(cur);
     }
-    else if (b.t === "h3") {
-      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-      ensure(12); y += 0.8;
-      write(parts[0] || "", { size: 10.5, style: "bold", color: [25, 25, 25], after: 0.2 });
-      if (parts.length > 1) write(parts.slice(1).join("  ·  "), { size: 9, color: [115, 115, 115], after: 1 });
-    }
-    else if (b.t === "bullet") {
-      ensure(lh(10));
-      doc.setFillColor(...A); doc.circle(M + 1.3, y + lh(10) * 0.5, 0.65, "F");
-      write(b.text, { indent: 4.5, after: 0.7 });
-    }
-    else if (b.t === "kv") {
-      font(10, "bold", [30, 30, 30]);
-      const label = `${pdfSafe(b.label)} `;
-      const lw = doc.getTextWidth(label);
-      font(10);
-      const first = doc.splitTextToSize(pdfSafe(b.text), W - lw);
-      ensure(lh(10));
-      font(10, "bold", [30, 30, 30]); doc.text(label, M, y + lh(10) * 0.78);
-      font(10); doc.text(first[0] || "", M + lw, y + lh(10) * 0.78);
-      y += lh(10);
-      const rest = first.slice(1).join(" ");
-      if (rest) write(rest, { after: 0.9 }); else y += 0.9;
-    }
-    else if (b.t === "sign") { y += 4; write(b.text, { style: "bold", after: 1 }); }
-    else write(b.text, { after: kind === "cv" ? 1.8 : 3.2 });
+    cur.blocks.push(b);
   }
-  const pages = doc.getNumberOfPages();
-  if (pages > 1) for (let i = 1; i <= pages; i++) { doc.setPage(i); font(8, "normal", [150, 150, 150]); doc.text(`${i} / ${pages}`, M + W, 297 - 9, { align: "right" }); }
-  return doc.output("arraybuffer");
+  return { kind, head, sections, letter, blocks };
+}
+const contactItems = (head) => head.contact.flatMap((b) => b.text.split(/\s*[|·•]\s*/).map((s) => s.trim()).filter(Boolean).map((s) => ({ text: s, icon: contactIcon(s), src: b })));
+
+function arrangeSections(sections, layout, two) {
+  const L = layout || {};
+  const keys = sections.map((s) => s.key);
+  const order = [...(L.order || []).filter((k) => keys.includes(k)), ...keys.filter((k) => !(L.order || []).includes(k))];
+  const hidden = new Set(L.hidden || []);
+  const isSide = (k) => (Array.isArray(L.side) ? L.side.includes(k) : SIDE_DEFAULT.includes(baseKey(k)));
+  const byKey = Object.fromEntries(sections.map((s) => [s.key, s]));
+  const main = [], side = [];
+  order.forEach((k) => { if (!hidden.has(k)) (two && isSide(k) ? side : main).push(byKey[k]); });
+  return { main, side, order, hidden, isSide };
+}
+
+/* ── Design : base, gabarits ───────────────────────────────────────────── */
+const PAGE_SIZES = { a4: [210, 297], letter: [215.9, 279.4] };
+const PT = 0.3528; // mm par point typographique
+const FONT_CSS = { sans: 'Helvetica, Arial, "Liberation Sans", sans-serif', serif: '"Times New Roman", Times, "Liberation Serif", serif', mono: '"Courier New", Courier, "Liberation Mono", monospace' };
+const FONT_PDF = { sans: "helvetica", serif: "times", mono: "courier" };
+const FONT_DOCX = { sans: "Arial", serif: "Times New Roman", mono: "Courier New" };
+
+const DESIGN_BASE = {
+  template: "ats", page: "a4",
+  font: "sans", headingFont: "sans", size: 10, lineHeight: 1.35, nameSize: 2.3, headingSize: 1.08, headingCase: "upper", headingSpacing: 0.4,
+  margin: { t: 16, r: 17, b: 15, l: 17 }, sectionGap: 5, itemGap: 2.2, paraGap: 1.6,
+  colors: { accent: "#1f3a5f", text: "#262626", muted: "#6b6b6b", rule: "#d4d4d4", side: "#f1f5f9", sideText: "#262626", band: "#1f3a5f", bandText: "#ffffff" },
+  header: "left", headingStyle: "line", rule: 0.3, bullet: "dot",
+  icons: false, sectionIcons: false, datesRight: true, skillsAsTags: false, justify: false,
+  columns: 1, side: "left", sideWidth: 32, colGap: 7, sideFull: false,
+  photo: { show: false, shape: "circle", size: 28, border: 0, borderColor: "#ffffff" },
+  layout: { order: [], side: null, hidden: [] },
+};
+const TEMPLATES = [
+  { id: "ats", label: "Classique ATS", hint: "1 colonne, sobre, lu par tous les logiciels de tri", d: { colors: { accent: "#1f3a5f", rule: "#1f3a5f" }, rule: 0.35 } },
+  { id: "modern", label: "Moderne", hint: "2 colonnes, photo ronde, icônes", d: { columns: 2, side: "right", sideWidth: 31, header: "left", headingStyle: "bar", icons: true, photo: { show: true, shape: "circle", size: 26 }, colors: { accent: "#2563eb", side: "#f1f5f9", rule: "#e2e8f0", band: "#2563eb" } } },
+  { id: "executive", label: "Exécutif", hint: "bandeau bord à bord, titres serif", d: { header: "band", headingFont: "serif", headingStyle: "line", icons: true, nameSize: 2.4, photo: { show: true, shape: "rounded", size: 27, border: 0.8, borderColor: "#ffffff" }, colors: { accent: "#1e293b", band: "#1e293b", bandText: "#ffffff", rule: "#94a3b8" } } },
+  { id: "minimal", label: "Minimal", hint: "centré, aéré, sans filet", d: { header: "center", headingStyle: "plain", headingSpacing: 1.4, headingSize: 0.95, sectionGap: 6.5, lineHeight: 1.45, colors: { accent: "#111827", muted: "#6b7280", rule: "#e5e7eb" } } },
+  { id: "compact", label: "Compact", hint: "dense, tient sur une page", d: { columns: 2, side: "left", sideWidth: 30, size: 9.2, lineHeight: 1.25, sectionGap: 3.6, itemGap: 1.6, paraGap: 1.1, headingStyle: "pill", skillsAsTags: true, margin: { t: 12, r: 12, b: 12, l: 12 }, colors: { accent: "#0f766e", side: "#f0fdfa", rule: "#99f6e4", band: "#0f766e" } } },
+  { id: "creative", label: "Créatif", hint: "colonne colorée bord à bord, photo", d: { columns: 2, side: "left", sideWidth: 33, sideFull: true, header: "side", headingStyle: "line", icons: true, sectionIcons: true, skillsAsTags: true, photo: { show: true, shape: "circle", size: 34, border: 1, borderColor: "#ffffff" }, colors: { accent: "#0f766e", side: "#134e4a", sideText: "#f0fdfa", rule: "#5eead4", band: "#0f766e" } } },
+  { id: "elegant", label: "Élégant", hint: "serif, centré, filets doubles", d: { font: "serif", headingFont: "serif", header: "center", headingStyle: "double", headingSpacing: 1.6, headingSize: 1.0, nameSize: 2.5, lineHeight: 1.4, colors: { accent: "#7c2d12", rule: "#d6c7b8", band: "#7c2d12" } } },
+];
+const TEMPLATE_BY_ID = Object.fromEntries(TEMPLATES.map((t) => [t.id, t]));
+function mergeDesign(a, b) {
+  const o = { ...a, ...(b || {}) };
+  ["colors", "margin", "photo", "layout"].forEach((k) => { o[k] = { ...(a?.[k] || {}), ...(b?.[k] || {}) }; });
+  return o;
+}
+function designFromTemplate(id, keep) {
+  const d = mergeDesign(DESIGN_BASE, TEMPLATE_BY_ID[id]?.d);
+  d.template = TEMPLATE_BY_ID[id] ? id : "ats";
+  if (keep?.layout) d.layout = deepClone(keep.layout);
+  if (keep?.accent) d.colors = { ...d.colors, accent: keep.accent, ...(TEMPLATE_BY_ID[id]?.d?.colors?.band === TEMPLATE_BY_ID[id]?.d?.colors?.accent ? { band: keep.accent } : {}) };
+  if (keep?.photoShow !== undefined) d.photo = { ...d.photo, show: keep.photoShow };
+  if (keep?.page) d.page = keep.page;
+  return d;
+}
+/* Design effectif d'une candidature : celui de la candidature, sinon le style par défaut, sinon le gabarit ATS
+   teinté de la couleur de charte proposée par l'IA. */
+function resolveDesign(app, settings, accent) {
+  if (app?.design) return mergeDesign(DESIGN_BASE, app.design);
+  const base = settings?.designDefault ? mergeDesign(DESIGN_BASE, settings.designDefault) : designFromTemplate("ats");
+  const a = cleanHex(accent, null);
+  return a ? { ...base, colors: { ...base.colors, accent: a, ...(base.colors.band === base.colors.accent ? { band: a } : {}), ...(base.colors.rule === base.colors.accent ? { rule: a } : {}) } } : base;
+}
+
+/* ── Mesure du texte (canvas : Arial ≈ Helvetica, Times New Roman ≈ Times, métriques compatibles) ── */
+let measureCtx = null;
+const measureCache = new Map();
+function textWidth(s, f) {
+  const key = `${f.font}|${f.bold ? 1 : 0}|${f.italic ? 1 : 0}|${s}`;
+  let r = measureCache.get(key);
+  if (r === undefined) {
+    if (measureCtx === null && typeof document !== "undefined") { try { measureCtx = document.createElement("canvas").getContext("2d") || false; } catch { measureCtx = false; } }
+    if (measureCtx) {
+      measureCtx.font = `${f.italic ? "italic " : ""}${f.bold ? "bold " : ""}100px ${FONT_CSS[f.font] || FONT_CSS.sans}`;
+      r = measureCtx.measureText(s).width / 100;
+    } else r = s.length * (f.bold ? 0.56 : 0.52);
+    if (measureCache.size > 30000) measureCache.clear();
+    measureCache.set(key, r);
+  }
+  return r * f.size * PT + (f.cs ? f.cs * Math.max(0, s.length - 1) : 0);
+}
+function wrapText(s, firstW, f, restW = firstW) {
+  const words = String(s || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  const width = () => (lines.length ? restW : firstW) * 0.99;
+  for (const w of words) {
+    const t = cur ? `${cur} ${w}` : w;
+    if (textWidth(t, f) <= width()) { cur = t; continue; }
+    if (cur) { lines.push(cur); cur = ""; }
+    if (textWidth(w, f) <= width()) { cur = w; continue; }
+    let part = "";
+    for (const ch of w) {
+      if (part && textWidth(part + ch, f) > width()) { lines.push(part); part = ch; } else part += ch;
+    }
+    cur = part;
+  }
+  if (cur || !lines.length) lines.push(cur);
+  return lines;
+}
+
+/* ── Mise en page : positions en mm, pages, zones cliquables ─────────────
+   Opérations : rect, line, circle, text (ligne de base), icon, photo. Zones : blocs (l0..l1) et sections. */
+function layoutDocument(model, design, { photo, lang = "fr" } = {}) {
+  const D = mergeDesign(DESIGN_BASE, design);
+  const C = D.colors;
+  const [W, H] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
+  const M = D.margin;
+  const isCv = model.kind === "cv";
+  const two = isCv && Number(D.columns) === 2;
+  const contentW = W - M.l - M.r;
+  const sideW = two ? (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100 : 0;
+  const mainW = two ? contentW - sideW - D.colGap : contentW;
+  const sideLeft = D.side !== "right";
+  const sideX = sideLeft ? M.l : M.l + mainW + D.colGap;
+  const mainX = two && sideLeft ? M.l + sideW + D.colGap : M.l;
+  const bottom = H - Math.max(M.b, 6) - 3;
+  const sideDark = luminance(C.side) < 0.35;
+  const sideBg = two && cleanHex(C.side) !== "#ffffff";
+  const pad = sideBg && !D.sideFull ? 4 : 0;
+  const headerMode = D.header === "side" && !two ? "left" : D.header;
+  const hasPhoto = !!(photo && D.photo.show);
+  const pages = [];
+  const page = (i) => { while (pages.length <= i) pages.push({ ops: [], hits: [], secs: [], sideTop: 0, sideBottom: 0 }); return pages[i]; };
+  const lh = (size) => size * PT * D.lineHeight;
+  const base = (size) => (lh(size) - size * PT) / 2 + size * PT * 0.8;
+  const boxes = new Map();
+  const track = (src, p, x, y0, w, y1, kind = "block") => {
+    if (!src) return;
+    const id = kind === "section" ? `s:${src.key}:${p}` : `b:${src.l0}:${p}`;
+    const b = boxes.get(id);
+    if (b) { b.x = Math.min(b.x, x); b.y0 = Math.min(b.y0, y0); b.x1 = Math.max(b.x1, x + w); b.y1 = Math.max(b.y1, y1); }
+    else boxes.set(id, { kind, p, x, y0, x1: x + w, y1, src });
+  };
+  const caseOf = (s) => (D.headingCase === "upper" ? String(s).toLocaleUpperCase(lang === "de" ? "de-DE" : "fr-BE") : s);
+  const palette = (inSide) => ({
+    text: inSide && sideBg ? C.sideText : C.text,
+    muted: inSide && sideBg ? (sideDark ? mixHex(C.sideText, C.side, 0.28) : C.muted) : C.muted,
+    accent: inSide && sideDark ? C.sideText : C.accent,
+    rule: inSide && sideDark ? mixHex(C.sideText, C.side, 0.45) : C.rule,
+    tag: inSide && sideDark ? mixHex(C.side, "#ffffff", 0.16) : mixHex(C.accent, "#ffffff", 0.88),
+    tagText: inSide && sideDark ? C.sideText : mixHex(C.accent, "#000000", 0.15),
+  });
+
+  /* Flux de colonne : y courant, page courante, saut de page automatique. */
+  const flow = (x, w, top, inSide) => ({ x, w, y: top, p: 0, top, inSide, first: true });
+  const ensure = (fl, h) => { if (fl.y + h > bottom && fl.y > M.t + 0.5) { fl.p += 1; fl.y = M.t + (fl.inSide && pad ? pad : 0); fl.first = true; } };
+  const text = (fl, s, x, f, anchor = "start", size = f.size) => {
+    page(fl.p).ops.push({ t: "text", x, y: fl.y + base(size), s, font: f.font, bold: !!f.bold, italic: !!f.italic, size: f.size, color: f.color, anchor, cs: f.cs || 0 });
+  };
+  const lines = (fl, arr, f, { x = fl.x, w = fl.w, src, justify = false, align = "start" } = {}) => {
+    const h = lh(f.size);
+    arr.forEach((ln, i) => {
+      ensure(fl, h);
+      if (justify && i < arr.length - 1 && ln.includes(" ")) {
+        const words = ln.split(" ");
+        const gap = (w - words.reduce((n, wd) => n + textWidth(wd, f), 0)) / (words.length - 1);
+        let cx = x;
+        if (gap < textWidth(" ", f) * 3) words.forEach((wd) => { text(fl, wd, cx, f); cx += textWidth(wd, f) + gap; });
+        else text(fl, ln, x, f);
+      } else if (align === "end") text(fl, ln, x + w, f, "end");
+      else if (align === "middle") text(fl, ln, x + w / 2, f, "middle");
+      else text(fl, ln, x, f);
+      track(src, fl.p, x, fl.y, w, fl.y + h);
+      fl.y += h;
+    });
+  };
+  const icon = (p, name, x, y, s, color) => { if (DOC_ICONS[name]) page(p).ops.push({ t: "icon", name, x, y, s, color }); };
+
+  /* ── Blocs ── */
+  const bulletMark = (fl, f, cy, color) => {
+    const x = fl.x + 0.9;
+    const o = page(fl.p).ops;
+    if (D.bullet === "dot") o.push({ t: "circle", cx: x + 0.3, cy, r: 0.55, fill: color });
+    else if (D.bullet === "square") o.push({ t: "rect", x: x - 0.25, y: cy - 0.55, w: 1.1, h: 1.1, fill: color });
+    else if (D.bullet === "dash") o.push({ t: "line", x1: x - 0.4, y1: cy, x2: x + 1.2, y2: cy, color, w: 0.3 });
+    else if (D.bullet === "arrow") o.push({ t: "text", x: x - 0.4, y: cy + f.size * PT * 0.32, s: "›", font: f.font, bold: true, italic: false, size: f.size * 1.15, color, anchor: "start", cs: 0 });
+  };
+  const block = (fl, b, sec) => {
+    const P = palette(fl.inSide);
+    const body = { font: D.font, size: D.size, color: P.text };
+    const key = baseKey(sec?.key);
+    if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      const role = parts[0] || "";
+      let rest = parts.slice(1);
+      const last = rest[rest.length - 1];
+      const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel|nu\b/i.test(last) ? last : null;
+      if (period) rest = rest.slice(0, -1);
+      const fRole = { font: D.font, bold: true, size: D.size * 1.03, color: P.text };
+      const fMeta = { font: D.font, size: D.size * 0.9, color: P.muted };
+      if (!fl.first) fl.y += D.itemGap * 0.8;
+      ensure(fl, lh(fRole.size) * 2 + lh(D.size));
+      const right = D.datesRight && period && fl.w > 60;
+      const pw = right ? textWidth(period, fMeta) + 3 : 0;
+      const rl = wrapText(role, fl.w - pw, fRole);
+      if (right) {
+        ensure(fl, lh(fRole.size));
+        page(fl.p).ops.push({ t: "text", x: fl.x + fl.w, y: fl.y + base(fRole.size), s: period, font: fMeta.font, bold: false, italic: false, size: fMeta.size, color: P.muted, anchor: "end", cs: 0 });
+      }
+      lines(fl, rl, fRole, { src: b, w: fl.w });
+      const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
+      if (meta) lines(fl, wrapText(meta, fl.w, fMeta), fMeta, { src: b });
+      fl.y += 0.6;
+    } else if (b.t === "bullet") {
+      const ind = D.bullet === "none" ? 0 : 3.6;
+      const arr = wrapText(b.text, fl.w - ind, body);
+      ensure(fl, lh(D.size));
+      if (D.bullet !== "none") bulletMark(fl, body, fl.y + lh(D.size) / 2, P.accent);
+      lines(fl, arr, body, { x: fl.x + ind, w: fl.w - ind, src: b });
+      track(b, fl.p, fl.x, fl.y - lh(D.size), ind, fl.y);
+      fl.y += D.itemGap * 0.25;
+    } else if (b.t === "kv") {
+      const fL = { ...body, bold: true };
+      if (D.skillsAsTags && key === "skills") {
+        const fT = { font: D.font, size: D.size * 0.86, color: P.tagText };
+        if (b.label) { lines(fl, wrapText(b.label.replace(/\s*:\s*$/, ""), fl.w, { ...fL, size: D.size * 0.92, color: P.muted }), { ...fL, size: D.size * 0.92, color: P.muted }, { src: b }); fl.y += 0.4; }
+        const tags = b.text.split(/\s*[,;·]\s*/).filter(Boolean);
+        const th = lh(fT.size) + 0.9;
+        let cx = fl.x;
+        ensure(fl, th + 1);
+        tags.forEach((tg) => {
+          const tw = Math.min(textWidth(tg, fT) + 3.4, fl.w);
+          if (cx > fl.x && cx + tw > fl.x + fl.w) { cx = fl.x; fl.y += th + 1.1; ensure(fl, th + 1); }
+          page(fl.p).ops.push({ t: "rect", x: cx, y: fl.y, w: tw, h: th, fill: P.tag, r: 1.2 });
+          page(fl.p).ops.push({ t: "text", x: cx + 1.7, y: fl.y + 0.45 + base(fT.size), s: tg, font: fT.font, bold: false, italic: false, size: fT.size, color: fT.color, anchor: "start", cs: 0 });
+          track(b, fl.p, cx, fl.y, tw, fl.y + th);
+          cx += tw + 1.3;
+        });
+        fl.y += th + 1.6;
+      } else {
+        const label = `${b.label} `;
+        const lw = textWidth(label, fL);
+        const arr = wrapText(b.text, Math.max(10, fl.w - lw), body, fl.w);
+        ensure(fl, lh(D.size));
+        text(fl, label.trim(), fl.x, fL);
+        lines(fl, arr.slice(0, 1), body, { x: fl.x + lw, w: fl.w - lw, src: b });
+        track(b, fl.p, fl.x, fl.y - lh(D.size), lw, fl.y);
+        if (arr.length > 1) lines(fl, arr.slice(1), body, { src: b });
+        fl.y += D.itemGap * 0.3;
+      }
+    } else if (b.t === "quote") {
+      const f = { ...body, italic: true, color: P.muted };
+      lines(fl, wrapText(b.text, fl.w, f), f, { src: b });
+      fl.y += D.paraGap;
+    } else {
+      lines(fl, wrapText(b.text, fl.w, body), body, { src: b, justify: !isCv && D.justify });
+      fl.y += isCv ? D.paraGap : Math.max(D.paraGap * 1.8, 3);
+    }
+    fl.first = false;
+  };
+
+  const heading = (fl, sec) => {
+    const P = palette(fl.inSide);
+    const f = { font: D.headingFont, bold: true, size: D.size * D.headingSize, color: P.accent, cs: D.headingCase === "upper" ? D.headingSpacing * PT : 0 };
+    const hh = lh(f.size);
+    ensure(fl, hh + 4 + lh(D.size) * 2);
+    const o = () => page(fl.p).ops;
+    const y0 = fl.y;
+    let x = fl.x;
+    const label = caseOf(sectionLabel(sec));
+    if (D.headingStyle === "double" && D.rule > 0) { o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: P.rule, w: D.rule }); fl.y += 1.4; }
+    if (D.headingStyle === "pill") { o().push({ t: "rect", x: fl.x, y: fl.y - 0.3, w: fl.w, h: hh + 0.6, fill: P.tag, r: 1.4 }); x += 2.2; }
+    if (D.headingStyle === "bar") { o().push({ t: "rect", x: fl.x, y: fl.y + hh * 0.18, w: 1.2, h: hh * 0.64, fill: P.accent, r: 0.3 }); x += 3.4; }
+    const icName = D.sectionIcons && SECTION_ICON[baseKey(sec.key)];
+    if (icName) { const s = f.size * PT * 1.15; icon(fl.p, icName, x, fl.y + (hh - s) / 2, s, P.accent); x += s + 1.8; }
+    const ls = wrapText(label, fl.x + fl.w - x, f);
+    const center = D.headingStyle !== "pill" && D.headingStyle !== "bar" && D.header === "center" && !two && !icName;
+    ls.forEach((ln) => { center ? text(fl, ln, fl.x + fl.w / 2, f, "middle") : text(fl, ln, x, f); fl.y += hh; });
+    if ((D.headingStyle === "line" || D.headingStyle === "double") && D.rule > 0) { fl.y += 0.9; o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: D.headingStyle === "line" ? P.rule : P.rule, w: D.rule }); fl.y += D.rule; }
+    fl.y += D.headingStyle === "plain" ? 1.2 : 2;
+    if (sec.heading) track(sec.heading, fl.p, fl.x, y0, fl.w, fl.y);
+    fl.first = true;
+  };
+  const section = (fl, sec) => {
+    if (!sec) return;
+    if (!fl.firstSection) fl.y += D.sectionGap; else fl.firstSection = false;
+    const p0 = fl.p, y0 = fl.y;
+    if (sec.heading) heading(fl, sec);
+    sec.blocks.forEach((b) => block(fl, b, sec));
+    for (let p = p0; p <= fl.p; p++) track(sec, p, fl.x, p === p0 ? y0 : M.t, fl.w, p === fl.p ? fl.y : bottom, "section");
+    page(fl.p).secs.push(sec.key);
+  };
+
+  /* ── En-tête ── */
+  const header = (x, w, y, mode, inSide) => {
+    const fl = { x, w, y, p: 0, inSide, first: true };
+    const P = palette(inSide);
+    const band = mode === "band";
+    const nameColor = band ? C.bandText : P.accent;
+    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : P.muted;
+    const center = mode === "center" || mode === "side";
+    const S = D.photo.size;
+    let tx = x, tw = w;
+    const y0 = y;
+    if (hasPhoto) {
+      if (center) { page(0).ops.push({ t: "photo", x: x + (w - S) / 2, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); fl.y += S + 4; }
+      else { page(0).ops.push({ t: "photo", x, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); tx = x + S + 6; tw = w - S - 6; }
+      track(PHOTO_SRC, 0, center ? x + (w - S) / 2 : x, center ? fl.y - S - 4 : fl.y, S, center ? fl.y - 4 : fl.y + S);
+    }
+    const opStart = page(0).ops.length;
+    const al = center ? "middle" : "start";
+    const ax = center ? tx + tw / 2 : tx;
+    const put = (arr, f, src) => arr.forEach((ln) => { text(fl, ln, ax, f, al); track(src, 0, tx, fl.y, tw, fl.y + lh(f.size)); fl.y += lh(f.size); });
+    if (model.head.name) {
+      const f = { font: D.headingFont, bold: true, size: D.size * D.nameSize, color: nameColor };
+      put(wrapText(model.head.name.text, tw, f), f, model.head.name);
+    }
+    model.head.headline.forEach((hb) => { const f = { font: D.font, size: D.size * 1.12, color: subColor }; fl.y += 0.6; put(wrapText(hb.text, tw, f), f, hb); });
+    const items = contactItems(model.head);
+    if (items.length) {
+      fl.y += 1.6;
+      const f = { font: D.font, size: D.size * 0.88, color: band ? subColor : P.muted };
+      const is = D.icons ? f.size * PT * 1.15 : 0;
+      const sep = D.icons ? 4 : textWidth("  ·  ", f);
+      const h = lh(f.size) + 0.4;
+      if (inSide) {
+        items.forEach((it) => {
+          const iw = textWidth(it.text, f);
+          const cw = Math.min(tw, iw + (is ? is + 1.4 : 0));
+          const cx = tx + (tw - cw) / 2;
+          if (is) icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent);
+          const arr = wrapText(it.text, tw - (is ? is + 1.4 : 0), f);
+          arr.forEach((ln, i) => { text(fl, ln, is ? cx + is + 1.4 : tx + tw / 2, f, is ? "start" : "middle"); if (i < arr.length - 1) fl.y += lh(f.size); });
+          track(it.src, 0, tx, fl.y, tw, fl.y + h);
+          fl.y += h;
+        });
+      } else {
+        const rows = [[]];
+        let rw = 0;
+        items.forEach((it) => {
+          const iw = Math.min(textWidth(it.text, f), tw) + (is ? is + 1.2 : 0);
+          if (rows[rows.length - 1].length && rw + sep + iw > tw) { rows.push([]); rw = 0; }
+          rows[rows.length - 1].push({ ...it, iw });
+          rw += (rw ? sep : 0) + iw;
+        });
+        rows.forEach((row) => {
+          const total = row.reduce((n, it, i) => n + it.iw + (i ? sep : 0), 0);
+          let cx = center ? tx + (tw - total) / 2 : tx;
+          row.forEach((it, i) => {
+            if (i && !D.icons) text(fl, "·", cx + sep / 2, { ...f, bold: true }, "middle");
+            if (i) cx += sep;
+            if (is) { icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent); }
+            text(fl, it.text, cx + (is ? is + 1.2 : 0), f);
+            track(it.src, 0, cx, fl.y, it.iw, fl.y + h);
+            cx += it.iw;
+          });
+          fl.y += h;
+        });
+      }
+    }
+    // Texte centré verticalement sur la photo quand celle-ci est plus haute.
+    if (hasPhoto && !center && fl.y - y0 < S) {
+      const dy = (S - (fl.y - y0)) / 2;
+      page(0).ops.slice(opStart).forEach((o) => { o.y += dy; });
+      const heads = new Set([model.head.name, ...model.head.headline, ...model.head.contact].filter(Boolean));
+      boxes.forEach((b) => { if (b.p === 0 && heads.has(b.src)) { b.y0 += dy; b.y1 += dy; } });
+    }
+    return Math.max(fl.y, hasPhoto && !center ? y0 + S : 0);
+  };
+
+  /* ── Assemblage ── */
+  let mainTop = M.t, sideTop = M.t;
+  if (headerMode === "band") {
+    page(0);
+    const bandIdx = pages[0].ops.length;
+    const end = header(M.l, contentW, Math.max(M.t * 0.75, 8), "band", false);
+    const bh = end + Math.max(M.t * 0.6, 6);
+    pages[0].ops.splice(bandIdx, 0, { t: "rect", x: 0, y: 0, w: W, h: bh, fill: C.band });
+    mainTop = sideTop = bh + Math.max(D.sectionGap, 5);
+  } else if (headerMode === "side" && two) {
+    sideTop = header(sideX + pad, sideW - 2 * pad, M.t + pad, "side", true) + D.sectionGap + 1;
+    mainTop = M.t;
+  } else if (isCv || model.head.name || model.head.contact.length) {
+    const end = header(M.l, contentW, M.t, headerMode === "center" ? "center" : "left", false);
+    const rule = headerMode !== "center" && D.headingStyle !== "plain" && D.rule > 0;
+    if (rule) pages[0].ops.push({ t: "line", x1: M.l, y1: end + 2.2, x2: M.l + contentW, y2: end + 2.2, color: C.accent, w: Math.max(D.rule, 0.5) });
+    mainTop = sideTop = end + (rule ? 2.2 + D.sectionGap + 0.6 : D.sectionGap + 1);
+  }
+
+  if (isCv) {
+    const arr = arrangeSections(model.sections, D.layout, two);
+    const main = flow(mainX, mainW, mainTop, false);
+    main.firstSection = true;
+    arr.main.forEach((sec) => section(main, sec));
+    if (two) {
+      const side = flow(sideX + pad, sideW - 2 * pad, sideTop + (headerMode === "side" ? 0 : pad), true);
+      side.firstSection = true;
+      arr.side.forEach((sec) => section(side, sec));
+      page(side.p);
+      pages.forEach((pg, i) => {
+        const top = i === 0 ? (headerMode === "side" ? 0 : headerMode === "band" ? mainTop - Math.max(D.sectionGap, 5) : (D.sideFull ? sideTop - D.sectionGap * 0.5 : sideTop)) : 0;
+        if (!sideBg) return;
+        const rect = D.sideFull
+          ? { x: sideLeft ? 0 : sideX - D.colGap / 2, y: top, w: sideLeft ? sideX + sideW + D.colGap / 2 : W - (sideX - D.colGap / 2), h: H - top }
+          : { x: sideX, y: i === 0 && headerMode !== "side" ? sideTop : M.t, w: sideW, h: (i === side.p ? side.y + pad : bottom) - (i === 0 && headerMode !== "side" ? sideTop : M.t), r: 2.5 };
+        if (rect.h > 0) pg.ops.unshift({ t: "rect", ...rect, fill: C.side });
+      });
+    }
+    page(main.p);
+  } else {
+    const L = model.letter;
+    const fl = flow(M.l, contentW, mainTop + 2, false);
+    const body = { font: D.font, size: D.size, color: C.text };
+    if (L.date) { lines(fl, [L.date.text], { ...body, color: C.muted }, { align: "end", src: L.date }); fl.y += 3; }
+    L.recipient.forEach((r) => lines(fl, wrapText(r.text, contentW * 0.6, body), body, { src: r }));
+    if (L.recipient.length) fl.y += 5;
+    if (L.subject) { const f = { ...body, bold: true }; lines(fl, wrapText(L.subject.text, contentW, f), f, { src: L.subject }); fl.y += 4; }
+    L.body.forEach((b) => block(fl, b, null));
+    if (L.sign) { fl.y += 3; const f = { ...body, bold: true }; lines(fl, wrapText(L.sign.text, contentW, f), f, { src: L.sign }); }
+    page(fl.p);
+  }
+
+  /* Numéros de page, zones cliquables */
+  if (pages.length > 1) pages.forEach((pg, i) => pg.ops.push({ t: "text", x: W - Math.max(M.r, 8), y: H - Math.max(M.b * 0.45, 4), s: `${i + 1} / ${pages.length}`, font: D.font, bold: false, italic: false, size: 7.5, color: C.muted, anchor: "end", cs: 0 }));
+  boxes.forEach((b) => page(b.p).hits.push({ kind: b.kind, x: b.x - 0.8, y: b.y0 - 0.4, w: b.x1 - b.x + 1.6, h: b.y1 - b.y0 + 0.8, src: b.src }));
+  return { W, H, pages, design: D, two };
+}
+
+/* ── Rendu PDF vectoriel (jsPDF) ───────────────────────────────────────── */
+const iconPngCache = new Map();
+function iconPng(name, color, px = 96) {
+  const key = `${name}|${color}|${px}`;
+  if (iconPngCache.has(key)) return iconPngCache.get(key);
+  const c = document.createElement("canvas");
+  c.width = c.height = px;
+  const ctx = c.getContext("2d");
+  ctx.scale(px / 24, px / 24);
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  (DOC_ICONS[name] || []).forEach((d) => ctx.stroke(new Path2D(d)));
+  const url = c.toDataURL("image/png");
+  iconPngCache.set(key, url);
+  return url;
+}
+const hexPoints = (x, y, s) => [[x + s / 2, y], [x + s, y + s * 0.25], [x + s, y + s * 0.75], [x + s / 2, y + s], [x, y + s * 0.75], [x, y + s * 0.25]];
+function pdfShape(pdf, o, style) {
+  if (o.shape === "circle") pdf.circle(o.x + o.s / 2, o.y + o.s / 2, o.s / 2, style);
+  else if (o.shape === "rounded") pdf.roundedRect(o.x, o.y, o.s, o.s, o.s * 0.18, o.s * 0.18, style);
+  else if (o.shape === "hexagon") {
+    const pts = hexPoints(o.x, o.y, o.s);
+    pdf.lines(pts.slice(1).map((p, i) => [p[0] - pts[i][0], p[1] - pts[i][1]]), pts[0][0], pts[0][1], [1, 1], style, true);
+  } else pdf.rect(o.x, o.y, o.s, o.s, style);
+}
+function drawPdfPage(pdf, pg, { photo }) {
+  for (const o of pg.ops) {
+    if (o.t === "rect") {
+      pdf.setFillColor(...hexRgb(o.fill));
+      if (o.r) pdf.roundedRect(o.x, o.y, o.w, o.h, o.r, o.r, "F"); else pdf.rect(o.x, o.y, o.w, o.h, "F");
+    } else if (o.t === "circle") { pdf.setFillColor(...hexRgb(o.fill)); pdf.circle(o.cx, o.cy, o.r, "F"); }
+    else if (o.t === "line") { pdf.setDrawColor(...hexRgb(o.color)); pdf.setLineWidth(o.w); pdf.line(o.x1, o.y1, o.x2, o.y2); }
+    else if (o.t === "text") {
+      pdf.setFont(FONT_PDF[o.font] || "helvetica", o.bold && o.italic ? "bolditalic" : o.bold ? "bold" : o.italic ? "italic" : "normal");
+      pdf.setFontSize(o.size);
+      pdf.setTextColor(...hexRgb(o.color));
+      const opt = {};
+      if (o.anchor === "end") opt.align = "right"; else if (o.anchor === "middle") opt.align = "center";
+      if (o.cs) opt.charSpace = o.cs;
+      pdf.text(pdfSafe(o.s), o.x, o.y, opt);
+    } else if (o.t === "icon") {
+      try { pdf.addImage(iconPng(o.name, o.color), "PNG", o.x, o.y, o.s, o.s, `ic_${o.name}_${o.color.slice(1)}`, "FAST"); } catch { /* icône facultative */ }
+    } else if (o.t === "photo" && photo?.src) {
+      pdf.saveGraphicsState();
+      pdfShape(pdf, o, null);
+      pdf.clip();
+      pdf.discardPath();
+      pdf.addImage(photo.src, "JPEG", o.x, o.y, o.s, o.s, "photo", "FAST");
+      pdf.restoreGraphicsState();
+      if (o.border > 0) { pdf.setDrawColor(...hexRgb(o.borderColor)); pdf.setLineWidth(o.border); pdfShape(pdf, o, "S"); }
+    }
+  }
+}
+async function buildPdf(items, { title, author, keywords, subject } = {}) {
+  const { jsPDF } = await loadJsPDF();
+  const first = items[0].layout;
+  const pdf = new jsPDF({ unit: "mm", format: [first.W, first.H], compress: true });
+  let n = 0;
+  for (const it of items) {
+    const start = n + 1;
+    it.layout.pages.forEach((pg) => { if (n > 0) pdf.addPage([it.layout.W, it.layout.H]); n += 1; drawPdfPage(pdf, pg, it); });
+    if (items.length > 1) { try { pdf.outline.add(null, pdfSafe(it.title), { pageNumber: start }); } catch { /* signets facultatifs */ } }
+  }
+  pdf.setProperties({ title: pdfSafe(title), subject: pdfSafe(subject || ""), author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
+  return pdf.output("arraybuffer");
+}
+
+/* ── ZIP (méthode « stockée », sans compression) : sert au .docx et aux exports groupés ── */
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+const toBytes = (d) => (typeof d === "string" ? new TextEncoder().encode(d) : d instanceof Uint8Array ? d : new Uint8Array(d));
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const time = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff;
+  const date = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const data = toBytes(f.data);
+    const crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]]
+      .forEach(([o, v, s]) => (s === 4 ? lh.setUint32(o, v, true) : lh.setUint16(o, v, true)));
+    parts.push(new Uint8Array(lh.buffer), name, data);
+    const ch = new DataView(new ArrayBuffer(46));
+    [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [30, 0, 2], [32, 0, 2], [34, 0, 2], [36, 0, 2], [38, 0, 4], [42, offset, 4]]
+      .forEach(([o, v, s]) => (s === 4 ? ch.setUint32(o, v, true) : ch.setUint16(o, v, true)));
+    central.push(new Uint8Array(ch.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, p) => n + p.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  all.forEach((p) => { out.set(p, o); o += p.length; });
+  return out;
+}
+const dataUrlBytes = (u) => { const b = atob(String(u).split(",")[1] || ""); const a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+
+/* ── Word (.docx) natif : styles Titre 1 / Titre 2 (lus par les ATS), colonnes en tableau, photo en forme native ── */
+const TW = 56.6929; // twips par mm
+const EMU = 36000; // EMU par mm
+const xmlEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const hexW = (h) => cleanHex(h).slice(1).toUpperCase();
+const DOCX_LANG = { fr: "fr-BE", nl: "nl-BE", en: "en-GB", de: "de-DE" };
+function buildDocx(items, { photo, title, author, keywords, mode = "design" } = {}) {
+  const media = [];
+  let drawId = 1;
+  const rels = [];
+  const mediaRel = (key, name, bytes) => {
+    let m = media.find((x) => x.key === key);
+    if (!m) { m = { key, name, bytes, rid: `rIdM${media.length + 1}` }; media.push(m); rels.push(`<Relationship Id="${m.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${name}"/>`); }
+    return m.rid;
+  };
+  const drawing = (rid, wmm, hmm, prst = "rect", ln) => {
+    const id = drawId++;
+    const cx = Math.round(wmm * EMU), cy = Math.round(hmm * EMU);
+    const line = ln ? `<a:ln w="${Math.round(ln.w * EMU)}"><a:solidFill><a:srgbClr val="${hexW(ln.color)}"/></a:solidFill></a:ln>` : "";
+    return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${id}" name="Image ${id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="${id}" name="img${id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="${prst}"><a:avLst/></a:prstGeom>${line}</pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+  };
+  const body = [];
+  let sect = null;
+  items.forEach((it, idx) => {
+    const D = mergeDesign(DESIGN_BASE, it.design);
+    const C = D.colors;
+    const lang = DOCX_LANG[it.lang] || "fr-BE";
+    const fBody = FONT_DOCX[D.font], fHead = FONT_DOCX[D.headingFont];
+    const [W] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
+    const contentW = W - D.margin.l - D.margin.r;
+    const ats = mode === "ats";
+    const two = !ats && it.kind === "cv" && Number(D.columns) === 2;
+    if (!sect) sect = D;
+    const run = (t, o = {}) => `<w:r><w:rPr><w:rFonts w:ascii="${o.font || fBody}" w:hAnsi="${o.font || fBody}" w:cs="${o.font || fBody}"/>${o.bold ? "<w:b/>" : ""}${o.italic ? "<w:i/>" : ""}${o.caps ? "<w:caps/>" : ""}<w:color w:val="${hexW(o.color || C.text)}"/>${o.cs ? `<w:spacing w:val="${Math.round(o.cs * 20)}"/>` : ""}<w:sz w:val="${Math.round((o.size || D.size) * 2)}"/><w:szCs w:val="${Math.round((o.size || D.size) * 2)}"/><w:lang w:val="${lang}"/></w:rPr><w:t xml:space="preserve">${xmlEsc(t)}</w:t></w:r>`;
+    const tab = (o = {}) => `<w:r><w:rPr><w:sz w:val="${Math.round((o.size || D.size) * 2)}"/></w:rPr><w:tab/></w:r>`;
+    const p = (runs, o = {}) => {
+      const sp = `<w:spacing w:before="${Math.round((o.before || 0) * TW)}" w:after="${Math.round((o.after ?? 0) * TW)}" w:line="${Math.round(240 * (o.line || D.lineHeight) * 0.86)}" w:lineRule="auto"/>`;
+      const bdr = o.border || "";
+      return `<w:p><w:pPr>${o.style ? `<w:pStyle w:val="${o.style}"/>` : ""}${o.keepNext ? "<w:keepNext/>" : ""}${bdr}${o.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(o.shade)}"/>` : ""}${o.tabs || ""}${sp}${o.ind ? `<w:ind w:left="${Math.round(o.ind.left * TW)}" w:hanging="${Math.round((o.ind.hanging || 0) * TW)}"/>` : ""}${o.align ? `<w:jc w:val="${o.align}"/>` : ""}</w:pPr>${runs}</w:p>`;
+    };
+    const colors = (inSide) => {
+      const dark = luminance(C.side) < 0.35;
+      return { text: inSide && two ? C.sideText : C.text, muted: inSide && two && dark ? mixHex(C.sideText, C.side, 0.28) : C.muted, accent: inSide && two && dark ? C.sideText : C.accent, rule: inSide && two && dark ? mixHex(C.sideText, C.side, 0.45) : C.rule };
+    };
+    const sectionXml = (sec, inSide, colW) => {
+      const K = colors(inSide);
+      const out = [];
+      if (sec.heading) {
+        const rulePt = Math.max(2, Math.round((D.rule / PT) * 8));
+        const bd = ats ? "" : D.headingStyle === "line" && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
+          : D.headingStyle === "double" && D.rule > 0 ? `<w:pBdr><w:top w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
+          : D.headingStyle === "bar" ? `<w:pBdr><w:left w:val="single" w:sz="24" w:space="6" w:color="${hexW(K.accent)}"/></w:pBdr>` : "";
+        out.push(p(run(sectionLabel(sec), { font: fHead, bold: true, caps: D.headingCase === "upper", cs: D.headingCase === "upper" ? D.headingSpacing : 0, size: D.size * D.headingSize, color: K.accent }), { style: "Heading1", keepNext: true, before: D.sectionGap, after: 1.6, border: bd, shade: !ats && D.headingStyle === "pill" ? mixHex(C.accent, "#ffffff", 0.88) : null }));
+      }
+      sec.blocks.forEach((b) => {
+        if (b.t === "h3") {
+          const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+          let rest = parts.slice(1);
+          const last = rest[rest.length - 1];
+          const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel/i.test(last) ? last : null;
+          if (period) rest = rest.slice(0, -1);
+          const right = D.datesRight && period && colW > 60;
+          out.push(p(run(parts[0] || "", { bold: true, size: D.size * 1.03, color: K.text }) + (right ? tab() + run(period, { size: D.size * 0.9, color: K.muted }) : ""), { style: "Heading2", keepNext: true, before: D.itemGap * 0.8, tabs: right ? `<w:tabs><w:tab w:val="right" w:pos="${Math.round(colW * TW)}"/></w:tabs>` : "" }));
+          const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
+          if (meta) out.push(p(run(meta, { size: D.size * 0.9, color: K.muted }), { after: 0.6 }));
+        } else if (b.t === "bullet") {
+          const mark = { dot: "•", square: "▪", dash: "–", arrow: "›", none: "" }[D.bullet] ?? "•";
+          out.push(p((mark ? run(mark, { color: K.accent }) + tab() : "") + run(b.text, { color: K.text }), { ind: mark ? { left: 3.6, hanging: 3.6 } : null, after: 0.4 }));
+        } else if (b.t === "kv") {
+          out.push(p(run(`${b.label} `, { bold: true, color: K.text }) + run(b.text, { color: K.text }), { after: 0.5 }));
+        } else if (b.t === "quote") out.push(p(run(b.text, { italic: true, color: K.muted }), { after: D.paraGap }));
+        else out.push(p(run(b.text, { color: K.text }), { after: D.paraGap }));
+      });
+      return out.join("");
+    };
+    const m = docModel(it.text, it.kind);
+    const showPhoto = !ats && photo?.src && D.photo.show;
+    const prst = { circle: "ellipse", rounded: "roundRect", hexagon: "hexagon", square: "rect" }[D.photo.shape] || "rect";
+    const photoRun = showPhoto ? drawing(mediaRel("photo", "photo.jpg", dataUrlBytes(photo.src)), D.photo.size, D.photo.size, prst, D.photo.border > 0 ? { w: D.photo.border, color: D.photo.borderColor } : null) : "";
+    const band = !ats && D.header === "band";
+    const center = D.header === "center" || (D.header === "side" && !two);
+    const nameColor = band ? C.bandText : C.accent;
+    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : C.muted;
+    const headParas = (align, inSide) => {
+      const out = [];
+      const K = colors(inSide);
+      if (m.head.name) out.push(p(run(m.head.name.text, { font: fHead, bold: true, size: D.size * D.nameSize, color: inSide ? K.accent : nameColor }), { style: "Title", align, after: 0.6, line: 1.05 }));
+      m.head.headline.forEach((h) => out.push(p(run(h.text, { size: D.size * 1.12, color: inSide ? K.muted : subColor }), { align, after: 0.6 })));
+      const items = contactItems(m.head);
+      if (items.length) {
+        const col = inSide ? K.muted : band ? subColor : C.muted;
+        const icCol = inSide ? K.accent : band ? C.bandText : C.accent;
+        const runs = items.map((x, i) => {
+          const ic = !ats && D.icons ? drawing(mediaRel(`ic_${x.icon}_${icCol}`, `ic_${x.icon}_${hexW(icCol)}.png`, dataUrlBytes(iconPng(x.icon, icCol))), D.size * 0.88 * PT * 1.15, D.size * 0.88 * PT * 1.15) + run(" ", { size: D.size * 0.88 }) : "";
+          return (inSide ? "" : i ? run(D.icons && !ats ? "     " : "  ·  ", { size: D.size * 0.88, color: col }) : "") + ic + run(x.text, { size: D.size * 0.88, color: col });
+        });
+        if (inSide) runs.forEach((r) => out.push(p(r, { align, after: 0.5 })));
+        else out.push(p(runs.join(""), { align, before: 1.2, after: 0.4 }));
+      }
+      return out.join("");
+    };
+    const tbl = (cells, { indent = 0, width } = {}) => {
+      const total = width || contentW;
+      return `<w:tbl><w:tblPr><w:tblW w:w="${Math.round(total * TW)}" w:type="dxa"/>${indent ? `<w:tblInd w:w="${Math.round(indent * TW)}" w:type="dxa"/>` : ""}<w:tblBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/><w:insideH w:val="nil"/><w:insideV w:val="nil"/></w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${cells.map((c) => `<w:gridCol w:w="${Math.round(c.w * TW)}"/>`).join("")}</w:tblGrid><w:tr>${cells.map((c) => `<w:tc><w:tcPr><w:tcW w:w="${Math.round(c.w * TW)}" w:type="dxa"/>${c.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(c.shade)}"/>` : ""}<w:tcMar><w:top w:w="${Math.round((c.pad?.[0] || 0) * TW)}" w:type="dxa"/><w:left w:w="${Math.round((c.pad?.[1] || 0) * TW)}" w:type="dxa"/><w:bottom w:w="${Math.round((c.pad?.[2] || 0) * TW)}" w:type="dxa"/><w:right w:w="${Math.round((c.pad?.[3] || 0) * TW)}" w:type="dxa"/></w:tcMar><w:vAlign w:val="${c.valign || "top"}"/></w:tcPr>${c.xml || p("")}</w:tc>`).join("")}</w:tr></w:tbl>`;
+    };
+    if (idx > 0) body.push(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`);
+    // En-tête
+    if (!(two && D.header === "side")) {
+      const align = center ? "center" : "left";
+      if (band) {
+        const inner = photoRun && !center
+          ? tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: W - D.photo.size - 6 - D.margin.l - D.margin.r, xml: headParas("left", false), valign: "center" }], { width: W - D.margin.l - D.margin.r }) + p("", { line: 0.5 })
+          : (photoRun ? p(photoRun, { align: "center" }) : "") + headParas(align, false);
+        body.push(tbl([{ w: W, shade: C.band, pad: [Math.max(D.margin.t * 0.6, 6), D.margin.l, Math.max(D.margin.t * 0.6, 6), D.margin.r], xml: inner }], { indent: -D.margin.l, width: W }));
+        body.push(p("", { after: 1 }));
+      } else if (photoRun && !center) {
+        body.push(tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: contentW - D.photo.size - 6, xml: headParas("left", false), valign: "center" }]));
+        body.push(p("", { after: 1, border: !ats && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / PT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` : "" }));
+      } else {
+        if (photoRun) body.push(p(photoRun, { align: "center", after: 2 }));
+        body.push(headParas(align, false));
+        if (!center && !ats && D.rule > 0) body.push(p("", { after: 1, border: `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / PT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` }));
+      }
+    }
+    if (it.kind === "letter") {
+      const L = m.letter;
+      if (L.date) body.push(p(run(L.date.text, { color: C.muted }), { align: "right", before: 4, after: 3 }));
+      L.recipient.forEach((r) => body.push(p(run(r.text))));
+      if (L.subject) body.push(p(run(L.subject.text, { bold: true }), { before: 5, after: 4 }));
+      L.body.forEach((b) => {
+        if (b.t === "bullet") body.push(p(run("•", { color: C.accent }) + tab() + run(b.text), { ind: { left: 3.6, hanging: 3.6 }, after: 0.4 }));
+        else body.push(p(run(b.text), { after: Math.max(D.paraGap * 1.8, 3), align: D.justify ? "both" : null }));
+      });
+      if (L.sign) body.push(p(run(L.sign.text, { bold: true }), { before: 4 }));
+    } else {
+      const arr = arrangeSections(m.sections, D.layout, two);
+      if (!two) {
+        // ATS : une seule colonne, colonne principale puis secondaire, dans l'ordre choisi dans le Studio.
+        const flat = ats && Number(D.columns) === 2 ? (({ main, side }) => [...main, ...side])(arrangeSections(m.sections, D.layout, true)) : arr.main;
+        flat.forEach((sec) => body.push(sectionXml(sec, false, contentW)));
+      }
+      else {
+        const sideW = (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100;
+        const mainW = contentW - sideW;
+        const pad = 3.5;
+        let sideXml = arr.side.map((sec) => sectionXml(sec, true, sideW - 2 * pad)).join("");
+        if (D.header === "side") sideXml = (photoRun ? p(photoRun, { align: "center", after: 3 }) : "") + headParas("center", true) + sideXml;
+        const mainXml = arr.main.map((sec) => sectionXml(sec, false, mainW - D.colGap)).join("");
+        const sideCell = { w: sideW, shade: cleanHex(C.side) !== "#ffffff" ? C.side : null, pad: [pad, pad, pad, pad], xml: sideXml || p("") };
+        const mainCell = { w: mainW, pad: [0, D.side === "left" ? D.colGap : 0, 0, D.side === "left" ? 0 : D.colGap], xml: mainXml || p("") };
+        body.push(tbl(D.side === "left" ? [sideCell, mainCell] : [mainCell, sideCell]));
+        body.push(p(""));
+      }
+    }
+  });
+  const D0 = mergeDesign(DESIGN_BASE, sect);
+  const [PW, PH] = PAGE_SIZES[D0.page] || PAGE_SIZES.a4;
+  const sectPr = `<w:sectPr><w:pgSz w:w="${Math.round(PW * TW)}" w:h="${Math.round(PH * TW)}"/><w:pgMar w:top="${Math.round(D0.margin.t * TW)}" w:right="${Math.round(D0.margin.r * TW)}" w:bottom="${Math.round(D0.margin.b * TW)}" w:left="${Math.round(D0.margin.l * TW)}" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>`;
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
+  const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${body.join("")}${sectPr}</w:body></w:document>`;
+  const f0 = FONT_DOCX[D0.font];
+  const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${f0}" w:hAnsi="${f0}" w:cs="${f0}" w:eastAsia="${f0}"/><w:sz w:val="${Math.round(D0.size * 2)}"/><w:szCs w:val="${Math.round(D0.size * 2)}"/><w:lang w:val="${DOCX_LANG[items[0]?.lang] || "fr-BE"}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="264" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style></w:styles>`;
+  const settingsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="709"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`;
+  const docRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rIdT" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>${rels.join("")}</Relationships>`;
+  const ct = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>`;
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>`;
+  const iso = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${xmlEsc(title || "")}</dc:title><dc:creator>${xmlEsc(author || "")}</dc:creator><cp:keywords>${xmlEsc((keywords || []).join(", "))}</cp:keywords><dcterms:created xsi:type="dcterms:W3CDTF">${iso}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${iso}</dcterms:modified></cp:coreProperties>`;
+  const app = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Radar</Application></Properties>`;
+  return zipStore([
+    { name: "[Content_Types].xml", data: ct },
+    { name: "_rels/.rels", data: rootRels },
+    { name: "docProps/core.xml", data: core },
+    { name: "docProps/app.xml", data: app },
+    { name: "word/document.xml", data: doc },
+    { name: "word/styles.xml", data: styles },
+    { name: "word/settings.xml", data: settingsXml },
+    { name: "word/_rels/document.xml.rels", data: docRels },
+    ...media.map((m) => ({ name: `word/media/${m.name}`, data: m.bytes })),
+  ]);
+}
+
+/* ── Photo : recadrage local (jamais envoyée à l'IA) ──────────────────── */
+const loadImg = (src) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Image illisible")); i.src = src; });
+function drawCrop(ctx, img, size, crop) {
+  const { zoom = 1, x = 0, y = 0, rot = 0 } = crop || {};
+  const r = ((rot % 360) + 360) % 360;
+  const iw = r % 180 ? img.height : img.width, ih = r % 180 ? img.width : img.height;
+  const s = Math.max(size / iw, size / ih) * zoom;
+  ctx.save();
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, size, size);
+  ctx.translate(size / 2 + x * size, size / 2 + y * size);
+  ctx.rotate((r * Math.PI) / 180);
+  ctx.drawImage(img, (-img.width * s) / 2, (-img.height * s) / 2, img.width * s, img.height * s);
+  ctx.restore();
+}
+async function downscaleImage(src, max = 1200) {
+  const img = await loadImg(src);
+  const k = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.88);
+}
+async function cropPhoto(original, crop, out = 640) {
+  const img = await loadImg(original);
+  const c = document.createElement("canvas");
+  c.width = c.height = out;
+  drawCrop(c.getContext("2d"), img, out, crop);
+  return c.toDataURL("image/jpeg", 0.9);
+}
+
+/* ── Qualité du document : contrôles locaux, 0 token (inspirés de Rezi, Enhancv, Jobscan) ── */
+const CLICHES = {
+  fr: ["passionné", "passionnée", "dynamique", "force de proposition", "motivé", "motivée", "rigoureux", "rigoureuse", "je me permets", "n'hésitez pas", "fort de", "forte de", "polyvalent", "esprit d'équipe", "sens du relationnel", "proactif", "proactive", "synergie", "challenge"],
+  nl: ["gepassioneerd", "dynamisch", "gemotiveerd", "teamplayer", "proactief", "stressbestendig", "hierbij solliciteer ik", "leergierig", "flexibel ingesteld"],
+  en: ["passionate", "dynamic", "hardworking", "hard-working", "team player", "detail-oriented", "go-getter", "synergy", "results-driven", "self-starter", "i am writing to apply", "highly motivated"],
+  de: ["dynamisch", "motiviert", "teamfähig", "belastbar", "leidenschaftlich", "hiermit bewerbe ich mich", "zielstrebig"],
+};
+const WEAK_STARTS = {
+  fr: ["responsable de", "en charge de", "chargé de", "chargée de", "participation à", "participation au", "aide à", "travail sur"],
+  nl: ["verantwoordelijk voor", "betrokken bij", "hulp bij", "werken aan"],
+  en: ["responsible for", "worked on", "helped", "duties included", "involved in", "tasked with"],
+  de: ["verantwortlich für", "zuständig für", "mitarbeit bei", "beteiligt an"],
+};
+const FIRST_PERSON = { fr: /(^|\s)(je|j'|moi|mon|ma|mes)\s/i, nl: /(^|\s)(ik|mijn)\s/i, en: /(^|\s)(I|my|me)\s/, de: /(^|\s)(ich|mein|meine)\s/i };
+function docQuality(text, { kind = "cv", lang = "fr", keywords = [], kwLang, design } = {}) {
+  const model = docModel(text, kind);
+  const blocks = model.blocks;
+  const plain = docPlainText(text);
+  const words = plain.split(/\s+/).filter(Boolean).length;
+  const low = ` ${plain.toLowerCase()} `;
+  const checks = [];
+  const add = (id, ok, w, label, detail, tone) => checks.push({ id, ok, w, label, detail, tone: ok ? "ok" : tone || "warn" });
+  const ph = (text.match(/\[(à compléter|aan te vullen|to complete|zu ergänzen)/gi) || []).length;
+  const cl = (CLICHES[lang] || CLICHES.fr).filter((c) => low.includes(` ${c} `) || low.includes(` ${c},`) || low.includes(` ${c}.`));
+  if (kind === "cv") {
+    const m = model;
+    const contact = contactItems(m.head).map((x) => x.icon);
+    const bullets = blocks.filter((b) => b.t === "bullet");
+    const quant = bullets.filter((b) => /\d|%|€|\bk€|x\d/.test(b.text));
+    const weak = bullets.filter((b) => (WEAK_STARTS[lang] || WEAK_STARTS.fr).some((w) => normText(b.text).startsWith(normText(w))));
+    const long = bullets.filter((b) => b.text.split(/\s+/).length > 32);
+    const prof = m.sections.find((s) => baseKey(s.key) === "profile");
+    const profWords = prof ? prof.blocks.map((b) => b.text).join(" ").split(/\s+/).filter(Boolean).length : 0;
+    const entries = blocks.filter((b) => b.t === "h3" && m.sections.some((s) => baseKey(s.key) === "experience" && s.blocks.includes(b)));
+    const dated = entries.filter((b) => /\d{4}/.test(b.text));
+    const keys = new Set(m.sections.map((s) => baseKey(s.key)));
+    const fp = [...(prof?.blocks || []), ...bullets].filter((b) => FIRST_PERSON[lang]?.test(` ${b.text} `));
+    add("contact", contact.includes("mail") && contact.includes("phone"), 10, "Coordonnées complètes", contact.includes("mail") && contact.includes("phone") ? `${contact.length} élément(s)${contact.includes("linkedin") ? ", LinkedIn inclus" : " · ajoutez LinkedIn"}` : "Ajoutez e-mail et téléphone sur la ligne « @ ».", "danger");
+    add("headline", m.head.headline.length > 0, 5, "Accroche sous le nom", m.head.headline.length ? "Présente" : "Ajoutez une ligne « > » qui reprend l'intitulé du poste.");
+    add("profile", profWords >= 30 && profWords <= 100, 7, "Profil de 30 à 100 mots", prof ? `${profWords} mots` : "Section Profil absente");
+    add("quant", quant.length >= 3, 12, "Au moins 3 résultats chiffrés", `${quant.length} puce(s) chiffrée(s) sur ${bullets.length}`, "danger");
+    add("quantShare", bullets.length > 0 && quant.length / bullets.length >= 0.4, 7, "40 % des puces quantifiées", bullets.length ? `${Math.round((quant.length / bullets.length) * 100)} %` : "Aucune puce");
+    add("weak", weak.length === 0, 7, "Verbes d'action plutôt que « responsable de »", weak.length ? `À reformuler : ${weak.slice(0, 2).map((b) => `« ${b.text.slice(0, 40)}… »`).join(", ")}` : "Aucune formulation passive détectée");
+    add("cliche", cl.length === 0, 7, "Aucun cliché", cl.length ? `À remplacer par une preuve : ${cl.slice(0, 4).join(", ")}` : "Aucun");
+    add("fp", fp.length === 0, 4, "Pas de première personne", fp.length ? `${fp.length} occurrence(s) à vérifier` : "Style nominal respecté");
+    add("long", long.length === 0, 5, "Puces de 2 lignes maximum", long.length ? `${long.length} puce(s) de plus de 32 mots` : "OK");
+    add("length", words >= 380 && words <= 850, 7, "Longueur 1 à 2 pages", `${words} mots${words > 850 ? " : resserrez" : words < 380 ? " : étoffez avec des résultats" : ""}`);
+    add("dates", entries.length > 0 && dated.length === entries.length, 6, "Dates sur chaque expérience", entries.length ? `${dated.length}/${entries.length} datée(s)` : "Aucune expérience détaillée (### …)");
+    add("sections", ["experience", "skills", "education"].every((k) => keys.has(k)), 6, "Sections Expérience, Compétences, Formation", ["experience", "skills", "education"].filter((k) => !keys.has(k)).map((k) => `manque : ${SECTION_TITLES.fr[k]}`).join(", ") || "Toutes présentes");
+  } else {
+    const L = model.letter;
+    const paras = L.body.filter((b) => b.t === "para");
+    add("subject", !!L.subject, 8, "Objet explicite", L.subject ? L.subject.text.slice(0, 60) : "Ajoutez une ligne « ## Objet : … »");
+    add("length", words >= 200 && words <= 380, 10, "Longueur 200 à 380 mots", `${words} mots`);
+    add("paras", paras.length >= 3 && paras.length <= 5, 7, "3 à 5 paragraphes", `${paras.length} paragraphe(s)`);
+    add("cliche", cl.length === 0, 10, "Aucun cliché", cl.length ? `À remplacer : ${cl.slice(0, 4).join(", ")}` : "Aucun");
+    add("opening", !/^(je me permets|hierbij|i am writing|hiermit)/i.test(paras[1]?.text || paras[0]?.text || ""), 6, "Accroche spécifique (pas « je me permets »)", "Ouvrez sur un élément précis de l'annonce.");
+    add("proof", /\d/.test(paras.map((x) => x.text).join(" ")), 8, "Au moins une preuve chiffrée", /\d/.test(paras.map((x) => x.text).join(" ")) ? "Présente" : "Ajoutez un résultat mesurable.");
+    add("sign", !!L.sign, 4, "Signature", L.sign ? "Présente" : "Ajoutez « ~ Prénom Nom ».");
+  }
+  add("placeholders", ph === 0, 10, "Aucun élément à compléter", ph ? `${ph} élément(s) entre crochets à remplir avant envoi` : "Prêt", "danger");
+  if (keywords?.length) {
+    const sameLang = !kwLang || kwLang === lang;
+    const cov = keywordCoverage(text, keywords);
+    if (sameLang) add("keywords", cov.pct >= 70, 10, "Mots-clés de l'annonce (≥ 70 %)", `${cov.pct} % couverts${cov.missing.length ? ` · absents : ${cov.missing.slice(0, 5).join(", ")}` : ""}`);
+  }
+  if (design) {
+    const D = mergeDesign(DESIGN_BASE, design);
+    add("readable", D.size >= 9 && Math.min(D.margin.l, D.margin.r) >= 10, 4, "Lisibilité (police ≥ 9 pt, marges latérales ≥ 10 mm)", `${D.size} pt · marges ${D.margin.l}/${D.margin.r} mm`);
+    if (kind === "cv" && D.photo.show && lang === "en") add("photo", false, 2, "Photo et candidature en anglais", "Déconseillée pour les recruteurs anglo-saxons : masquez-la pour cette langue.", "warn");
+    if (kind === "cv" && Number(D.columns) === 2) checks.push({ id: "cols", ok: true, w: 0, label: "Mise en page 2 colonnes", detail: "Lue par les ATS récents. Pour un portail ancien, exportez en Word « ATS 1 colonne ».", tone: "info" });
+  }
+  const tot = checks.reduce((n, c) => n + c.w, 0);
+  const got = checks.reduce((n, c) => n + (c.ok ? c.w : 0), 0);
+  return { score: tot ? Math.round((got / tot) * 100) : 0, checks, words };
 }
 
 async function saveFile(filename, data, mime) {
@@ -602,7 +1464,13 @@ async function saveFile(filename, data, mime) {
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
 const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId;
 const offerLang = (o) => o?.language || "fr";
-const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais" };
+const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais", de: "allemand" };
+const LANG_FLAG = { fr: "FR", nl: "NL", en: "EN", de: "DE" };
+/* Versions de documents par langue : une version sans langue (v2) vaut la langue du dossier. */
+const docLangOf = (app, offer, v) => v?.lang || app?.docLanguage || offerLang(offer);
+const docVersions = (app, offer, type, lang) => (app?.docs?.[type] || []).filter((v) => docLangOf(app, offer, v) === lang);
+const latestDoc = (app, offer, type, lang) => docVersions(app, offer, type, lang).slice(-1)[0] || null;
+const docLangs = (app, offer, type) => [...new Set((app?.docs?.[type] || []).filter((v) => v.format === "markup").map((v) => docLangOf(app, offer, v)))];
 
 /* ════════════════════════════════════════════════════════════════════════
    3. ENVIRONNEMENT & PERSISTANCE
@@ -705,7 +1573,24 @@ const storage = {
    4. COUCHE IA — API Claude (web_search, MCP Gmail / Google Calendar)
    ════════════════════════════════════════════════════════════════════════ */
 
-let WORKING_VARIANT = null; // mémorise la combinaison modèle / outil web / format MCP acceptée
+let WORKING_VARIANT = null; // mémorise ce que l'API accepte : outil web, format MCP, cache de prompt, effort
+const MODEL_IDX = {}; // modèle retenu par niveau (profond, équilibré, rapide) après un éventuel repli
+/* Consommation de la session (version « chat ») : affichée dans Confidentialité & données. */
+const USAGE = { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, byTier: {} };
+const usageListeners = new Set();
+function addUsage(tier, u) {
+  if (!u) return;
+  USAGE.calls += 1;
+  USAGE.input += u.input_tokens || 0;
+  USAGE.output += u.output_tokens || 0;
+  USAGE.cacheRead += u.cache_read_input_tokens || 0;
+  USAGE.cacheWrite += u.cache_creation_input_tokens || 0;
+  const t = (USAGE.byTier[tier] = USAGE.byTier[tier] || { calls: 0, input: 0, output: 0 });
+  t.calls += 1; t.input += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0); t.output += u.output_tokens || 0;
+  usageListeners.forEach((f) => f({ ...USAGE }));
+}
+const TIER_LABEL = { deep: "profond", balanced: "équilibré", fast: "rapide" };
+const tierModels = (s, tier) => [...new Set((tier === "fast" ? [s.modelFast, s.modelBalanced, s.model] : tier === "balanced" ? [s.modelBalanced, s.model] : [s.model, s.fallbackModel]).filter(Boolean))];
 
 function collectBlocks(content, acc) {
   for (const b of content || []) {
@@ -750,11 +1635,16 @@ async function runConversation(settings, v, o) {
   }
   const headers = { "Content-Type": "application/json" };
   if (servers.length && mode === "toolset") headers["anthropic-beta"] = "mcp-client-2025-11-20";
+  // Contexte stable (profil, critères, barème) placé en fin de system avec un point de cache : les lots suivants le relisent à 5 %.
+  const system = o.context
+    ? (v.cache === false ? `${o.system}\n\n${o.context}` : [{ type: "text", text: o.system }, { type: "text", text: o.context, cache_control: { type: "ephemeral" } }])
+    : o.system;
 
   const messages = [{ role: "user", content: o.prompt }];
   const acc = { text: [], urls: new Set(), toolText: [], toolCalls: [], toolErrors: [] };
   for (let turn = 0; turn < 5; turn++) {
-    const body = { model, max_tokens: o.maxTokens, system: o.system, messages };
+    const body = { model, max_tokens: o.maxTokens, system, messages };
+    if (o.effort && v.effort !== false) body.output_config = { effort: o.effort };
     if (tools.length) body.tools = tools;
     if (servers.length) body.mcp_servers = servers;
     let r;
@@ -773,6 +1663,7 @@ async function runConversation(settings, v, o) {
       throw err;
     }
     collectBlocks(data.content, acc);
+    addUsage(o.tier, data.usage);
     if (data.stop_reason === "refusal") throw new Error("Le modèle a décliné cette requête. Reformulez ou réessayez.");
     if (data.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: data.content });
@@ -819,7 +1710,7 @@ const SAMPLE_ERRORS = {
   cancelled: "Demande annulée.",
 };
 
-async function callSample(settings, { system, prompt, web, mcp = [] }) {
+async function callSample(settings, { system, prompt, web, mcp = [], context }) {
   if (!RT.sample) throw new Error("Claude n'est pas disponible dans cette vue : ouvrez la page connecté à claude.ai.");
   const acc = { toolText: [], toolCalls: [], toolErrors: [] };
   const tools = [];
@@ -854,7 +1745,7 @@ async function callSample(settings, { system, prompt, web, mcp = [] }) {
     ? "\n\nIMPORTANT : aucune recherche web n'est disponible ici. N'utilise que les informations fournies ; n'invente aucune URL, aucun fait externe ni aucune source. Laisse vides les listes qui exigeraient une recherche."
     : "";
   try {
-    const r = await RT.sample(`${system}\n\n${prompt}${note}`, tools.length ? { tools } : {});
+    const r = await RT.sample(`${system}${context ? `\n\n${context}` : ""}\n\n${prompt}${note}`, tools.length ? { tools } : {});
     const text = (r.text || "").trim();
     return { text, lastText: text, urls: [], toolText: acc.toolText.join("\n"), toolCalls: acc.toolCalls, toolErrors: acc.toolErrors, stop: r.truncated ? "max_tokens" : "end_turn", model: `claude.ai (${r.modelTierApplied || "default"})` };
   } catch (e) {
@@ -867,24 +1758,33 @@ async function callClaude(settings, opts) {
   return callClaudeApi(settings, opts);
 }
 
-async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000 }) {
+/* Niveaux : « deep » (Opus : scoring, CV, recherche web), « balanced » (Sonnet : traduction, Gmail, relances),
+   « fast » (Haiku : priorisation, synonymes, doublons, réparation JSON). Effort bas sur les tâches légères. */
+async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000, tier = "deep", effort, context }) {
+  const t = settings.routing === false ? "deep" : tier;
   const o = {
-    system, prompt, web, mcp, maxTokens,
-    models: [...new Set([settings.model, settings.fallbackModel].filter(Boolean))],
+    system, prompt, web, mcp, maxTokens, context, tier: t,
+    effort: settings.effortTuning === false ? null : effort,
+    models: tierModels(settings, t),
     webTypes: ["web_search_20260209", "web_search_20250305"],
     mcpModes: settings.mcpMode === "auto" ? ["legacy", "toolset"] : [settings.mcpMode],
   };
-  let v = WORKING_VARIANT ? { ...WORKING_VARIANT } : { m: 0, w: 0, p: 0 };
+  if (settings.promptCache === false && context) { o.context = null; o.system = `${system}\n\n${context}`; }
+  let v = { w: 0, p: 0, ...(WORKING_VARIANT || {}), m: MODEL_IDX[t] || 0 };
   let lastErr;
-  for (let attempt = 0; attempt < 7; attempt++) {
+  for (let attempt = 0; attempt < 9; attempt++) {
     try {
       const res = await runConversation(settings, v, o);
-      WORKING_VARIANT = v;
+      const { m, ...shared } = v;
+      WORKING_VARIANT = shared;
+      MODEL_IDX[t] = m;
       return res;
     } catch (e) {
       lastErr = e;
       const msg = (e.message || "").toLowerCase();
       if (e.status === 400 || e.status === 404) {
+        if (o.context && v.cache !== false && /cache_control|cache/.test(msg)) { v = { ...v, cache: false }; continue; }
+        if (o.effort && v.effort !== false && /output_config|effort/.test(msg)) { v = { ...v, effort: false }; continue; }
         if (web && /web_search|20260209|tool.*type|tools\.\d/.test(msg) && v.w < o.webTypes.length - 1) { v = { ...v, w: v.w + 1 }; continue; }
         if (mcp.length && /mcp|toolset|beta|tool_configuration/.test(msg) && v.p < o.mcpModes.length - 1) { v = { ...v, p: v.p + 1 }; continue; }
         if (/model/.test(msg) && v.m < o.models.length - 1) { v = { ...v, m: v.m + 1 }; continue; }
@@ -924,6 +1824,8 @@ async function askJSON(settings, opts) {
         system: SYSTEM_REPAIR,
         prompt: `Texte à convertir :\n<<<\n${res.text.slice(0, 40000)}\n>>>`,
         maxTokens: opts.maxTokens || 8000,
+        tier: "fast",
+        effort: "low",
       });
       return { ...res, data: extractJSON(fix.text) };
     }
@@ -947,11 +1849,12 @@ Réponds UNIQUEMENT avec le JSON demandé, sans texte autour.`;
 const SYSTEM_REPAIR = `Convertis le texte fourni en un JSON strictement valide, en conservant exactement les informations présentes, sans rien ajouter ni inventer. Réponds uniquement avec le JSON.`;
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
+let HOME_LABEL = "Ohain (Brabant wallon)"; // suit le domicile du profil (mis à jour par l'application)
 
 function criteriaDigest(c) {
   return [
     `Postes visés : ${c.roles.join(" ; ")}`,
-    `Zones : ${c.zones.join(", ")} — trajet max ${c.maxCommute} min depuis Ohain (Brabant wallon)`,
+    `Zones : ${c.zones.join(", ")} — trajet max ${c.maxCommute} min depuis ${HOME_LABEL}`,
     `Télétravail : ${c.remote}`,
     `Indispensables : ${c.mustHave.join(" ; ") || "aucun"}`,
     `Souhaités (poids 1-5) : ${c.wishes.map((w) => `${w.label} [${w.weight}]`).join(" ; ") || "aucun"}`,
@@ -998,7 +1901,7 @@ RÈGLES STRICTES
 - N'invente jamais une offre. L'URL doit être exactement celle d'un résultat de recherche que tu as vu.
 - Champ inconnu ou absent de l'annonce → null. Le salaire n'est renseigné que s'il est écrit dans l'annonce.
 - description : résumé factuel (missions, profil, conditions) en 600 caractères max, sans extrapoler.
-- commuteMinutes : estimation du trajet en voiture hors heures de pointe depuis Ohain, null si le lieu est inconnu.
+- commuteMinutes : estimation du trajet en voiture hors heures de pointe depuis ${HOME_LABEL}, null si le lieu est inconnu.
 
 Réponds uniquement avec ce JSON :
 {"offers":[${OFFER_SCHEMA}],"notes":"remarque courte sur la recherche (ex. site peu indexé, annonces expirées)"}`;
@@ -1027,17 +1930,13 @@ Réponds uniquement avec ce JSON :
 Mission : structurer une annonce d'emploi fournie par l'utilisateur.
 ${url ? `URL fournie : ${url}\n` : ""}${text ? `Texte de l'annonce :\n<<<\n${text.slice(0, 20000)}\n>>>\n` : ""}
 ${url && !text ? `Utilise web_search pour retrouver CETTE annonce précise (intitulé, entreprise, contenu). Si tu ne la retrouves pas avec certitude, réponds {"found":false,"reason":"…"}.` : "Base-toi uniquement sur le texte fourni."}
-Règles : aucun champ inventé (null si absent) ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 800 caractères max ; commuteMinutes = trajet voiture estimé depuis Ohain ou null.
+Règles : aucun champ inventé (null si absent) ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 1 200 caractères max (missions, profil, conditions) ; commuteMinutes = trajet voiture estimé depuis ${HOME_LABEL} ou null.
 Réponds uniquement avec ce JSON :
 {"found":true,"offer":${OFFER_SCHEMA}}`;
   },
 
-  score(offers, profile, c, versionLabel) {
-    const compact = offers.map((o) => ({
-      id: o.id, title: o.title, company: o.company, location: o.location,
-      commuteMinutes: o.commute?.minutes ?? null, contract: o.contract, seniority: o.seniority,
-      salary: o.salary, remote: o.remote, language: o.language, description: o.description,
-    }));
+  /* Partie stable du scoring (profil, critères, barème) : mise en cache entre les lots. */
+  scoreContext(profile, c, versionLabel) {
     return `Mission : évaluer l'adéquation de chaque offre avec le profil et les critères du candidat. Sois factuel, sobre, sans complaisance.
 
 PROFIL
@@ -1046,11 +1945,8 @@ ${profileDigest(profile)}
 CRITÈRES (version « ${versionLabel} »)
 ${criteriaDigest(c)}
 
-OFFRES
-${JSON.stringify(compact)}
-
 BARÈME
-- breakdown : une ligne par critère indispensable, souhaité, exclusion et signal d'alerte.
+- breakdown : une ligne par critère indispensable, souhaité, exclusion et signal d'alerte, en reprenant EXACTEMENT le libellé du critère.
   · indispensable / souhaité : match 0-100 = degré de satisfaction.
   · exclusion / alerte : match 0-100 = degré de PRÉSENCE (100 = clairement présent dans l'annonce).
   · note : 15 mots max, factuelle, qui s'appuie sur l'annonce. Information absente → match 50 et note « non précisé ».
@@ -1059,8 +1955,22 @@ BARÈME
 - redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce (type : stress, turnover, role_flou, autre).
 - questions : points à clarifier avec le recruteur.
 
+CLARTÉ (uniquement ce que dit l'annonce, sinon null ou liste vide)
+- tldr : une phrase EN FRANÇAIS de 25 mots max qui dit ce qu'est vraiment le poste, quelle que soit la langue de l'annonce.
+- facts : contract (CDI | CDD | Freelance | Intérim | Stage | Autre), remoteDays (jours de télétravail par semaine, nombre), salaryMin / salaryMax (nombres, en euros), salaryPeriod (an | mois), languages (codes fr, nl, en, de exigés), teamSize (nombre de personnes à manager), reportsTo (rattachement), seniority (Junior | Médior | Senior | Manager | Direction).
+- must : exigences indispensables de l'annonce (5 max, 8 mots chacune) ; nice : atouts souhaités (5 max) ; missions : missions principales (5 max, 10 mots chacune). En français.
+
 Réponds uniquement avec ce JSON :
-{"scores":[{"id":"","score":0,"confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","breakdown":[{"criterion":"","kind":"indispensable|souhaité|exclusion|alerte","weight":1,"match":0,"note":""}],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
+{"scores":[{"id":"","score":0,"confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","tldr":"","facts":{"contract":null,"remoteDays":null,"salaryMin":null,"salaryMax":null,"salaryPeriod":null,"languages":[],"teamSize":null,"reportsTo":null,"seniority":null},"must":[],"nice":[],"missions":[],"breakdown":[{"criterion":"","kind":"indispensable|souhaité|exclusion|alerte","weight":1,"match":0,"note":""}],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
+  },
+
+  score(offers) {
+    const compact = offers.map((o) => ({
+      id: o.id, title: o.title, company: o.company, location: o.location,
+      commuteMinutes: o.commute?.minutes ?? null, contract: o.contract, seniority: o.seniority,
+      salary: o.salary, remote: o.remote, language: o.language, description: o.description,
+    }));
+    return `OFFRES À ÉVALUER\n${JSON.stringify(compact)}`;
   },
 
   dossier(offer, profile, types, instruction) {
@@ -1248,23 +2158,67 @@ RÈGLES
 Réponds uniquement {"groups":[{"ids":["",""],"confidence":"haute|moyenne","reason":"20 mots max"}]}`;
   },
 
-  replies(items) {
+  replies(items, { after, query }) {
     return `Date du jour : ${todayStr()}.
-Mission : détecter dans Gmail les réponses reçues aux candidatures ci-dessous. LECTURE SEULE.
-CANDIDATURES
+Mission : surveiller la boîte Gmail pour le pipeline de candidatures ci-dessous. LECTURE SEULE.
+CANDIDATURES SUIVIES
 ${JSON.stringify(items)}
 
 MÉTHODE
-1. Pour chaque candidature, recherche les e-mails reçus depuis sa date d'envoi (champ since) venant de l'entreprise, du cabinet ou des contacts listés (nom, domaine, adresse). Ignore les alertes emploi automatiques, newsletters et e-mails envoyés par l'utilisateur.
-2. Ouvre les messages pertinents (25 au maximum au total).
-3. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
+1. Lance cette recherche Gmail (ajuste-la si elle ne renvoie rien) : ${query}
+   Ne regarde que les e-mails reçus après le ${after} (vérification incrémentale).
+2. Ouvre uniquement les fils pertinents (25 au maximum) : réponses d'entreprises ou de cabinets, accusés de réception de logiciels de recrutement (Workday, SmartRecruiters, Greenhouse, Lever, Teamtailor, Recruitee, SuccessFactors, Taleo, iCIMS, Personio, Workable…), confirmations « candidature envoyée » de LinkedIn ou Indeed, invitations, tests, refus, offres.
+3. Ignore les alertes emploi automatiques et les newsletters. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
 
 RÈGLES
-- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. Si le rattachement à une candidature est incertain, ne le rapporte pas.
-- kind : accuse_reception | invitation_entretien | refus | demande_info | offre | autre.
-- proposedStage : "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
-- interviewAt : date et heure proposées dans l'e-mail (YYYY-MM-DDTHH:mm), sinon null.
-Réponds uniquement {"replies":[{"appId":"","date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"messagesRead":0}`;
+- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. threadId = identifiant du fil tel que renvoyé par l'outil, sinon null.
+- Rattache un e-mail à une candidature (appId) seulement si l'entreprise, le cabinet, le poste ou le contact correspondent clairement.
+- kind : confirmation_candidature | accuse_reception | invitation_entretien | test_evaluation | demande_info | refus | offre | autre.
+- proposedStage : "sent" pour une confirmation de candidature envoyée, "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
+- interviewAt : date et heure proposées (YYYY-MM-DDTHH:mm), sinon null.
+- untracked : confirmations de candidature ou réponses de recruteurs qui ne correspondent à AUCUNE candidature suivie (candidature envoyée hors de l'outil).
+Réponds uniquement {"replies":[{"appId":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"untracked":[{"company":"","title":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"confirmation_candidature|invitation_entretien|refus|autre","summary":""}],"messagesRead":0}`;
+  },
+
+  translate(text, kind, from, to, offer) {
+    const titles = SECTION_TITLES[to] || SECTION_TITLES.en;
+    const conv = {
+      fr: "Formules belges francophones : « Madame, Monsieur, » ; conclusion sobre (« Je me tiens à votre disposition pour un entretien. ») ; date au format « Ville, le 21 octobre 2026 ».",
+      nl: "Néerlandais de Belgique, vouvoiement « u » : « Geachte heer, mevrouw, » ; « Met vriendelijke groeten, » ; date au format « Ville, 21 oktober 2026 ». Intitulés de fonction usuels en Flandre (souvent en anglais).",
+      en: "Anglais britannique professionnel : « Dear Hiring Manager, » ; « Kind regards, » ; date au format « Ville, 21 October 2026 ».",
+      de: "Allemand standard : « Sehr geehrte Damen und Herren, » ; « Mit freundlichen Grüßen » ; date au format « Ville, 21. Oktober 2026 ».",
+    }[to];
+    return `Mission : traduire ${kind === "cv" ? "un CV" : "une lettre de motivation"} du ${LANG_NAME[from]} vers le ${LANG_NAME[to]}, pour un recruteur ${to === "nl" ? "flamand ou bruxellois" : to === "fr" ? "belge francophone" : "international"}. Poste visé : ${offer?.title || "non communiqué"}${offer?.company ? ` chez ${offer.company}` : ""}.
+
+RÈGLES
+- Conserve EXACTEMENT le balisage en début de ligne (#, >, @, =, ##, ###, -, **Libellé :**, ~), l'ordre des lignes et les lignes vides.
+- Conserve tels quels : noms propres, organisations, outils, certifications, chiffres, e-mails, téléphones, URL. Traduis les mois.
+- Titres de sections standard en ${LANG_NAME[to]} : ${Object.values(titles).join(", ")}.
+- Traduction idiomatique et professionnelle, pas littérale. Garde le ton sobre et orienté résultats ; n'ajoute aucun fait, aucun superlatif.
+- Les éléments [à compléter : …] restent entre crochets, traduits (${to === "nl" ? "[aan te vullen: …]" : to === "en" ? "[to complete: …]" : to === "de" ? "[zu ergänzen: …]" : "[à compléter : …]"}).
+- ${conv}
+
+DOCUMENT
+<<<
+${text}
+>>>
+
+Réponds uniquement {"text":"<document traduit, même balisage>"}.`;
+  },
+
+  practice(question, answer, offer, profile) {
+    return `Mission : évaluer la réponse écrite d'un candidat à une question d'entretien, comme un recruteur exigeant et bienveillant.
+Poste : ${offer?.title || "non communiqué"} chez ${show(offer?.company)}.
+Profil (seule source de faits) : ${profile.summary} Réalisations : ${(profile.achievements || []).join(" ; ")}
+
+QUESTION : ${question}
+RÉPONSE DU CANDIDAT :
+<<<
+${answer}
+>>>
+
+Règles : note de 1 à 5 ; indique les éléments STAR présents (situation, tâche, action, résultat) ; 3 forces et 3 améliorations concrètes maximum ; réponse améliorée de 180 mots maximum, dans la langue de la réponse, qui n'utilise que les faits de la réponse et du profil (chiffre manquant → [à compléter]) ; durée orale estimée en secondes (130 mots par minute).
+Réponds uniquement {"score":1,"star":{"situation":false,"task":false,"action":false,"result":false},"strengths":[],"improvements":[],"improved":"","seconds":0}`;
   },
 
   today(items) {
@@ -1273,6 +2227,37 @@ ${JSON.stringify(items.map(({ id, label, detail, due }) => ({ id, label, detail,
 Réponds uniquement {"ordered":[{"id":"","priority":1,"reason":""}]} (priorité 1 = urgent, 3 = peut attendre).`;
   },
 };
+
+/* Faits normalisés extraits au scoring : nombres et listes propres, null si absents. */
+function normFacts(f) {
+  if (!f || typeof f !== "object") return null;
+  const num = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) && n > 0 ? n : null; };
+  const contract = str(f.contract);
+  return {
+    contract: contract && /^(CDI|CDD|Freelance|Intérim|Stage|Autre)$/i.test(contract) ? contract : contract,
+    remoteDays: f.remoteDays === 0 ? 0 : num(f.remoteDays) !== null && num(f.remoteDays) <= 5 ? num(f.remoteDays) : null,
+    salaryMin: num(f.salaryMin), salaryMax: num(f.salaryMax),
+    salaryPeriod: /mois|month|maand/i.test(f.salaryPeriod || "") ? "mois" : f.salaryMin || f.salaryMax ? "an" : null,
+    languages: (Array.isArray(f.languages) ? f.languages : []).map((l) => String(l).toLowerCase().slice(0, 2)).filter((l) => DOC_LANGS.includes(l)),
+    teamSize: num(f.teamSize), reportsTo: str(f.reportsTo), seniority: str(f.seniority),
+  };
+}
+const fmtK = (n) => (n >= 1000 ? `${Math.round(n / 100) / 10}`.replace(".", ",") + " k" : String(n));
+function fmtSalary(f, raw) {
+  if (f && (f.salaryMin || f.salaryMax)) {
+    const range = f.salaryMin && f.salaryMax && f.salaryMin !== f.salaryMax ? `${fmtK(f.salaryMin)} – ${fmtK(f.salaryMax)}` : fmtK(f.salaryMin || f.salaryMax);
+    return `${range} € / ${f.salaryPeriod || "an"}`;
+  }
+  return raw || null;
+}
+/* Verdict calculé localement (cohérent avec le score, gratuit) : Postuler, À creuser, Passer. */
+function offerVerdict(o, threshold) {
+  const s = o?.score;
+  if (!s) return null;
+  if (s.caps?.length || s.value < 50) return { id: "skip", label: "Passer", tone: "neutral" };
+  if (s.value >= threshold && s.confidence !== "faible" && !(s.redFlags || []).length) return { id: "apply", label: "Postuler", tone: "ok" };
+  return { id: "dig", label: "À creuser", tone: "warn" };
+}
 
 /* Score final : score IA borné par les règles dures, pour qu'il reste cohérent avec sa décomposition. */
 function finalizeScore(s, versionId) {
@@ -1291,10 +2276,39 @@ function finalizeScore(s, versionId) {
     gaps: (s.gaps || []).map(String),
     questions: (s.questions || []).map(String),
     redFlags: (s.redFlags || []).filter((r) => r && r.evidence).map((r) => ({ type: r.type || "autre", evidence: String(r.evidence) })),
+    tldr: str(s.tldr),
+    facts: normFacts(s.facts),
+    must: (s.must || []).map(String).filter(Boolean).slice(0, 6),
+    nice: (s.nice || []).map(String).filter(Boolean).slice(0, 6),
+    missions: (s.missions || []).map(String).filter(Boolean).slice(0, 6),
     caps,
     criteriaVersionId: versionId,
     scoredAt: nowISO(),
   };
+}
+
+/* Re-pondération locale : si seule la pondération des souhaités change, le score est recalculé sans appel IA. */
+function onlyWeightsChanged(prev, next) {
+  if (!prev || !next) return false;
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  if (!["roles", "zones", "maxCommute", "remote", "mustHave", "exclusions", "redFlags", "keywords"].every((k) => same(prev[k], next[k]))) return false;
+  const lab = (c) => (c.wishes || []).map((w) => w.label), wt = (c) => (c.wishes || []).map((w) => w.weight);
+  return same(lab(prev), lab(next)) && !same(wt(prev), wt(next));
+}
+function reweightScore(score, prevWishes, nextWishes, versionId) {
+  const rows = (score?.breakdown || []).filter((b) => b.kind === "souhaité");
+  const find = (label) => rows.find((r) => normText(r.criterion) === normText(label)) || rows.find((r) => jaccard(tokens(r.criterion), tokens(label)) >= 0.5);
+  // Un souhait absent de la décomposition vaut 50 (« non précisé »), comme dans le barème IA ; au moins la moitié doit correspondre.
+  const pairs = nextWishes.map((w) => ({ w, r: find(w.label) || { match: 50, missing: true }, old: prevWishes.find((x) => x.label === w.label)?.weight || w.weight }));
+  if (!pairs.length || pairs.filter((x) => x.r.missing).length > pairs.length / 2) return null;
+  const avg = (useOld) => {
+    const tot = pairs.reduce((n, x) => n + (useOld ? x.old : x.w.weight), 0);
+    return tot ? pairs.reduce((n, x) => n + x.r.match * (useOld ? x.old : x.w.weight), 0) / tot : 0;
+  };
+  let value = clamp(Math.round(score.value + avg(false) - avg(true)), 0, 100);
+  if (score.caps?.includes("indispensable non rempli")) value = Math.min(value, 45);
+  if (score.caps?.includes("exclusion touchée")) value = Math.min(value, 20);
+  return { ...score, value, breakdown: score.breakdown.map((b) => { const x = pairs.find((q) => q.r === b); return x ? { ...b, weight: x.w.weight } : b; }), criteriaVersionId: versionId, local: true, scoredAt: nowISO() };
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1305,6 +2319,54 @@ function makeCriteriaState(body = DEFAULT_CRITERIA_BODY) {
   const v = { id: uid("crit"), label: "v1 — critères initiaux", createdAt: nowISO(), ...deepClone(body) };
   return { draft: deepClone(body), versions: [v] };
 }
+
+const DEMO_KEYWORDS = ["transformation digitale", "CRM", "Dynamics 365", "automatisation", "management", "feuille de route", "gouvernance", "Power Automate", "KPI", "SAP"];
+const DEMO_CV = `# Alex Martin (exemple)
+> Digital Transformation Manager — CRM, automatisation et pilotage d'équipe
+@ Ohain, Belgique | alex.martin@exemple.be | +32 470 00 00 00 | linkedin.com/in/exemple
+## Profil
+Manager de la transformation digitale dans une fédération patronale belge. Responsable du CRM Dynamics 365 et d'une équipe de 4 personnes. Pilote la digitalisation et l'automatisation des processus, du cadrage au déploiement, avec un suivi par KPI et une gouvernance claire.
+## Réalisations clés
+- Réduction de 35 % du délai de traitement des adhésions grâce à 12 flux Power Automate (exemple)
+- Migration de 48 000 contacts vers Dynamics 365 sans perte de données, en 4 mois (exemple)
+- Adoption du CRM portée de 52 % à 88 % en un an par la formation et des tableaux de bord (exemple)
+## Expérience professionnelle
+### Business Improvement Manager | Fédération patronale belge | Bruxelles | 2019 – aujourd'hui
+- Pilotage de la feuille de route digitale et de son budget (exemple)
+- Management d'une équipe de 4 : priorisation, montée en compétences, rituels agiles
+- Automatisation de 20 processus métier avec Power Automate et Make (exemple)
+### Chef de projet CRM | Entreprise de services | Wavre | 2015 – 2019
+- Déploiement d'un CRM pour 120 utilisateurs, en 3 vagues (exemple)
+- Conception des rapports Power BI de suivi commercial
+## Compétences
+**CRM :** Dynamics 365, Dataverse, Customer Insights
+**Automatisation :** Power Automate, Make, API REST
+**Management :** équipe de 4, gestion de projets ICT, conduite du changement
+## Langues
+**Français :** langue maternelle
+**Néerlandais :** courant
+**Anglais :** courant
+## Formation
+### Master en sciences de gestion | Université (exemple) | 2012
+## Certifications
+- Microsoft Certified: Power Platform Functional Consultant (exemple)`;
+const DEMO_LETTER = `# Alex Martin (exemple)
+@ Ohain, Belgique | alex.martin@exemple.be | +32 470 00 00 00
+= Ohain, le 21 octobre 2026
+> Service recrutement
+> Exemple Logistics SA
+## Objet : candidature au poste de Digital Transformation Manager
+Madame, Monsieur,
+
+Votre annonce met l'accent sur la gouvernance du CRM et l'automatisation des processus : ce sont précisément les deux chantiers que je pilote depuis cinq ans dans une fédération patronale belge.
+
+J'y ai réduit de 35 % le délai de traitement des adhésions en automatisant 12 flux, et porté l'adoption du CRM de 52 % à 88 % en un an. Je dirige une équipe de 4 personnes, avec des priorités claires et un suivi par indicateurs.
+
+Chez Exemple Logistics, je mettrais cette méthode au service de votre feuille de route digitale : cadrer, livrer par étapes, mesurer.
+
+Je me tiens à votre disposition pour un entretien.
+
+~ Alex Martin`;
 
 function makeDemo(versionId) {
   const t = nowISO();
@@ -1377,10 +2439,12 @@ function makeDemo(versionId) {
   ];
   const sentAt = addDays(t, -8);
   const itv = new Date(addDays(t, 3)); itv.setHours(10, 0, 0, 0);
+  const demoDoc = (text) => ({ id: uid("doc"), text, format: "markup", lang: "fr", accent: "#0f766e", accentSource: "exemple", keywords: DEMO_KEYWORDS, missingInProfile: ["SAP (exemple)"], tips: ["Exemple : chiffrez l'impact sur les délais logistiques.", "Exemple : citez un projet de gouvernance de données."], createdAt: addDays(t, -10), origin: "IA" });
   const apps = [
     {
       id: "demo_app_1", offerId: "demo_off_1", stage: "sent", demo: true, createdAt: addDays(t, -12), updatedAt: sentAt, sentAt,
-      closed: null, docs: {}, prep: null, contactIds: ["demo_ct_1"], interviews: [],
+      closed: null, docs: { cv: [demoDoc(DEMO_CV)], letter: [demoDoc(DEMO_LETTER)] }, docLanguage: "fr", design: designFromTemplate("modern", { accent: "#0f766e" }),
+      prep: null, contactIds: ["demo_ct_1"], interviews: [],
       followUps: [
         { id: "demo_fu_1", kind: "relance1", due: addDays(sentAt, 7), status: "pending", draft: null },
         { id: "demo_fu_2", kind: "relance2", due: addDays(sentAt, 14), status: "pending", draft: null },
@@ -1394,6 +2458,7 @@ function makeDemo(versionId) {
       id: "demo_app_2", offerId: "demo_off_2", stage: "interview", demo: true, createdAt: addDays(t, -20), updatedAt: t, sentAt: addDays(t, -15),
       closed: null, docs: {}, prep: null, contactIds: [],
       interviews: [{ id: "demo_itv_1", at: itv.toISOString(), durationMin: 60, type: "Visioconférence", location: "Teams", notes: "Premier entretien RH (exemple)", eventCreated: false }],
+      emails: [{ id: "demo_mail_1", date: addDays(t, -2).slice(0, 10), from: "rh@exemple-mutualite.be", subject: "Invitation à un premier entretien (exemple)", kind: "invitation_entretien", summary: "Proposition d'un entretien RH en visioconférence (exemple).", threadId: null, at: addDays(t, -2) }],
       followUps: [{ id: "demo_fu_3", kind: "merci", due: addDays(itv.toISOString(), 2), status: "pending", draft: null }],
       log: [{ id: uid("log"), at: addDays(t, -2), type: "email", text: "Invitation à un entretien reçue (exemple)" }],
     },
@@ -1483,7 +2548,7 @@ function Btn({ variant = "soft", size = "md", icon: Icon, loading, children, cla
   );
 }
 
-function IconBtn({ icon: Icon, label, onClick, className = "", active, ...rest }) {
+function IconBtn({ icon: Icon, label, onClick, className = "", active, small, ...rest }) {
   const T = useT();
   return (
     <button
@@ -1492,9 +2557,9 @@ function IconBtn({ icon: Icon, label, onClick, className = "", active, ...rest }
       title={label}
       onClick={onClick}
       {...rest}
-      className={`inline-flex items-center justify-center w-9 h-9 rounded-xl transition-colors duration-200 ${active ? T.accentSoft : T.btnGhost} ${T.ring} ${className}`}
+      className={`inline-flex items-center justify-center shrink-0 ${small ? "w-7 h-7 rounded-lg" : "w-9 h-9 rounded-xl"} transition-colors duration-200 disabled:opacity-40 ${active ? T.accentSoft : T.btnGhost} ${T.ring} ${className}`}
     >
-      <Icon className="w-4 h-4" aria-hidden="true" />
+      <Icon className={small ? "w-3.5 h-3.5" : "w-4 h-4"} aria-hidden="true" />
     </button>
   );
 }
@@ -1884,6 +2949,8 @@ export default function RadarApp() {
   const [apps, setApps] = useState([]);
   const [contacts, setContacts] = useState([]);
   const [ratings, setRatings] = useState({});
+  const [media, setMedia] = useState({});
+  const [inbox, setInbox] = useState({ replies: [], untracked: [] });
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -1901,7 +2968,10 @@ export default function RadarApp() {
   const [todayAI, setTodayAI] = useState(null);
   const [offerPreset, setOfferPreset] = useState(null);
   const [dupeProposals, setDupeProposals] = useState(null);
-  const [replyProposals, setReplyProposals] = useState(null);
+  const [replyOpen, setReplyOpen] = useState(false);
+  const [studio, setStudio] = useState(null);
+  const [exportFor, setExportFor] = useState(null);
+  const [compare, setCompare] = useState(null);
   const [veille, setVeille] = useState({ routine: null, status: null, configSig: null, configLoaded: false });
   const veilleRef = useRef(veille);
   veilleRef.current = veille;
@@ -1912,7 +2982,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, media, inbox };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -1941,16 +3011,16 @@ export default function RadarApp() {
       try {
         let existing = null;
         try { existing = await storage.list("radar:"); } catch { existing = null; }
-        const out = {};
-        for (const [name, key] of Object.entries(KEYS)) {
-          if (existing && !existing.includes(key)) { out[name] = null; continue; }
+        // Lecture des collections en parallèle (démarrage plus rapide, surtout en page publiée).
+        const out = Object.fromEntries(await Promise.all(Object.entries(KEYS).map(async ([name, key]) => {
+          if (existing && !existing.includes(key)) return [name, null];
           try {
-            out[name] = await storage.get(key);
+            return [name, await storage.get(key)];
           } catch (e) {
             if (existing || RT.mode === "published") throw e; // lecture en échec : on n'écrase rien
-            out[name] = null; // sans liste, une erreur signifie le plus souvent « clé absente »
+            return [name, null]; // sans liste, une erreur signifie le plus souvent « clé absente »
           }
-        }
+        })));
         const first = Object.values(out).every((v) => v === null || v === undefined);
         if (first) {
           applyDefaults();
@@ -1973,6 +3043,8 @@ export default function RadarApp() {
           const closedOffers = new Set((out.apps || []).filter((a) => a.stage === "closed").map((a) => a.offerId));
           setOffers((out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o)));
           if (out.ratings) setRatings(out.ratings);
+          if (out.media) setMedia(out.media);
+          if (out.inbox) setInbox({ replies: [], untracked: [], ...out.inbox });
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -2006,6 +3078,9 @@ export default function RadarApp() {
   usePersist(KEYS.apps, apps, persistOn, setSaveState);
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
+  usePersist(KEYS.media, media, persistOn, setSaveState);
+  usePersist(KEYS.inbox, inbox, persistOn, setSaveState);
+  useEffect(() => { HOME_LABEL = str(profile.home) || "Ohain (Brabant wallon)"; }, [profile.home]);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -2049,9 +3124,10 @@ export default function RadarApp() {
     if (!targets.length) return;
     setProgress({ label: "Scoring", done: 0, total: targets.length });
     let ok = 0, failed = 0;
-    await pool(chunk(targets, 4), 2, async (batch) => {
+    const context = P.scoreContext(p, ver, ver.label);
+    const runBatch = async (batch) => {
       try {
-        const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.score(batch, p, ver, ver.label), maxTokens: 14000 });
+        const { data } = await askJSON(s, { system: SYSTEM_BASE, context, prompt: P.score(batch), maxTokens: 16000, tier: "deep", effort: "medium" });
         const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).map((x) => [x.id, x]));
         const got = batch.filter((o) => byId[o.id]).length;
         ok += got;
@@ -2063,7 +3139,11 @@ export default function RadarApp() {
       } finally {
         setProgress((pr) => pr && { ...pr, done: Math.min(pr.total, pr.done + batch.length) });
       }
-    });
+    };
+    // Premier lot seul : il écrit le cache du contexte, que les lots suivants (en parallèle) relisent.
+    const batches = chunk(targets, 5);
+    await runBatch(batches[0]);
+    await pool(batches.slice(1), 3, runBatch);
     setProgress(null);
     toast(`${ok} offre(s) scorée(s)${failed ? ` · ${failed} non scorée(s)` : ""}`, failed ? "warn" : "ok");
   });
@@ -2157,6 +3237,7 @@ export default function RadarApp() {
       prompt: P.gmail(days || s.gmailDays),
       mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }],
       maxTokens: 16000,
+      tier: "balanced",
     });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) {
       toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}). Vérifiez votre boîte.`, "danger");
@@ -2180,6 +3261,8 @@ export default function RadarApp() {
       prompt: P.structure({ text: str(text), url: cleanUrl }),
       web: cleanUrl && !str(text) ? { maxUses: 4 } : null,
       maxTokens: 6000,
+      tier: "balanced",
+      effort: "low",
     });
     if (!res.data?.found || !res.data.offer) throw new Error(`Annonce non retrouvée${res.data?.reason ? ` (${res.data.reason})` : ""}. Collez plutôt le texte de l'annonce.`);
     const o = normalizeOffer(
@@ -2219,7 +3302,7 @@ export default function RadarApp() {
     const used = new Set();
     const groups = [];
     for (const batch of chunk(pool0, 60)) {
-      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000 });
+      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000, tier: "fast", effort: "low" });
       for (const g of Array.isArray(data?.groups) ? data.groups : []) {
         const ids = [...new Set((g.ids || []).filter((id) => known.has(id) && !used.has(id)))];
         if (ids.length < 2) continue;
@@ -2271,52 +3354,111 @@ export default function RadarApp() {
     toast(`Fusion annulée : ${last.absorbed.length} offre(s) restaurée(s)`, "ok");
   };
 
-  /* ── Réponses des recruteurs (Gmail, lecture seule) ──────────────── */
+  /* ── Surveillance Gmail du pipeline : lecture seule, incrémentale, toujours validée ── */
   const replyKey = (r) => `${r.date || ""}|${normText(r.from)}|${normText(r.subject)}`;
-  const checkReplies = () => withBusy("replies", async () => {
-    const { settings: s, apps: A, offers: O, contacts: C } = R.current;
-    const active = A.filter((a) => !a.demo && a.sentAt && a.stage !== "closed");
-    if (!active.length) { toast("Aucune candidature envoyée à surveiller.", "neutral"); return; }
+  const monitoredApps = () => R.current.apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage)));
+  const setInboxNow = (next) => { R.current.inbox = next; setInbox(next); };
+  const checkReplies = ({ auto = false } = {}) => withBusy("replies", async () => {
+    const { settings: s, offers: O, contacts: C } = R.current;
+    const active = monitoredApps();
+    if (!active.length) { if (!auto) toast("Aucune candidature à surveiller (préparation, envoyée ou au-delà).", "neutral"); return; }
+    // Fenêtre incrémentale : depuis la dernière vérification (1 jour de marge), sans remonter avant la plus ancienne candidature.
+    const oldest = active.reduce((m, a) => Math.min(m, new Date(a.sentAt || a.createdAt).getTime()), Date.now());
+    const last = s.lastReplyWindowAt ? new Date(s.lastReplyWindowAt).getTime() - 864e5 : 0;
+    const after = new Date(Math.max(oldest - 864e5, last, Date.now() - 120 * 864e5)).toISOString().slice(0, 10);
     const items = active.map((a) => {
       const o = O.find((x) => x.id === a.offerId);
       return {
-        appId: a.id, title: o?.title || null, company: o?.company || null,
+        appId: a.id, title: o?.title || null, company: o?.company || null, stage: a.stage, sentAt: a.sentAt ? a.sentAt.slice(0, 10) : null,
         sites: [...new Set((o?.sources || []).map((x) => hostOf(x.url)).filter(Boolean))],
         contacts: C.filter((c) => (a.contactIds || []).includes(c.id)).map((c) => ({ name: c.name, email: c.email || null, company: c.company || null })),
-        since: a.sentAt.slice(0, 10),
       };
     });
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000 });
+    const companies = [...new Set(items.map((i) => i.company).filter((c) => c && !/confidenti|non communiqu|anonyme/i.test(c)))].slice(0, 20);
+    const emails = [...new Set(items.flatMap((i) => i.contacts.map((c) => c.email)).filter(Boolean))].slice(0, 15);
+    const query = `after:${after.replace(/-/g, "/")} -category:promotions (${[
+      ...companies.map((c) => `"${c.replace(/"/g, "")}"`),
+      ...emails.map((e) => `from:${e}`),
+      `from:(${ATS_SENDERS.join(" OR ")})`,
+      "subject:(candidature OR application OR sollicitatie OR bewerbung OR entretien OR interview OR gesprek OR sollicitatiegesprek)",
+    ].join(" OR ")})`;
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items, { after, query }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000, tier: "balanced" });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}).`, "danger");
     if (!res.toolCalls.length) throw new Error("Gmail n'a pas été consulté : vérifiez que le connecteur Gmail est activé pour cet artefact.");
-    setSettings((x) => ({ ...x, lastReplyCheckAt: nowISO() }));
+    const now = nowISO();
+    setSettings((x) => ({ ...x, lastReplyCheckAt: now, lastReplyWindowAt: now }));
     const hay = normText(res.toolText);
+    const thread = (t) => (str(t) && hay.includes(normText(t)) ? str(t) : null);
+    const day = (d) => (str(d) && !isNaN(new Date(d).getTime()) ? String(d).slice(0, 10) : null);
+    const seen = new Set([...R.current.apps.flatMap((a) => a.seenReplies || []), ...R.current.inbox.replies.map(replyKey)]);
     const found = (Array.isArray(res.data?.replies) ? res.data.replies : [])
       .filter((r) => r && active.some((a) => a.id === r.appId) && str(r.subject))
       .map((r) => ({
-        id: uid("rep"), appId: r.appId, date: str(r.date), from: str(r.from), subject: str(r.subject),
+        id: uid("rep"), appId: r.appId, threadId: thread(r.threadId), date: day(r.date), from: str(r.from), subject: str(r.subject),
         kind: REPLY_KINDS[r.kind] ? r.kind : "autre", summary: str(r.summary),
         interviewAt: str(r.interviewAt) && !isNaN(new Date(r.interviewAt).getTime()) ? new Date(r.interviewAt).toISOString() : null,
-        action: ["interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
-        verified: hay.includes(normText(r.subject)),
+        action: ["sent", "interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
+        verified: hay.includes(normText(r.subject)), at: now,
       }))
-      .filter((r) => !(active.find((a) => a.id === r.appId)?.seenReplies || []).includes(replyKey(r)));
-    if (!found.length) { toast(`Aucune nouvelle réponse (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok"); return; }
-    setReplyProposals(found);
+      .filter((r) => !seen.has(replyKey(r)));
+    const seenU = new Set([...(s.seenUntracked || []), ...R.current.inbox.untracked.map(replyKey)]);
+    const untracked = (Array.isArray(res.data?.untracked) ? res.data.untracked : [])
+      .filter((u) => u && str(u.subject) && str(u.company))
+      .map((u) => ({ id: uid("unt"), company: str(u.company), title: str(u.title), threadId: thread(u.threadId), date: day(u.date), from: str(u.from), subject: str(u.subject), kind: REPLY_KINDS[u.kind] ? u.kind : "autre", summary: str(u.summary), verified: hay.includes(normText(u.subject)), at: now }))
+      .filter((u) => !seenU.has(replyKey(u)));
+    setInboxNow({ replies: [...R.current.inbox.replies, ...found], untracked: [...R.current.inbox.untracked, ...untracked] });
+    if (found.length || untracked.length) {
+      toast(`Gmail : ${found.length} réponse(s)${untracked.length ? ` et ${untracked.length} candidature(s) non suivie(s)` : ""} à valider.`, "ok");
+      if (!auto) setReplyOpen(true);
+    } else if (!auto) toast(`Aucune nouvelle réponse depuis le ${fmtDate(after)} (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok");
   });
   const resolveReply = (r, apply) => {
     patchApp(r.appId, (a) => {
       const n = { ...a, seenReplies: [...(a.seenReplies || []), replyKey(r)] };
-      return apply ? addLogEntry(n, "email", `Réponse reçue (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`) : n;
+      if (!apply) return n;
+      const mail = { id: uid("mail"), date: r.date, from: r.from, subject: r.subject, kind: r.kind, summary: r.summary, threadId: r.threadId, at: nowISO() };
+      return addLogEntry({ ...n, emails: [...(n.emails || []), mail] }, "email", `E-mail reçu (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`);
     });
     if (apply) {
-      if (r.action === "interview") {
+      const cur = R.current.apps.find((a) => a.id === r.appId);
+      if (r.action === "sent") {
+        const sentAt = r.date ? new Date(`${r.date}T09:00:00`).toISOString() : undefined;
+        if (cur && STAGE_INDEX[cur.stage] < STAGE_INDEX.sent) moveApp(r.appId, "sent", { sentAt });
+        else if (cur && !cur.sentAt && sentAt) patchApp(r.appId, (a) => ({ ...a, sentAt }));
+      } else if (r.action === "interview") {
         if (r.interviewAt) addInterview(r.appId, { at: r.interviewAt, type: "À préciser", location: "", notes: `Selon l'e-mail « ${r.subject} »` });
         else moveApp(r.appId, "interview");
       } else if (r.action === "closed") moveApp(r.appId, "closed", { outcome: "refused", reason: r.summary || "Réponse négative reçue par e-mail" });
       else if (r.action === "offer") moveApp(r.appId, "offer");
     }
-    setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
+    setInboxNow({ ...R.current.inbox, replies: R.current.inbox.replies.filter((x) => x.id !== r.id) });
+  };
+  const resolveUntracked = (u, create) => {
+    if (create) {
+      const t = nowISO();
+      const sentAt = u.date ? new Date(`${u.date}T09:00:00`).toISOString() : t;
+      const stage = u.kind === "invitation_entretien" ? "interview" : u.kind === "refus" ? "closed" : "sent";
+      const off = {
+        id: uid("off"), title: u.title || "Candidature détectée dans Gmail", company: u.company, location: null, commute: null, contract: null, seniority: null, salary: null, remote: null,
+        language: null, publishedAt: null, description: u.summary || null, collectedAt: t, lastSeenAt: t, status: stage === "closed" ? "closed" : "pipeline", score: null, demo: false,
+        sources: [{ name: "Gmail", url: null, collectedAt: t, via: "surveillance Gmail", verified: null, emailSubject: u.subject }],
+      };
+      const rules = R.current.settings.followUp;
+      const app = {
+        id: uid("app"), offerId: off.id, stage, reached: STAGE_INDEX[stage === "closed" ? "sent" : stage], createdAt: t, updatedAt: t, sentAt,
+        closed: stage === "closed" ? { outcome: "refused", reason: u.summary, at: t } : null, docs: {}, prep: null, contactIds: [], interviews: [], demo: false,
+        followUps: stage === "sent" ? rules.afterSend.map((d, i) => ({ id: uid("fu"), kind: i === 0 ? "relance1" : i === 1 ? "relance2" : "custom", due: addDays(sentAt, d), status: "pending", draft: null })) : [],
+        emails: [{ id: uid("mail"), date: u.date, from: u.from, subject: u.subject, kind: u.kind, summary: u.summary, threadId: u.threadId, at: t }],
+        log: [{ id: uid("log"), at: t, type: "email", text: `Candidature détectée dans Gmail : « ${u.subject} »` }],
+      };
+      R.current.offers = [off, ...R.current.offers];
+      setOffers((l) => [off, ...l]);
+      R.current.apps = [app, ...R.current.apps];
+      setApps((l) => [app, ...l]);
+      toast(`Ajoutée au pipeline : ${u.company} (${STAGE_LABEL[stage]})`, "ok");
+    }
+    setSettings((x) => ({ ...x, seenUntracked: [...(x.seenUntracked || []), replyKey(u)].slice(-300) }));
+    setInboxNow({ ...R.current.inbox, untracked: R.current.inbox.untracked.filter((x) => x.id !== u.id) });
   };
 
   /* ── Notes employeur (avis publics type Glassdoor) ───────────────── */
@@ -2331,7 +3473,7 @@ export default function RadarApp() {
       toast(`Notes demandées pour ${list.length} entreprise(s) : elles s'afficheront d'ici quelques minutes.`, "ok");
       return;
     }
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000 });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000, tier: "balanced", effort: "low" });
     const next = {};
     (res.data?.ratings || []).forEach((r) => {
       if (!r?.company) return;
@@ -2360,11 +3502,25 @@ export default function RadarApp() {
   /* ── Critères ───────────────────────────────────────────────────── */
   const saveCriteriaVersion = (label) => {
     const c = R.current.criteria;
+    const prev = activeVersion(c);
     const v = { id: uid("crit"), label: label || `v${c.versions.length + 1} — ${fmtDate(nowISO())}`, createdAt: nowISO(), ...deepClone(c.draft) };
     const next = { ...c, versions: [...c.versions, v] };
     R.current.criteria = next;
     setCriteria(next);
     toast(`Version enregistrée : ${v.label}`, "ok");
+    if (prev && onlyWeightsChanged(criteriaBody(prev), criteriaBody(v))) {
+      let n = 0;
+      const list = R.current.offers.map((o) => {
+        if (o.score?.criteriaVersionId !== prev.id) return o;
+        const ns = reweightScore(o.score, prev.wishes || [], v.wishes || [], v.id);
+        if (!ns) return o;
+        n += 1;
+        return { ...o, score: ns };
+      });
+      R.current.offers = list;
+      setOffers(list);
+      if (n) toast(`${n} score(s) recalculé(s) localement : seules les pondérations ont changé, aucun appel IA.`, "ok");
+    }
     if (R.current.settings.autoRescore) setTimeout(() => rescoreStale(), 50);
   };
   const restoreVersion = (vid) => {
@@ -2378,7 +3534,7 @@ export default function RadarApp() {
     saveCriteriaVersion(`Restauration de « ${label} »`);
   };
   const generateKeywords = () => withBusy("keywords", async () => {
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000 });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000, tier: "fast", effort: "low" });
     setCriteria((c) => {
       const kw = { ...c.draft.keywords };
       ["fr", "nl", "en"].forEach((l) => {
@@ -2482,7 +3638,7 @@ export default function RadarApp() {
         toast("Brouillon créé dans Gmail — non envoyé", "ok");
         return;
       }
-      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000 });
+      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000, tier: "balanced", effort: "low" });
       if (res.toolCalls.some((n) => /send/i.test(n))) toast("Alerte : un outil d'envoi a été appelé. Vérifiez vos e-mails envoyés.", "danger");
       if (!res.toolCalls.length) throw new Error("Le connecteur Gmail n'a pas été appelé : aucun brouillon créé. Vérifiez l'activation du connecteur.");
       if (!res.data?.created) throw new Error(`Brouillon non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -2513,6 +3669,8 @@ export default function RadarApp() {
         prompt: P.calendarEvent({ title, start: toLocalInput(start) + ":00", end: toLocalInput(end) + ":00", description, reminder }),
         mcp: [{ server: "gcal", allow: s.mcpTools.gcal }],
         maxTokens: 3000,
+        tier: "balanced",
+        effort: "low",
       });
       if (!res.toolCalls.length) throw new Error("Le connecteur Google Calendar n'a pas été appelé : aucun événement créé.");
       if (!res.data?.created) throw new Error(`Événement non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -2525,18 +3683,20 @@ export default function RadarApp() {
   const calTitle = (what, company) => (R.current.settings.discreetCalendarTitles ? `Perso · ${what}` : `${what} – ${company || "entreprise"}`);
 
   /* ── Dossier de candidature ─────────────────────────────────────── */
-  const generateDocs = (appId, types, instruction) => withBusy(`dossier:${appId}`, async () => {
+  const generateDocs = (appId, types, instruction, langOverride) => withBusy(`dossier:${appId}`, async () => {
     const { settings: s, profile: p } = R.current;
     const app = R.current.apps.find((a) => a.id === appId);
-    const offer = R.current.offers.find((o) => o.id === app?.offerId);
-    if (!app || !offer) throw new Error("Candidature introuvable.");
+    const offer0 = R.current.offers.find((o) => o.id === app?.offerId);
+    if (!app || !offer0) throw new Error("Candidature introuvable.");
+    const offer = langOverride ? { ...offer0, language: langOverride } : offer0;
     const proParts = types.filter((t) => t === "cv" || t === "letter");
     const otherParts = types.filter((t) => !proParts.includes(t));
     const [pro, rest] = await Promise.all([
-      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction), maxTokens: 16000 }) : null,
-      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction), maxTokens: 12000 }) : null,
+      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction), maxTokens: 16000, tier: "deep" }) : null,
+      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction), maxTokens: 12000, tier: "balanced" }) : null,
     ]);
     const data = { ...(rest?.data || {}), language: pro?.data?.language || rest?.data?.language };
+    const lang = langOverride || (DOC_LANGS.includes(data.language) ? data.language : offerLang(offer));
     const versions = {};
     if (pro?.data) {
       const d = pro.data;
@@ -2544,7 +3704,7 @@ export default function RadarApp() {
       const common = { accent, accentSource: accent ? str(d.accentSource) || "suggérée" : null, keywords: (d.keywords?.fromAd || []).map(String).slice(0, 30), missingInProfile: (d.keywords?.missingInProfile || []).map(String), tips: (d.tips || []).map(String) };
       for (const t of proParts) {
         const txt = typeof d[t] === "string" ? d[t].trim() : "";
-        if (txt) versions[t] = { text: txt, format: "markup", ...common, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
+        if (txt) versions[t] = { text: txt, format: "markup", lang, ...common, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
       }
     }
     for (const t of otherParts) {
@@ -2556,13 +3716,13 @@ export default function RadarApp() {
       else if (t === "cv") v = { text: d.text || "", highlights: (d.highlights || []).map(String) };
       else v = { text: d.text || "" };
       if (!v.text) continue;
-      versions[t] = { ...v, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
+      versions[t] = { ...v, lang, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
     }
     if (!Object.keys(versions).length) throw new Error("Aucun document reçu de l'IA.");
     patchApp(appId, (a) => {
       const docs = { ...(a.docs || {}) };
       for (const [t, v] of Object.entries(versions)) docs[t] = [...(docs[t] || []), v];
-      const n = { ...a, docs, docLanguage: data.language || a.docLanguage };
+      const n = { ...a, docs, docLanguage: a.docLanguage || lang };
       if (["new", "retained"].includes(a.stage)) n.stage = "prep";
       return addLogEntry(n, "doc", `Généré : ${Object.keys(versions).map((t) => DOC_LABEL[t]).join(", ")}`);
     });
@@ -2576,6 +3736,36 @@ export default function RadarApp() {
     return addLogEntry({ ...a, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
   });
 
+  /* ── Traduction des documents (structure et faits conservés) ───── */
+  const translateDoc = (appId, kind, from, to) => withBusy(`tr:${appId}:${kind}:${to}`, async () => {
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    const src = latestDoc(app, offer, kind, from);
+    if (!src) throw new Error(`Aucune version ${LANG_FLAG[from]} à traduire.`);
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.translate(src.text, kind, from, to, offer), maxTokens: 12000, tier: "balanced", effort: "low" });
+    const text = typeof data?.text === "string" ? data.text.trim() : "";
+    if (!text) throw new Error("Traduction vide : réessayez.");
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, ...keep } = src;
+    const v = { ...keep, text, lang: to, from, id: uid("doc"), createdAt: nowISO(), origin: "traduction" };
+    patchApp(appId, (a) => addLogEntry({ ...a, docs: { ...a.docs, [kind]: [...(a.docs?.[kind] || []), v] } }, "doc", `${DOC_LABEL[kind]} traduit : ${LANG_FLAG[from]} → ${LANG_FLAG[to]}`));
+    return v;
+  });
+  const setAppDesign = (appId, design) => patchApp(appId, (a) => ({ ...a, design }));
+
+  /* ── Entraînement à l'entretien ─────────────────────────────────── */
+  const evaluatePractice = (appId, question, answer) => withBusy(`practice:${appId}`, async () => {
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.practice(question, answer, offer, R.current.profile), maxTokens: 5000, tier: "balanced" });
+    const fb = {
+      score: clamp(Math.round(Number(data?.score) || 1), 1, 5), star: data?.star || {},
+      strengths: (data?.strengths || []).map(String).slice(0, 3), improvements: (data?.improvements || []).map(String).slice(0, 3),
+      improved: str(data?.improved), seconds: Number(data?.seconds) || Math.round((answer.split(/\s+/).length / 130) * 60),
+    };
+    patchApp(appId, (a) => ({ ...a, practice: [...(a.practice || []), { id: uid("pr"), at: nowISO(), question, answer, feedback: fb }] }));
+    return fb;
+  });
+
   /* ── Relances ───────────────────────────────────────────────────── */
   const setFollowUp = (appId, fuId, patch) => patchApp(appId, (a) => ({ ...a, followUps: (a.followUps || []).map((f) => (f.id === fuId ? { ...f, ...patch } : f)) }));
   const draftFollowUp = (appId, fuId) => withBusy(`fu:${fuId}`, async () => {
@@ -2584,7 +3774,7 @@ export default function RadarApp() {
     const fu = app?.followUps.find((f) => f.id === fuId);
     const offer = O.find((o) => o.id === app?.offerId);
     const contact = C.find((c) => app?.contactIds?.includes(c.id));
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.followUp(app, offer, fu, p, contact), maxTokens: 3000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.followUp(app, offer, fu, p, contact), maxTokens: 3000, tier: "balanced", effort: "low" });
     if (!data?.body) throw new Error("Aucun texte reçu.");
     setFollowUp(appId, fuId, { draft: { subject: data.subject || "", body: data.body, createdAt: nowISO() } });
     toast("Relance rédigée — à relire", "ok");
@@ -2602,7 +3792,7 @@ export default function RadarApp() {
     const { settings: s, profile: p, apps: A, offers: O } = R.current;
     const app = A.find((a) => a.id === appId);
     const offer = O.find((o) => o.id === app?.offerId);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.prep(offer, p), web: { maxUses: 6 }, maxTokens: 14000 });
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.prep(offer, p), web: { maxUses: 6 }, maxTokens: 14000, tier: "deep" });
     const d = res.data || {};
     const seen = (u) => !!u && res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u));
     const prep = {
@@ -2651,7 +3841,11 @@ export default function RadarApp() {
       });
       if (a.stage === "retained" && !Object.keys(a.docs || {}).length) items.push({ id: `doc:${a.id}`, label: "Préparer le dossier de candidature", detail: name, weight: 2, go: () => openApp(a.id, "docs"), demo: a.demo });
       if (a.stage === "prep" && daysFromToday(a.updatedAt) <= -3) items.push({ id: `send:${a.id}`, label: "Finaliser et envoyer la candidature", detail: name, weight: 2, go: () => openApp(a.id, "docs"), demo: a.demo });
+      const silent = silenceDays(a);
+      if (silent !== null && silent >= (settings.ghostDays || 21)) items.push({ id: `ghost:${a.id}`, label: `Sans nouvelles depuis ${silent} j : relancer ou clôturer`, detail: name, weight: 2, go: () => openApp(a.id, "track"), demo: a.demo });
     });
+    const pendingMail = inbox.replies.length + inbox.untracked.length;
+    if (pendingMail) items.push({ id: "inbox", label: `${pendingMail} e-mail(s) détecté(s) à valider`, detail: "Réponses et candidatures trouvées dans Gmail", weight: 1, go: () => setReplyOpen(true) });
     offers
       .filter((o) => o.status === "new" && o.score && o.score.value >= th)
       .sort((a, b) => b.score.value - a.score.value)
@@ -2664,11 +3858,11 @@ export default function RadarApp() {
     return items
       .map((it) => ({ ...it, ai: order[it.id] }))
       .sort((a, b) => (a.ai?.priority ?? a.weight) - (b.ai?.priority ?? b.weight) || new Date(a.due || 8.64e15) - new Date(b.due || 8.64e15));
-  }, [apps, offers, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [apps, offers, inbox, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, settings.ghostDays, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const prioritizeToday = () => withBusy("today", async () => {
     if (!todayItems.length) return;
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000 });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000, tier: "fast", effort: "low" });
     const order = {};
     (data?.ordered || []).forEach((x) => { if (x?.id) order[x.id] = { priority: clamp(Number(x.priority) || 2, 1, 3), reason: str(x.reason) }; });
     setTodayAI({ order, at: nowISO() });
@@ -2676,7 +3870,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, ratings, media, inbox });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -2686,6 +3880,9 @@ export default function RadarApp() {
     setOffers(obj.offers || []);
     setApps(obj.apps || []);
     setContacts(obj.contacts || []);
+    setRatings(obj.ratings || {});
+    setMedia(obj.media || {});
+    setInbox({ replies: [], untracked: [], ...(obj.inbox || {}) });
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -2699,7 +3896,11 @@ export default function RadarApp() {
     setOffers([]);
     setApps([]);
     setContacts([]);
+    setRatings({});
+    setMedia({});
+    setInbox({ replies: [], untracked: [] });
     setTodayAI(null);
+    setOfferQueue([]);
     toast("Plateforme réinitialisée", "ok");
   };
   const clearDemo = () => {
@@ -2716,6 +3917,18 @@ export default function RadarApp() {
     toast("Exemples rechargés", "ok");
   };
   const hasDemo = offers.some((o) => o.demo) || apps.some((a) => a.demo) || contacts.some((c) => c.demo);
+  /* Allège les offres écartées ou expirées anciennes (description courte, analyse détaillée retirée). */
+  const compactOffers = (days = 90) => {
+    const lim = Date.now() - days * 864e5;
+    const old = (o) => ["dismissed", "expired"].includes(o.status) && !o.compacted && new Date(o.dismissedAt || o.expiredAt || o.lastSeenAt || o.collectedAt).getTime() < lim;
+    const n = R.current.offers.filter(old).length;
+    if (!n) { toast(`Aucune offre écartée depuis plus de ${days} jours.`, "neutral"); return; }
+    setOffers((l) => l.map((o) => (old(o) ? {
+      ...o, description: o.description ? o.description.slice(0, 280) : null, mergeHistory: undefined, compacted: true,
+      score: o.score ? { ...o.score, breakdown: [], strengths: [], gaps: [], questions: [], must: [], nice: [], missions: [] } : null,
+    } : o)));
+    toast(`${n} offre(s) allégée(s)`, "ok");
+  };
 
   /* ── Raccourcis clavier ─────────────────────────────────────────── */
   useEffect(() => {
@@ -2789,6 +4002,8 @@ export default function RadarApp() {
     const s = R.current.settings;
     const stale = (iso) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= (s.autoWatchHours || 24);
     const t = setTimeout(async () => {
+      const due = (iso, h) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= h;
+      if (s.autoReplies && due(s.lastReplyCheckAt, s.autoRepliesHours || 12) && monitoredApps().length && (RT.mode !== "published" || RT.mcp)) await checkReplies({ auto: true });
       if (s.autoGmail && stale(s.lastGmailImportAt)) await importGmail(s.gmailDays);
       if (s.autoWatch && RT.mode !== "published" && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
     }, 1500);
@@ -2812,6 +4027,9 @@ export default function RadarApp() {
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
+    media, setMedia, inbox, setReplyOpen, resolveUntracked, translateDoc, setAppDesign, evaluatePractice, compactOffers,
+    openStudio: (appId, kind = "cv") => setStudio({ appId, kind }), openExport: (appId) => setExportFor(appId), openCompare: (ids) => setCompare(ids),
+    monitoredCount: apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage))).length,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -2862,7 +4080,10 @@ export default function RadarApp() {
           {appSel && <AppDrawer id={appSel.id} tab={appSel.tab} setTab={(t) => setAppSel((s) => ({ ...s, tab: t }))} onClose={() => setAppSel(null)} />}
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
           <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
-          <ReplyReviewModal replies={replyProposals} setReplies={setReplyProposals} onResolve={resolveReply} apps={apps} offers={offers} />
+          <ReplyReviewModal open={replyOpen} onClose={() => setReplyOpen(false)} inbox={inbox} setInbox={setInbox} onResolve={resolveReply} onResolveUntracked={resolveUntracked} apps={apps} offers={offers} />
+          {studio && <Studio key={`${studio.appId}:${studio.kind}`} appId={studio.appId} initialKind={studio.kind} onClose={() => setStudio(null)} />}
+          {exportFor && <ExportModal appId={exportFor} onClose={() => setExportFor(null)} />}
+          {compare && <CompareModal ids={compare} onClose={() => setCompare(null)} />}
           <StageDialog dialog={stageDialog} onClose={() => setStageDialog(null)} />
           <ConfirmExternalModal confirm={confirm} onClose={() => setConfirm(null)} />
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
@@ -2987,12 +4208,19 @@ function CommandPalette({ open, onClose }) {
       { group: "Actions", label: "Importer les alertes e-mail (Gmail)", icon: Mail, run: run(() => app.importGmail()) },
       { group: "Actions", label: "Importer une annonce (URL ou texte)", icon: Clipboard, run: run(() => app.setManualOpen(true)) },
       { group: "Actions", label: "Voir les relances dues", icon: BellRing, run: run(() => app.go("followups")) },
-      { group: "Actions", label: "Vérifier les réponses des recruteurs (Gmail)", icon: MailCheck, run: run(() => app.checkReplies()) },
+      { group: "Actions", label: "Vérifier Gmail (réponses, accusés, candidatures non suivies)", icon: MailCheck, run: run(() => app.checkReplies()) },
+      ...(app.inbox.replies.length + app.inbox.untracked.length ? [{ group: "Actions", label: "Valider les e-mails détectés", hint: `${app.inbox.replies.length + app.inbox.untracked.length}`, icon: Inbox, run: run(() => app.setReplyOpen(true)) }] : []),
       { group: "Actions", label: "Détecter les doublons (IA)", icon: GitMerge, run: run(() => app.detectDuplicates()) },
       { group: "Actions", label: "Recalculer les scores obsolètes", hint: `${app.staleIds.length}`, icon: RefreshCw, run: run(() => app.rescoreStale()) },
       { group: "Actions", label: "Prioriser mes actions du jour (IA)", icon: Wand2, run: run(() => { app.go("dashboard"); app.prioritizeToday(); }) },
       { group: "Actions", label: "Exporter une sauvegarde JSON", icon: Download, run: run(() => app.go("privacy")) },
       ...NAV.map((n) => ({ group: "Navigation", label: n.label, icon: n.icon, run: run(() => app.go(n.id)) })),
+      ...app.apps
+        .filter((a) => (a.docs?.cv || a.docs?.letter || []).length)
+        .map((a) => {
+          const o = app.offers.find((x) => x.id === a.offerId);
+          return { group: "Studio CV & lettre", label: `Studio : ${o?.title || "poste"}`, hint: o?.company || "", icon: Palette, run: run(() => app.openStudio(a.id, "cv")) };
+        }),
       ...app.apps
         .filter((a) => ["new", "retained", "prep"].includes(a.stage))
         .map((a) => {
@@ -3007,7 +4235,7 @@ function CommandPalette({ open, onClose }) {
     const nq = normText(q);
     const filtered = nq ? list.filter((i) => normText(`${i.label} ${i.hint || ""} ${i.group}`).includes(nq)) : list.filter((i) => i.group !== "Offres");
     return filtered.slice(0, 40);
-  }, [open, q, app.apps, app.offers, app.staleIds]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, q, app.apps, app.offers, app.staleIds, app.inbox]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!open) return null;
   const onKey = (e) => {
@@ -3288,13 +4516,17 @@ function DashboardView() {
    11. OFFRES
    ════════════════════════════════════════════════════════════════════════ */
 
-const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score", hideOld: true };
+const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score", hideOld: true, verdict: "" };
+const isFresh = (o) => o.status === "new" && Date.now() - new Date(o.collectedAt).getTime() < 48 * 36e5;
 
 function OffersView() {
   const T = useT();
-  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates, setOfferQueue, ratings, requestRatings } = useApp();
+  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates, setOfferQueue, ratings, requestRatings, openCompare } = useApp();
   const [f, setF] = useState(DEFAULT_FILTERS);
   const [dense, setDense] = useState(true);
+  const [picking, setPicking] = useState(false);
+  const [picked, setPicked] = useState([]);
+  const togglePick = (id) => setPicked((l) => (l.includes(id) ? l.filter((x) => x !== id) : l.length < 4 ? [...l, id] : l));
   useEffect(() => {
     if (offerPreset) { setF({ ...DEFAULT_FILTERS, ...offerPreset }); setOfferPreset(null); }
   }, [offerPreset]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -3313,6 +4545,7 @@ function OffersView() {
       if (f.source && !(o.sources || []).some((s) => s.name === f.source)) return false;
       if (f.minScore && !(o.score?.value >= f.minScore)) return false;
       if (f.maxCommute && !(o.commute && o.commute.minutes <= f.maxCommute)) return false;
+      if (f.verdict && offerVerdict(o, settings.threshold)?.id !== f.verdict) return false;
       if (nq && !normText(`${o.title} ${o.company} ${o.location} ${o.description}`).includes(nq)) return false;
       return true;
     });
@@ -3323,7 +4556,7 @@ function OffersView() {
       source: (a, b) => (a.sources?.[0]?.name || "").localeCompare(b.sources?.[0]?.name || ""),
     }[f.sort];
     return [...l].sort(cmp);
-  }, [offers, f, settings.hideOlderThan]);
+  }, [offers, f, settings.hideOlderThan, settings.threshold]);
   useEffect(() => { setOfferQueue(list.map((o) => o.id)); }, [list]); // eslint-disable-line react-hooks/exhaustive-deps
   const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && !/confidenti|non communiqu/i.test(c)))], [list, ratings]);
 
@@ -3339,13 +4572,15 @@ function OffersView() {
             {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length}</Btn>}
             {unrated.length > 0 && <Btn icon={Star} onClick={() => requestRatings(unrated)} loading={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</Btn>}
             <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
+            {picking && picked.length >= 2 ? <Btn variant="primary" icon={Columns} onClick={() => openCompare(picked)}>Comparer ({picked.length})</Btn> : null}
+            <Btn icon={Columns} variant={picking ? "ghost" : "soft"} onClick={() => { setPicking(!picking); setPicked([]); }}>{picking ? "Annuler" : "Comparer"}</Btn>
             <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
           </>
         }
       />
       <Card className="p-4 mb-6">
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 items-end">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end">
           <Field label="Recherche" className="col-span-2">
             <Input value={f.q} onChange={set("q")} placeholder="Intitulé, entreprise, lieu…" />
           </Field>
@@ -3361,6 +4596,14 @@ function OffersView() {
               <option value={50}>≥ 50</option>
               <option value={settings.threshold}>≥ seuil ({settings.threshold})</option>
               <option value={85}>≥ 85</option>
+            </Select>
+          </Field>
+          <Field label="Verdict">
+            <Select value={f.verdict} onChange={set("verdict")} className="w-full">
+              <option value="">Tous</option>
+              <option value="apply">Postuler</option>
+              <option value="dig">À creuser</option>
+              <option value="skip">Passer</option>
             </Select>
           </Field>
           <Field label="Trajet max">
@@ -3405,25 +4648,33 @@ function OffersView() {
       ) : dense ? (
         <Card className="p-2">
           <ul className={`divide-y ${T.divide}`}>
-            {list.map((o) => (
-              <li key={o.id}>
-                <button type="button" onClick={() => openOffer(o.id)} className={`w-full flex items-center gap-4 px-3 py-3 rounded-2xl text-left transition-colors duration-150 ${T.subHover} ${T.ring}`}>
+            {list.map((o) => {
+              const v = offerVerdict(o, settings.threshold);
+              const fx = o.score?.facts || {};
+              return (
+              <li key={o.id} className="flex items-center">
+                {picking && <input type="checkbox" className="ml-3 shrink-0" checked={picked.includes(o.id)} disabled={!picked.includes(o.id) && picked.length >= 4} onChange={() => togglePick(o.id)} aria-label={`Comparer ${o.title}`} />}
+                <button type="button" onClick={() => openOffer(o.id)} className={`flex-1 min-w-0 flex items-center gap-4 px-3 py-3 rounded-2xl text-left transition-colors duration-150 ${T.subHover} ${T.ring}`}>
                   <ScorePill score={o.score} threshold={settings.threshold} />
                   <span className="flex-1 min-w-0">
                     <span className="flex items-center gap-2">
+                      {isFresh(o) && <span className="w-2 h-2 rounded-full bg-indigo-600 shrink-0" title="Nouvelle (moins de 48 h)" aria-label="Nouvelle" />}
                       <span className="text-sm font-medium truncate">{o.title}</span>
+                      {v && <Chip tone={v.tone} className="shrink-0">{v.label}</Chip>}
                       {o.demo && <Chip>exemple</Chip>}
                       {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
                       {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">score obsolète</Chip>}
                     </span>
-                    <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}><span className="truncate">{show(o.company)} · {show(o.location)}</span><RatingChip company={o.company} compact /></span>
+                    <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}><span className="truncate">{show(o.company)} · {show(o.location)}{fx.contract || o.contract ? ` · ${fx.contract || o.contract}` : ""}{fx.remoteDays != null ? ` · ${fx.remoteDays} j télétravail` : ""}{fmtSalary(fx, null) ? ` · ${fmtSalary(fx, null)}` : ""}</span><RatingChip company={o.company} compact /></span>
+                    {o.score?.tldr && <span className={`block text-xs mt-0.5 truncate ${T.faint}`}>{o.score.tldr}</span>}
                   </span>
                   <span className={`hidden md:flex items-center gap-1 text-xs w-20 ${T.muted}`}><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</span>
                   <span className={`hidden lg:block text-xs w-32 truncate ${T.muted}`}>{o.sources?.map((s) => s.name).join(", ")}</span>
                   <span className={`hidden sm:block text-xs w-20 text-right tabular-nums ${T.faint}`}>{fmtDate(o.publishedAt || o.collectedAt)}</span>
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
         </Card>
       ) : (
@@ -3439,12 +4690,13 @@ function OffersView() {
                     {o.demo && <Chip>exemple</Chip>}
                     <Chip><MapPin className="w-3 h-3" aria-hidden="true" />{show(o.location)}</Chip>
                     <Chip><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</Chip>
-                    <Chip>{show(o.remote)}</Chip>
+                    <Chip>{o.score?.facts?.remoteDays != null ? `${o.score.facts.remoteDays} j télétravail` : show(o.remote)}</Chip>
+                    {offerVerdict(o, settings.threshold) && <Chip tone={offerVerdict(o, settings.threshold).tone}>{offerVerdict(o, settings.threshold).label}</Chip>}
                     {o.score && <Chip tone={o.score.confidence === "faible" ? "warn" : "neutral"}>confiance {o.score.confidence}</Chip>}
                   </div>
                 </div>
               </div>
-              {o.score?.summary && <p className={`text-sm mt-4 ${T.muted}`}>{o.score.summary}</p>}
+              {(o.score?.tldr || o.score?.summary) && <p className={`text-sm mt-4 ${T.muted}`}>{o.score.tldr || o.score.summary}</p>}
               {o.score?.redFlags?.length > 0 && (
                 <div className="mt-3 text-xs text-rose-600 flex items-start gap-1.5"><Flag className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />{o.score.redFlags[0].evidence}</div>
               )}
@@ -3461,6 +4713,7 @@ function OfferDrawer({ id, onClose }) {
   const T = useT();
   const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel } = useApp();
   const o = offers.find((x) => x.id === id);
+  const [tab, setTab] = useState("analysis");
   const queue = offerQueue.length ? offerQueue : offers.filter(isActiveOffer).map((x) => x.id);
   const pos = queue.indexOf(id);
   const prevId = pos > 0 ? queue[pos - 1] : null;
@@ -3531,36 +4784,19 @@ function OfferDrawer({ id, onClose }) {
         {nextId && <Btn variant="ghost" icon={ArrowRight} onClick={() => setOfferSel(nextId)}>Suivante</Btn>}
         {!o.demo && <Btn variant="ghost" icon={RefreshCw} onClick={() => scoreOffers([o.id])} loading={busy.score}>{s ? "Rescorer" : "Scorer"}</Btn>}
       </div>
-      <label className={`flex items-center gap-2 text-xs mb-8 ${T.faint}`}>
+      <label className={`flex items-center gap-2 text-xs mb-6 ${T.faint}`}>
         <input type="checkbox" checked={!!settings.autoNext} onChange={(e) => setSettings((x) => ({ ...x, autoNext: e.target.checked }))} />
         Passer automatiquement à l'offre suivante après « Écarter », « Expirée » ou « Ajouter » · flèches ← → pour naviguer
       </label>
 
-      <section className="mb-8">
-        <div className="flex items-center gap-4">
-          <ScorePill score={s} threshold={settings.threshold} size="lg" />
-          <div className="flex-1">
-            {s ? (
-              <>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>Confiance {s.confidence}</Chip>
-                  {stale && !o.demo && <Chip tone="warn">critères modifiés depuis</Chip>}
-                  {s.caps?.map((c) => <Chip key={c} tone="danger">plafonné : {c}</Chip>)}
-                </div>
-                {s.summary && <p className="text-sm mt-2">{s.summary}</p>}
-                {s.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
-              </>
-            ) : (
-              <p className={`text-sm ${T.muted}`}>Pas encore scorée.</p>
-            )}
-          </div>
-        </div>
-      </section>
+      <DecisionCard o={o} stale={stale} />
+      <div className="mb-6 overflow-x-auto"><Tabs value={tab} onChange={setTab} tabs={[{ id: "analysis", label: "Analyse" }, { id: "ad", label: "Annonce" }, { id: "sources", label: "Sources", count: o.sources?.length || 0 }]} /></div>
 
-      {s && (
+      {tab === "analysis" && (s ? (
         <>
           <section className="mb-8">
             <SectionTitle>Décomposition par critère</SectionTitle>
+            {s.local && <p className={`text-xs mb-3 ${T.faint}`}>Score recalculé localement après un changement de pondération (aucun appel IA).</p>}
             <div className="space-y-5">
               {groups.map(([kind, label]) => {
                 const rows = s.breakdown.filter((b) => b.kind === kind);
@@ -3592,58 +4828,130 @@ function OfferDrawer({ id, onClose }) {
             <BulletList title="Drapeaux rouges" items={s.redFlags.map((r) => `${{ stress: "Pression", turnover: "Turnover", role_flou: "Rôle flou" }[r.type] || "Autre"} — ${r.evidence}`)} icon={Flag} danger empty="Aucun signal détecté dans le texte" />
           </section>
         </>
+      ) : <Empty icon={Gauge} title="Pas encore scorée" text="Le score explique l'adéquation critère par critère." action={!o.demo && <Btn icon={RefreshCw} loading={busy.score} onClick={() => scoreOffers([o.id])}>Scorer</Btn>} />)}
+
+      {tab === "ad" && (
+        <>
+          {(s?.missions?.length > 0 || s?.must?.length > 0 || s?.nice?.length > 0) && (
+            <section className="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-8">
+              <BulletList title="Missions principales" items={s.missions} icon={Briefcase} empty="Non précisées" />
+              <div className="space-y-6">
+                <BulletList title="Exigences indispensables" items={s.must} icon={Target} empty="Non précisées" />
+                <BulletList title="Atouts souhaités" items={s.nice} icon={Plus} empty="Non précisés" />
+              </div>
+            </section>
+          )}
+          <section className="mb-8">
+            <SectionTitle>Annonce (résumé collecté{o.language && o.language !== "fr" ? `, en ${LANG_NAME[o.language]}` : ""})</SectionTitle>
+            <p className={`text-sm leading-relaxed whitespace-pre-line ${o.description ? "" : T.faint}`}>{show(o.description)}</p>
+          </section>
+          <section className="mb-8">
+            <SectionTitle>Fiche normalisée</SectionTitle>
+            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
+              {meta.map(([k, v]) => (
+                <div key={k}>
+                  <dt className={`text-xs ${T.faint}`}>{k}</dt>
+                  <dd className={`text-sm ${v ? "" : T.faint}`}>{show(v)}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        </>
       )}
 
-      <section className="mb-8">
-        <SectionTitle>Fiche normalisée</SectionTitle>
-        <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
-          {meta.map(([k, v]) => (
-            <div key={k}>
-              <dt className={`text-xs ${T.faint}`}>{k}</dt>
-              <dd className={`text-sm ${v ? "" : T.faint}`}>{show(v)}</dd>
+      {tab === "sources" && (
+        <>
+          {o.mergeHistory?.length > 0 && (
+            <section className="mb-8">
+              <SectionTitle action={<Btn size="sm" variant="ghost" icon={Undo2} onClick={() => undoMerge(o.id)}>Annuler la dernière fusion</Btn>}>Historique des fusions</SectionTitle>
+              <ul className="space-y-2">
+                {[...o.mergeHistory].reverse().map((m) => (
+                  <li key={m.id} className={`rounded-2xl p-4 text-sm ${T.sub}`}>
+                    <div className="flex flex-wrap items-center gap-2"><GitMerge className={`w-3.5 h-3.5 ${T.muted}`} aria-hidden="true" /><span>{fmtDate(m.at, { time: true })}</span><Chip>{m.origin}</Chip></div>
+                    {m.reason && <div className={`text-xs mt-1 ${T.muted}`}>{m.reason}</div>}
+                    <ul className={`text-xs mt-2 space-y-0.5 ${T.muted}`}>{m.absorbed.map((x) => <li key={x.id}>↳ {x.title} · {show(x.company)} · {(x.sources || []).map((y) => y.name).join(", ")}</li>)}</ul>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          <section>
+            <ul className="space-y-3">
+              {(o.sources || []).map((src, i) => (
+                <li key={i} className={`rounded-2xl p-4 ${T.sub}`}>
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span className="font-medium">{src.name}</span>
+                    <span className={`text-xs ${T.faint}`}>via {src.via} · collectée {fmtDate(src.collectedAt, { time: true })}</span>
+                    {src.verified === true && <Chip tone="ok">URL vérifiée</Chip>}
+                    {src.verified === false && <Chip tone="warn">URL à vérifier</Chip>}
+                  </div>
+                  {src.emailSubject && <div className={`text-xs mt-1 ${T.muted}`}>E-mail : {src.emailSubject}</div>}
+                  <div className="mt-1 text-sm break-all">{src.url ? <ExtLink href={src.url}>{src.url}</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        </>
+      )}
+    </Drawer>
+  );
+}
+
+/* Synthèse de décision : verdict, résumé en français, faits clés normalisés, raisons principales. */
+function DecisionCard({ o, stale }) {
+  const T = useT();
+  const { settings } = useApp();
+  const s = o.score;
+  const f = s?.facts || {};
+  const v = offerVerdict(o, settings.threshold);
+  const facts = [
+    [MapPin, "Lieu", o.location ? `${o.location}${o.commute ? ` · ~${o.commute.minutes} min` : ""}` : null],
+    [FileText, "Contrat", f.contract || o.contract],
+    [Monitor, "Télétravail", f.remoteDays != null ? `${f.remoteDays} j / semaine` : o.remote],
+    [TrendingUp, "Salaire", fmtSalary(f, o.salary)],
+    [Users, "Équipe", f.teamSize ? `${f.teamSize} personne(s)` : null],
+    [Building2, "Rattachement", f.reportsTo],
+    [Target, "Séniorité", f.seniority || o.seniority],
+    [Languages, "Langues exigées", f.languages?.length ? f.languages.map((l) => LANG_FLAG[l]).join(" · ") : null],
+    [Clock, "Publiée", o.publishedAt && !isNaN(new Date(o.publishedAt)) ? `${fmtDate(o.publishedAt)} · ${relDay(o.publishedAt)}` : null],
+  ];
+  const known = facts.filter(([, , val]) => val);
+  const unknown = facts.filter(([, , val]) => !val).map(([, l]) => l.toLowerCase());
+  return (
+    <section className={`rounded-3xl p-5 mb-6 ${T.sub}`} aria-label="Synthèse de décision">
+      <div className="flex items-start gap-4">
+        <ScorePill score={s} threshold={settings.threshold} size="lg" />
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            {v ? <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm font-semibold ${v.id === "apply" ? "bg-emerald-600 text-white" : v.id === "dig" ? (T.dark ? "bg-amber-900 text-amber-100" : "bg-amber-100 text-amber-900") : T.chip}`}>{v.label}</span> : <Chip>non scorée</Chip>}
+            {s && <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>confiance {s.confidence}</Chip>}
+            {stale && !o.demo && s && <Chip tone="warn">critères modifiés depuis</Chip>}
+            {s?.caps?.map((c) => <Chip key={c} tone="danger">plafonné : {c}</Chip>)}
+          </div>
+          {s?.tldr && <p className="text-base font-medium leading-snug mt-2">{s.tldr}</p>}
+          {s?.summary && <p className={`text-sm mt-1 ${T.muted}`}>{s.summary}</p>}
+          {s?.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
+        </div>
+      </div>
+      {known.length > 0 && (
+        <dl className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-5">
+          {known.map(([I, l, val]) => (
+            <div key={l} className={`rounded-2xl px-3 py-2 ${T.surface}`}>
+              <dt className={`flex items-center gap-1.5 text-xs ${T.faint}`}><I className="w-3.5 h-3.5" aria-hidden="true" />{l}</dt>
+              <dd className="text-sm mt-0.5">{val}</dd>
             </div>
           ))}
         </dl>
-      </section>
-
-      <section className="mb-8">
-        <SectionTitle>Annonce (résumé collecté)</SectionTitle>
-        <p className={`text-sm leading-relaxed whitespace-pre-line ${o.description ? "" : T.faint}`}>{show(o.description)}</p>
-      </section>
-
-      {o.mergeHistory?.length > 0 && (
-        <section className="mb-8">
-          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Undo2} onClick={() => undoMerge(o.id)}>Annuler la dernière fusion</Btn>}>Historique des fusions</SectionTitle>
-          <ul className="space-y-2">
-            {[...o.mergeHistory].reverse().map((m) => (
-              <li key={m.id} className={`rounded-2xl p-4 text-sm ${T.sub}`}>
-                <div className="flex flex-wrap items-center gap-2"><GitMerge className={`w-3.5 h-3.5 ${T.muted}`} aria-hidden="true" /><span>{fmtDate(m.at, { time: true })}</span><Chip>{m.origin}</Chip></div>
-                {m.reason && <div className={`text-xs mt-1 ${T.muted}`}>{m.reason}</div>}
-                <ul className={`text-xs mt-2 space-y-0.5 ${T.muted}`}>{m.absorbed.map((a) => <li key={a.id}>↳ {a.title} · {show(a.company)} · {(a.sources || []).map((x) => x.name).join(", ")}</li>)}</ul>
-              </li>
-            ))}
-          </ul>
-        </section>
       )}
-
-      <section>
-        <SectionTitle>Sources ({o.sources?.length || 0})</SectionTitle>
-        <ul className="space-y-3">
-          {(o.sources || []).map((src, i) => (
-            <li key={i} className={`rounded-2xl p-4 ${T.sub}`}>
-              <div className="flex flex-wrap items-center gap-2 text-sm">
-                <span className="font-medium">{src.name}</span>
-                <span className={`text-xs ${T.faint}`}>via {src.via} · collectée {fmtDate(src.collectedAt, { time: true })}</span>
-                {src.verified === true && <Chip tone="ok">URL vérifiée</Chip>}
-                {src.verified === false && <Chip tone="warn">URL à vérifier</Chip>}
-              </div>
-              {src.emailSubject && <div className={`text-xs mt-1 ${T.muted}`}>E-mail : {src.emailSubject}</div>}
-              <div className="mt-1 text-sm break-all">{src.url ? <ExtLink href={src.url}>{src.url}</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
-            </li>
-          ))}
-        </ul>
-      </section>
-    </Drawer>
+      {unknown.length > 0 && <p className={`text-xs mt-3 ${T.faint}`}>Non précisé dans l'annonce : {unknown.join(", ")}.</p>}
+      {s && (s.strengths?.length > 0 || s.gaps?.length > 0 || s.redFlags?.length > 0) && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 mt-4 text-sm">
+          {s.strengths.slice(0, 3).map((x, i) => <div key={`s${i}`} className="flex gap-2"><Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" aria-hidden="true" />{x}</div>)}
+          {s.gaps.slice(0, 3).map((x, i) => <div key={`g${i}`} className="flex gap-2"><ArrowRight className={`w-4 h-4 mt-0.5 shrink-0 ${T.faint}`} aria-hidden="true" />{x}</div>)}
+          {s.redFlags.slice(0, 2).map((r, i) => <div key={`r${i}`} className="flex gap-2 text-rose-600"><Flag className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />{r.evidence}</div>)}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -3728,8 +5036,9 @@ function nextStep(a) {
 
 function PipelineView() {
   const T = useT();
-  const { apps, offers, settings, requestMove, openApp, go } = useApp();
+  const { apps, offers, settings, setSettings, requestMove, openApp, go, checkReplies, busy, inbox, setReplyOpen, monitoredCount } = useApp();
   const [over, setOver] = useState(null);
+  const pendingMail = inbox.replies.length + inbox.untracked.length;
   const [showClosed, setShowClosed] = useState(true);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
   const cols = STAGES.filter((s) => showClosed || s.id !== "closed");
@@ -3740,6 +5049,18 @@ function PipelineView() {
         subtitle="Glissez une carte pour changer d'étape, ou ouvrez-la pour la déplacer au clavier."
         actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
       />
+      <Card className="p-4 mb-6 flex flex-wrap items-center gap-3">
+        <span className={`w-9 h-9 rounded-xl flex items-center justify-center ${T.sub}`}><MailCheck className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /></span>
+        <div className="flex-1 min-w-48">
+          <div className="text-sm font-medium">Surveillance Gmail</div>
+          <div className={`text-xs ${T.muted}`}>
+            {monitoredCount} candidature(s) suivie(s) · vérifié {relTime(settings.lastReplyCheckAt)} · {settings.autoReplies ? `automatique à l'ouverture, toutes les ${settings.autoRepliesHours} h` : "vérification manuelle"} · accusés ATS, réponses, invitations, refus, candidatures non suivies · lecture seule
+          </div>
+        </div>
+        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={!!settings.autoReplies} onChange={(e) => setSettings((x) => ({ ...x, autoReplies: e.target.checked }))} />Auto</label>
+        {pendingMail > 0 && <Btn variant="primary" icon={Inbox} onClick={() => setReplyOpen(true)}>{pendingMail} à valider</Btn>}
+        <Btn icon={RefreshCw} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
+      </Card>
       {apps.length === 0 ? (
         <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre pour démarrer une candidature." action={<Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn>} /></Card>
       ) : (
@@ -3764,6 +5085,9 @@ function PipelineView() {
                   {list.map((a) => {
                     const o = offerOf(a);
                     const ns = nextStep(a);
+                    const le = lastEmail(a);
+                    const sil = silenceDays(a);
+                    const waiting = inbox.replies.some((r) => r.appId === a.id);
                     return (
                       <li key={a.id}>
                         <button
@@ -3787,6 +5111,9 @@ function PipelineView() {
                             {a.closed && <Chip tone={a.closed.outcome === "accepted" ? "ok" : "neutral"}>{OUTCOME_LABEL[a.closed.outcome]}</Chip>}
                             {Object.keys(a.docs || {}).length > 0 && <Chip><FileText className="w-3 h-3" aria-hidden="true" />{Object.keys(a.docs).length} doc.</Chip>}
                             {ns && <Chip tone={ns.urgent ? "danger" : "neutral"}><Clock className="w-3 h-3" aria-hidden="true" />{ns.text}</Chip>}
+                            {waiting && <Chip tone="accent"><Inbox className="w-3 h-3" aria-hidden="true" />e-mail à valider</Chip>}
+                            {le && <Chip tone={le.kind === "refus" ? "danger" : ["invitation_entretien", "offre"].includes(le.kind) ? "ok" : "neutral"}><Mail className="w-3 h-3" aria-hidden="true" />{(REPLY_KINDS[le.kind] || "E-mail").toLowerCase()} · {relDay(le.date || le.at)}</Chip>}
+                            {sil !== null && sil >= (settings.ghostDays || 21) && <Chip tone="warn">sans nouvelles · {sil} j</Chip>}
                           </div>
                         </button>
                       </li>
@@ -3918,39 +5245,73 @@ function DupeReviewModal({ groups, setGroups, onApply, offers, apps }) {
   );
 }
 
-function ReplyReviewModal({ replies, setReplies, onResolve, apps, offers }) {
+function ReplyReviewModal({ open, onClose, inbox, setInbox, onResolve, onResolveUntracked, apps, offers }) {
   const T = useT();
-  if (!replies) return null;
-  const ACTIONS = { log: "Journaliser seulement", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
+  if (!open) return null;
+  const replies = inbox.replies || [];
+  const untracked = inbox.untracked || [];
+  const ACTIONS = { log: "Journaliser seulement", sent: "Marquer « Envoyée » (date de l'e-mail)", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
+  const setAction = (id, action) => setInbox((ib) => ({ ...ib, replies: ib.replies.map((x) => (x.id === id ? { ...x, action } : x)) }));
   return (
-    <Modal open wide onClose={() => setReplies(null)} title={`Réponses détectées (${replies.length})`}>
-      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Validez chaque réponse : elle sera ajoutée au journal et l'étape n'avancera que si vous le choisissez. Les relances en attente sont annulées en cas d'entretien, d'offre ou de refus.</p>
-      <ul className="space-y-3">
-        {replies.map((r) => {
-          const app = apps.find((a) => a.id === r.appId);
-          const o = offers.find((x) => x.id === app?.offerId);
-          return (
-            <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
-                <Chip tone={r.kind === "refus" ? "danger" : r.kind === "invitation_entretien" || r.kind === "offre" ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
-                {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
-              </div>
-              <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
-              <div className="text-sm mt-2">« {r.subject} »</div>
-              {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
-              {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
-              <div className="flex flex-wrap items-center gap-2 mt-3">
-                <Select value={r.action} onChange={(e) => setReplies(replies.map((x) => (x.id === r.id ? { ...x, action: e.target.value } : x)))} aria-label="Action" className="h-8 text-xs">
-                  {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                </Select>
-                <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
-                <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
+    <Modal open wide onClose={onClose} title={`E-mails détectés (${replies.length + untracked.length})`}>
+      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Rien n'est appliqué sans votre validation ; les relances en attente sont annulées en cas d'entretien, d'offre ou de refus. Les e-mails non traités restent ici jusqu'à votre décision.</p>
+      {!replies.length && !untracked.length && <Empty icon={MailCheck} title="Tout est traité" text="Aucun e-mail en attente de validation." />}
+      {replies.length > 0 && (
+        <>
+          <SectionTitle>Réponses aux candidatures suivies</SectionTitle>
+          <ul className="space-y-3 mb-6">
+            {replies.map((r) => {
+              const app = apps.find((a) => a.id === r.appId);
+              const o = offers.find((x) => x.id === app?.offerId);
+              return (
+                <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
+                    <Chip tone={r.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(r.kind) ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
+                    {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
+                  </div>
+                  <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
+                  <div className="text-sm mt-2">« {r.subject} »</div>
+                  {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
+                  {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
+                  <div className="flex flex-wrap items-center gap-2 mt-3">
+                    <Select value={r.action} onChange={(e) => setAction(r.id, e.target.value)} aria-label="Action" className="h-8 text-xs">
+                      {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                    </Select>
+                    <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
+                    <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
+                    {gmailLink(r) && <ExtLink href={gmailLink(r)} className="text-xs">Gmail</ExtLink>}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      {untracked.length > 0 && (
+        <>
+          <SectionTitle>Candidatures envoyées hors de Radar</SectionTitle>
+          <ul className="space-y-3">
+            {untracked.map((u) => (
+              <li key={u.id} className={`rounded-2xl p-4 ${T.sub}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{u.title || "Poste non précisé"} · {u.company}</span>
+                  <Chip tone={u.kind === "refus" ? "danger" : "accent"}>{REPLY_KINDS[u.kind] || "E-mail"}</Chip>
+                  {!u.verified && <Chip tone="warn">à vérifier</Chip>}
+                </div>
+                <div className={`text-xs mt-1 ${T.muted}`}>{show(u.from)} · {u.date ? fmtDate(u.date) : NC}</div>
+                <div className="text-sm mt-2">« {u.subject} »</div>
+                {u.summary && <div className={`text-sm mt-1 ${T.muted}`}>{u.summary}</div>}
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                  <Btn size="sm" variant="primary" icon={Plus} onClick={() => onResolveUntracked(u, true)}>Ajouter au pipeline</Btn>
+                  <Btn size="sm" variant="ghost" onClick={() => onResolveUntracked(u, false)}>Ignorer</Btn>
+                  {gmailLink(u) && <ExtLink href={gmailLink(u)} className="text-xs">Gmail</ExtLink>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </Modal>
   );
 }
@@ -4024,6 +5385,7 @@ function AppDrawer({ id, tab, setTab, onClose }) {
             { id: "track", label: "Suivi" },
             { id: "docs", label: "Dossier", count: Object.keys(app.docs || {}).length || undefined },
             { id: "followups", label: "Relances", count: fuPending || undefined },
+            { id: "emails", label: "E-mails", count: (app.emails || []).length || undefined },
             { id: "prep", label: "Entretien" },
             { id: "contacts", label: "Contacts", count: (app.contactIds || []).length || undefined },
           ]}
@@ -4032,6 +5394,7 @@ function AppDrawer({ id, tab, setTab, onClose }) {
       {tab === "track" && <TrackPanel app={app} offer={offer} />}
       {tab === "docs" && <DossierPanel app={app} offer={offer} />}
       {tab === "followups" && <AppFollowUps app={app} offer={offer} />}
+      {tab === "emails" && <EmailsPanel app={app} />}
       {tab === "prep" && <PrepPanel app={app} offer={offer} />}
       {tab === "contacts" && <AppContacts app={app} />}
     </Drawer>
@@ -4126,27 +5489,28 @@ function TrackPanel({ app, offer }) {
 function DossierPanel({ app, offer }) {
   const T = useT();
   const { generateDocs, busy } = useApp();
-  const [type, setType] = useState("cv");
+  const [type, setType] = useState("studio");
   const [instruction, setInstruction] = useState("");
   const docs = app.docs || {};
   const has = Object.keys(docs).length > 0;
   const loading = busy[`dossier:${app.id}`];
+  const others = DOC_TYPES.filter((d) => d.id !== "cv" && d.id !== "letter");
   const all = DOC_TYPES.filter((d) => docs[d.id]?.length).map((d) => {
     const v = docs[d.id].slice(-1)[0];
-    return `### ${d.label}\n${v.subject ? `Objet : ${v.subject}\n` : ""}${v.text}`;
+    return `### ${d.label}\n${v.subject ? `Objet : ${v.subject}\n` : ""}${d.id === "cv" || d.id === "letter" ? docPlainText(v.text) : v.text}`;
   }).join("\n\n");
   return (
     <div className="space-y-6">
       <Notice icon={Info}>
-        La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Ouvrez l'annonce et copiez les éléments du dossier.{" "}
-        {offer?.sources?.[0]?.url && <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink>}
+        La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Exportez le dossier puis ouvrez l'annonce.{" "}
+        {offer?.sources?.find((x) => x.url) && <ExtLink href={offer.sources.find((x) => x.url).url}>Ouvrir l'annonce</ExtLink>}
       </Notice>
       {!has ? (
         <Card className="p-6">
           {loading ? <Skeleton lines={6} /> : (
             <>
               <div className="text-base font-medium">Générer le dossier complet</div>
-              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV et lettre prêts à envoyer (mis en page aux couleurs de l'entreprise, mots-clés de l'annonce pour les ATS, PDF texte), message LinkedIn, réponses probables au formulaire et e-mail, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
+              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV et lettre prêts à envoyer (mots-clés de l'annonce pour les ATS, mise en page réglable dans le Studio, PDF et Word, traduction FR / NL / EN / DE), message LinkedIn, réponses probables au formulaire et e-mail, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
               <Field label="Consigne facultative"><Input value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Ex. insister sur l'automatisation, ton plus direct…" /></Field>
               <Btn className="mt-4" variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, DOC_TYPES.map((d) => d.id), instruction)}>Générer</Btn>
             </>
@@ -4155,122 +5519,66 @@ function DossierPanel({ app, offer }) {
       ) : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="overflow-x-auto"><Tabs value={type} onChange={setType} tabs={DOC_TYPES.map((d) => ({ id: d.id, label: d.label, count: docs[d.id]?.length || undefined }))} /></div>
+            <div className="overflow-x-auto"><Tabs value={type} onChange={setType} tabs={[{ id: "studio", label: "CV & lettre" }, ...others.map((d) => ({ id: d.id, label: d.label, count: docs[d.id]?.length || undefined }))]} /></div>
             <CopyBtn text={all} label="Copier tout le dossier" />
           </div>
-          <DocEditor key={`${app.id}-${type}`} app={app} type={type} />
+          {type === "studio" ? <StudioCards app={app} offer={offer} /> : <DocEditor key={`${app.id}-${type}`} app={app} type={type} />}
         </>
       )}
     </div>
   );
 }
 
-/* Aperçu « papier » : toujours sur fond blanc, comme le PDF. */
-function DocPaper({ text, accent, kind }) {
-  const A = cleanHex(accent);
-  const blocks = parseDoc(text);
-  let seenContact = false;
+/* Cartes CV et lettre : vignette, langues, qualité, accès au Studio et à l'export. */
+function StudioCards({ app, offer }) {
+  const T = useT();
+  const { settings, media, openStudio, openExport, generateDocs, busy } = useApp();
+  const design = resolveDesign(app, settings, (app.docs?.cv || []).slice(-1)[0]?.accent);
+  const loading = busy[`dossier:${app.id}`];
   return (
-    <div className="rounded-2xl overflow-x-auto" style={{ background: "#ffffff", color: "#2d2d2d", border: "1px solid #e7e5e4", boxShadow: "0 12px 32px -18px rgba(0,0,0,.25)" }}>
-      <div style={{ padding: "32px 34px", fontFamily: '"Inter", Helvetica, Arial, sans-serif', fontSize: 12.5, lineHeight: 1.5, minWidth: 320 }}>
-        {blocks.map((b, i) => {
-          if (b.t === "name") return <div key={i} style={{ color: A, fontSize: kind === "cv" ? 26 : 19, fontWeight: 700, letterSpacing: "-0.01em", lineHeight: 1.15 }}>{b.text}</div>;
-          if (b.t === "quote") return kind === "cv"
-            ? <div key={i} style={{ fontSize: 14, color: "#4a4a4a", marginTop: 4 }}>{b.text}</div>
-            : <div key={i} style={{ marginTop: 2 }}>{b.text}</div>;
-          if (b.t === "contact") { seenContact = true; return <div key={i} style={{ fontSize: 11, color: "#6b6b6b", marginTop: 4, paddingBottom: 12, borderBottom: `2px solid ${A}`, marginBottom: 14 }}>{b.text}</div>; }
-          if (b.t === "date") return <div key={i} style={{ textAlign: "right", color: "#5a5a5a", margin: "8px 0 14px" }}>{b.text}</div>;
-          if (b.t === "h2") return kind === "cv"
-            ? <div key={i} style={{ color: A, fontWeight: 700, fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", margin: "16px 0 6px", paddingBottom: 4, borderBottom: "1px solid #e5e5e5" }}>{b.text}</div>
-            : <div key={i} style={{ fontWeight: 700, margin: "14px 0 12px" }}>{b.text}</div>;
-          if (b.t === "h3") {
-            const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-            return <div key={i} style={{ marginTop: 8 }}><div style={{ fontWeight: 700, color: "#1f1f1f" }}>{parts[0]}</div>{parts.length > 1 && <div style={{ fontSize: 11, color: "#777" }}>{parts.slice(1).join("  ·  ")}</div>}</div>;
-          }
-          if (b.t === "bullet") return <div key={i} style={{ display: "flex", gap: 8, marginTop: 3 }}><span style={{ width: 5, height: 5, borderRadius: 9, background: A, marginTop: 7, flexShrink: 0 }} /><span>{b.text}</span></div>;
-          if (b.t === "kv") return <div key={i} style={{ marginTop: 3 }}><strong style={{ color: "#1f1f1f" }}>{b.label}</strong> {b.text}</div>;
-          if (b.t === "sign") return <div key={i} style={{ marginTop: 18, fontWeight: 700 }}>{b.text}</div>;
-          return <p key={i} style={{ margin: kind === "cv" ? "4px 0" : "0 0 12px", textAlign: kind === "cv" ? "left" : "justify" }}>{b.text}</p>;
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {[["cv", "CV"], ["letter", "Lettre de motivation"]].map(([kind, label]) => {
+          const langs = docLangs(app, offer, kind);
+          const lang = langs.includes(app.docLanguage) ? app.docLanguage : langs[0];
+          const v = lang ? latestDoc(app, offer, kind, lang) : null;
+          const legacy = !v && (app.docs?.[kind] || []).length > 0;
+          const q = v ? docQuality(v.text, { kind, lang, keywords: kind === "cv" ? v.keywords : [], kwLang: offer?.language, design }) : null;
+          return (
+            <Card key={kind} className="p-4 flex gap-4">
+              {v ? <button type="button" onClick={() => openStudio(app.id, kind)} className={`shrink-0 rounded-xl ${T.ring}`} aria-label={`Ouvrir ${label} dans le Studio`}><DocThumb text={v.text} kind={kind} design={design} photo={media.photo} lang={lang} width={104} /></button>
+                : <div className={`shrink-0 rounded-xl flex items-center justify-center ${T.sub}`} style={{ width: 104, height: 147 }}><FileText className={`w-6 h-6 ${T.faint}`} aria-hidden="true" /></div>}
+              <div className="flex-1 min-w-0 flex flex-col gap-2">
+                <div className="text-sm font-medium">{label}</div>
+                {v ? (
+                  <>
+                    <div className="flex flex-wrap gap-1">{langs.map((l) => <Chip key={l} tone={l === lang ? "accent" : "neutral"}>{LANG_FLAG[l]}</Chip>)}</div>
+                    <div className="flex flex-wrap gap-1"><Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"}>qualité {q.score}</Chip><Chip>{TEMPLATE_BY_ID[design.template]?.label || "Personnalisé"}</Chip></div>
+                    <div className="mt-auto"><Btn size="sm" variant="primary" icon={Palette} onClick={() => openStudio(app.id, kind)}>Ouvrir le Studio</Btn></div>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-xs ${T.muted}`}>{legacy ? "Ancien format : régénérez pour la mise en page." : "Pas encore généré."}</p>
+                    <div className="mt-auto"><Btn size="sm" icon={Sparkles} loading={loading} onClick={() => generateDocs(app.id, [kind])}>Générer</Btn></div>
+                  </>
+                )}
+              </div>
+            </Card>
+          );
         })}
-        {!seenContact && kind === "cv" && blocks.length > 0 && <div style={{ fontSize: 11, color: "#b45309", marginTop: 12 }}>Coordonnées absentes : ajoutez une ligne « @ … » ou complétez votre profil.</div>}
+      </div>
+      <div className={`flex flex-wrap items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium">Exporter</div>
+          <div className={`text-xs ${T.muted}`}>PDF ou Word, une ou plusieurs langues, fichiers séparés ou fusionnés en un seul.</div>
+        </div>
+        <Btn icon={FileDown} onClick={() => openExport(app.id)} disabled={!docLangs(app, offer, "cv").length && !docLangs(app, offer, "letter").length}>Exporter</Btn>
       </div>
     </div>
   );
 }
 
 const slugFile = (x) => normText(x || "").replace(/\s+/g, "-").slice(0, 40) || "document";
-
-function ProDocTools({ app, type, v, text, setText, accent, setAccent, dirty, onSave }) {
-  const T = useT();
-  const { offers, profile, toast } = useApp();
-  const [mode, setMode] = useState("preview");
-  const [pdfBusy, setPdfBusy] = useState(false);
-  const offer = offers.find((o) => o.id === app.offerId);
-  const cov = useMemo(() => keywordCoverage(text, v.keywords), [text, v.keywords]);
-  const placeholders = (text.match(/\[à compléter/gi) || []).length;
-  const words = docPlainText(text).split(/\s+/).filter(Boolean).length;
-  const downloadPdf = async () => {
-    setPdfBusy(true);
-    try {
-      const data = await buildDocPdf(text, { accent, kind: type, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: v.keywords, author: profile.name });
-      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}.pdf`, data, "application/pdf");
-      if (r === "saved") toast("PDF prêt", "ok");
-    } catch (e) {
-      toast(`PDF impossible : ${e.message}`, "danger");
-    } finally { setPdfBusy(false); }
-  };
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <Tabs value={mode} onChange={setMode} tabs={[{ id: "preview", label: "Aperçu" }, { id: "edit", label: "Modifier le texte" }]} />
-        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}>
-          <Palette className="w-4 h-4" aria-hidden="true" /> Couleur
-          <input type="color" value={cleanHex(accent)} onChange={(e) => setAccent(e.target.value)} aria-label="Couleur d'accent" style={{ width: 32, height: 24, border: "none", background: "transparent" }} />
-        </label>
-        {v.accentSource && <span className={`text-xs ${T.faint}`}>({v.accentSource})</span>}
-        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots</span>
-      </div>
-      {mode === "preview" ? <DocPaper text={text} accent={accent} kind={type} /> : (
-        <>
-          <Textarea rows={22} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
-          <p className={`text-xs ${T.faint}`}># nom · &gt; accroche ou destinataire · @ coordonnées · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
-        </>
-      )}
-      <div className="flex flex-wrap gap-2">
-        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={onSave}>Enregistrer une version</Btn>
-        <Btn icon={Download} loading={pdfBusy} onClick={downloadPdf}>Télécharger le PDF</Btn>
-        <CopyBtn text={docPlainText(text)} label="Copier le texte (formulaires, ATS)" size="md" />
-      </div>
-      {type === "cv" && (
-        <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-sm font-medium">Analyse ATS</div>
-            {cov.pct !== null && <Chip tone={cov.pct >= 75 ? "ok" : cov.pct >= 50 ? "warn" : "danger"}>{cov.pct} % des mots-clés de l'annonce</Chip>}
-          </div>
-          {cov.covered.length > 0 && <div className="flex flex-wrap gap-1.5">{cov.covered.map((k) => <Chip key={k} tone="ok">{k}</Chip>)}</div>}
-          {cov.missing.length > 0 && (
-            <div>
-              <div className={`text-xs mb-1 ${T.muted}`}>Absents du CV — ajoutez-les seulement si c'est vrai :</div>
-              <div className="flex flex-wrap gap-1.5">{cov.missing.map((k) => <Chip key={k} tone="warn">{k}</Chip>)}</div>
-            </div>
-          )}
-          {v.missingInProfile?.length > 0 && <p className={`text-xs ${T.muted}`}>Exigences non couvertes par votre profil : {v.missingInProfile.join(", ")}. À préparer pour l'entretien.</p>}
-          <ul className={`text-xs space-y-1 ${T.muted}`}>
-            <li>{placeholders ? `⚠ ${placeholders} élément(s) [à compléter] avant envoi.` : "✓ Aucun élément à compléter."}</li>
-            <li>✓ Une colonne, titres standard, texte sélectionnable dans le PDF : lisible par les ATS.</li>
-            <li>{words > 900 ? "⚠ Plus de 900 mots : visez 2 pages maximum." : "✓ Longueur adaptée (1 à 2 pages)."}</li>
-          </ul>
-        </div>
-      )}
-      {v.tips?.length > 0 && (
-        <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
-          <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
-          <ul className="text-sm space-y-1">{v.tips.map((t, i) => <li key={i}>• {t}</li>)}</ul>
-        </div>
-      )}
-    </div>
-  );
-}
 
 function DocEditor({ app, type }) {
   const T = useT();
@@ -4284,11 +5592,9 @@ function DocEditor({ app, type }) {
   const linked = contacts.filter((c) => (app.contactIds || []).includes(c.id) && c.email);
   const [to, setTo] = useState(linked[0]?.email || "");
   useEffect(() => { setIdx(versions.length - 1); }, [versions.length]);
-  const isPro = (type === "cv" || type === "letter") && v?.format === "markup";
-  const [accent, setAccent] = useState(cleanHex(v?.accent));
-  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); setAccent(cleanHex(v?.accent)); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setText(v?.text || ""); setSubject(v?.subject || ""); }, [v?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const loading = busy[`dossier:${app.id}`];
-  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")) || (isPro && accent !== cleanHex(v.accent)));
+  const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")));
   const warn = mentionsEmployer(`${subject}\n${text}`, settings.employerNames);
 
   if (!v) {
@@ -4310,12 +5616,8 @@ function DocEditor({ app, type }) {
         {dirty && <Chip tone="warn">modifications non enregistrées</Chip>}
       </div>
       {warn.length > 0 && <Notice tone="danger" icon={AlertTriangle}>Ce document mentionne votre employeur actuel ({warn.join(", ")}). Vérifiez que c'est voulu avant toute diffusion.</Notice>}
-      {isPro && !loading && (
-        <ProDocTools app={app} type={type} v={v} text={text} setText={setText} accent={accent} setAccent={setAccent} dirty={dirty}
-          onSave={() => saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource })} />
-      )}
-      {(type === "cv" || type === "letter") && !isPro && <Notice icon={Info}>Ancien format : régénérez ce document pour obtenir la version mise en page (aperçu, analyse ATS et PDF).</Notice>}
-      {type === "cv" && !isPro && v.highlights?.length > 0 && (
+      {(type === "cv" || type === "letter") && <Notice icon={Info}>Ancien format : régénérez ce document pour l'ouvrir dans le Studio (mise en page, traduction, PDF et Word).</Notice>}
+      {type === "cv" && v.highlights?.length > 0 && (
         <div className={`rounded-2xl p-4 ${T.sub}`}>
           <div className={`text-xs font-medium mb-2 ${T.muted}`}>Points clés à mettre en avant</div>
           <ul className="space-y-1 text-sm">{v.highlights.map((h, i) => <li key={i} className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-1 shrink-0 ${T.accentText}`} aria-hidden="true" />{h}</li>)}</ul>
@@ -4330,17 +5632,17 @@ function DocEditor({ app, type }) {
           </Field>
         </div>
       )}
-      {loading ? <Card className="p-6"><Skeleton lines={8} /></Card> : !isPro && (
+      {loading ? <Card className="p-6"><Skeleton lines={8} /></Card> : (
         <Textarea rows={type === "linkedin" ? 5 : 16} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: FONT }} />
       )}
       {type === "linkedin" && (
         <p className={`text-xs ${text.length > 300 ? "text-rose-600" : T.faint}`}>{text.length} / 300 caractères (limite d'une invitation). Envoi manuel depuis LinkedIn : aucune automatisation possible.</p>
       )}
-      {!isPro && <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2">
         <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={() => saveDocVersion(app.id, type, text, type === "email" ? subject : undefined)}>Enregistrer une version</Btn>
         <CopyBtn text={type === "email" ? `Objet : ${subject}\n\n${text}` : text} size="md" />
         {type === "email" && <Btn icon={Mail} loading={busy["gmail-draft"]} onClick={() => createGmailDraft({ to, subject, body: text, appId: app.id })}>Créer le brouillon Gmail</Btn>}
-      </div>}
+      </div>
       <div className={`flex flex-col sm:flex-row gap-2 pt-4 border-t ${T.line}`}>
         <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Consigne de régénération (facultatif) : plus court, plus orienté résultats…" aria-label="Consigne de régénération" />
         <Btn icon={RefreshCw} loading={loading} onClick={() => generateDocs(app.id, [type], instr)}>Régénérer</Btn>
@@ -4429,16 +5731,19 @@ function PrepPanel({ app, offer }) {
   const loading = busy[`prep:${app.id}`];
   if (!p) {
     return (
-      <Card className="p-6">
-        {loading ? <Skeleton lines={8} /> : (
-          <Empty
-            icon={Sparkles}
-            title="Préparer l'entretien"
-            text="Fiche entreprise sourcée (recherche web), questions probables, vos exemples STAR, questions à poser et points de négociation."
-            action={<Btn variant="primary" icon={Search} onClick={() => prepareInterview(app.id)}>Générer la fiche</Btn>}
-          />
-        )}
-      </Card>
+      <div className="space-y-8">
+        <Card className="p-6">
+          {loading ? <Skeleton lines={8} /> : (
+            <Empty
+              icon={Sparkles}
+              title="Préparer l'entretien"
+              text="Fiche entreprise sourcée (recherche web), questions probables, vos exemples STAR, questions à poser et points de négociation."
+              action={<Btn variant="primary" icon={Search} onClick={() => prepareInterview(app.id)}>Générer la fiche</Btn>}
+            />
+          )}
+        </Card>
+        <PracticePanel app={app} offer={offer} />
+      </div>
     );
   }
   return (
@@ -4495,6 +5800,7 @@ function PrepPanel({ app, offer }) {
           <p className="text-sm">{p.salaryBenchmark.range} {p.salaryBenchmark.sourceUrl && <ExtLink href={p.salaryBenchmark.sourceUrl} className="text-xs">source</ExtLink>}</p>
         ) : <p className={`text-sm ${T.faint}`}>{NC} — aucune source publique chiffrée trouvée.</p>}
       </section>
+      <PracticePanel app={app} offer={offer} />
     </div>
   );
 }
@@ -4520,36 +5826,1096 @@ function AppContacts({ app }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   13b. STUDIO CV & LETTRE — édition visuelle, design en temps réel, export
+   ════════════════════════════════════════════════════════════════════════ */
+
+const PX_MM = 3.7795; // pixels CSS par mm à 100 %
+
+/* Une page du moteur de mise en page, en SVG (mêmes coordonnées que le PDF). */
+function PageSvg({ page, W, H, photo, idp, interactive, sel, hover, onPick, onHover, accent }) {
+  const shapeEl = (o, props) => {
+    if (o.shape === "circle") return <circle cx={o.x + o.s / 2} cy={o.y + o.s / 2} r={o.s / 2} {...props} />;
+    if (o.shape === "rounded") return <rect x={o.x} y={o.y} width={o.s} height={o.s} rx={o.s * 0.18} {...props} />;
+    if (o.shape === "hexagon") return <polygon points={hexPoints(o.x, o.y, o.s).map((p) => p.join(",")).join(" ")} {...props} />;
+    return <rect x={o.x} y={o.y} width={o.s} height={o.s} {...props} />;
+  };
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="100%" style={{ display: "block", background: "#ffffff" }} xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Aperçu de la page">
+      <defs>
+        {page.ops.map((o, i) => (o.t === "photo" ? <clipPath key={i} id={`${idp}-c${i}`}>{shapeEl(o, {})}</clipPath> : null))}
+      </defs>
+      {page.ops.map((o, i) => {
+        if (o.t === "rect") return <rect key={i} x={o.x} y={o.y} width={o.w} height={o.h} rx={o.r || 0} fill={o.fill} />;
+        if (o.t === "circle") return <circle key={i} cx={o.cx} cy={o.cy} r={o.r} fill={o.fill} />;
+        if (o.t === "line") return <line key={i} x1={o.x1} y1={o.y1} x2={o.x2} y2={o.y2} stroke={o.color} strokeWidth={o.w} />;
+        if (o.t === "text") {
+          return (
+            <text key={i} x={o.x} y={o.y} fontFamily={FONT_CSS[o.font]} fontSize={o.size * PT} fontWeight={o.bold ? 700 : 400} fontStyle={o.italic ? "italic" : "normal"} fill={o.color} textAnchor={o.anchor} letterSpacing={o.cs || undefined} style={{ whiteSpace: "pre" }}>
+              {o.s}
+            </text>
+          );
+        }
+        if (o.t === "icon") {
+          return (
+            <g key={i} transform={`translate(${o.x} ${o.y}) scale(${o.s / 24})`} fill="none" stroke={o.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              {(DOC_ICONS[o.name] || []).map((d, k) => <path key={k} d={d} />)}
+            </g>
+          );
+        }
+        if (o.t === "photo") {
+          return (
+            <g key={i}>
+              {photo?.src ? <image href={photo.src} x={o.x} y={o.y} width={o.s} height={o.s} preserveAspectRatio="xMidYMid slice" clipPath={`url(#${idp}-c${i})`} /> : shapeEl(o, { fill: "#e7e5e4" })}
+              {o.border > 0 && shapeEl(o, { fill: "none", stroke: o.borderColor, strokeWidth: o.border })}
+            </g>
+          );
+        }
+        return null;
+      })}
+      {interactive && page.hits.filter((h) => h.kind === "section").map((h, i) => (
+        <rect key={`s${i}`} x={h.x - 1.2} y={h.y - 0.8} width={h.w + 2.4} height={h.h + 1.6} rx={1.5} fill="transparent" stroke={hover === h.src.key ? accent : "transparent"} strokeDasharray="1.2 1" strokeWidth={0.35} onMouseEnter={() => onHover?.(h.src.key)} />
+      ))}
+      {interactive && page.hits.filter((h) => h.kind === "block").map((h, i) => {
+        const on = sel && (h.src.photo ? sel.photo : sel.l0 === h.src.l0);
+        return (
+          <rect key={`b${i}`} x={h.x} y={h.y} width={h.w} height={h.h} rx={0.8} fill={on ? "rgba(79,70,229,0.08)" : "transparent"} stroke={on ? accent : "transparent"} strokeWidth={0.35} style={{ cursor: "text" }}
+            onClick={(e) => { e.stopPropagation(); onPick?.(h); }}
+            onMouseEnter={(e) => { if (!on) e.currentTarget.setAttribute("stroke", "rgba(79,70,229,0.45)"); }}
+            onMouseLeave={(e) => { if (!on) e.currentTarget.setAttribute("stroke", "transparent"); }} />
+        );
+      })}
+    </svg>
+  );
+}
+
+/* Vignette d'un document (première page), sans interaction. */
+function DocThumb({ text, kind, design, photo, lang, width = 160, className = "" }) {
+  const lay = useMemo(() => (text ? layoutDocument(docModel(text, kind), design, { photo, lang }) : null), [text, kind, design, photo, lang]);
+  if (!lay) return null;
+  return (
+    <div className={`rounded-xl overflow-hidden ${className}`} style={{ width, height: (width * lay.H) / lay.W, boxShadow: "0 8px 24px -14px rgba(0,0,0,.35)", border: "1px solid #e7e5e4" }}>
+      <PageSvg page={lay.pages[0]} W={lay.W} H={lay.H} photo={photo} idp={`th-${kind}-${lang}-${width}`} />
+    </div>
+  );
+}
+
+/* Schéma d'un gabarit (aperçu instantané, sans calcul de mise en page). */
+function TemplateThumb({ tpl, accent, active, onClick }) {
+  const T = useT();
+  const d = mergeDesign(DESIGN_BASE, tpl.d);
+  const a = accent || d.colors.accent;
+  const two = Number(d.columns) === 2;
+  const sw = two ? 34 * (d.sideWidth / 100) : 0;
+  const sx = d.side === "right" ? 34 - sw : 0;
+  const mx = two && d.side !== "right" ? sw + 2 : 3;
+  const mw = two ? 34 - sw - 5 : 28;
+  const sideFill = two ? (luminance(d.colors.side) < 0.35 ? a : d.colors.side) : null;
+  return (
+    <button type="button" onClick={onClick} aria-pressed={active} className={`rounded-2xl p-2 text-left transition-colors duration-150 ${active ? T.accentSoft : T.subHover} ${T.ring}`}>
+      <svg viewBox="0 0 34 48" className="w-full" style={{ background: "#fff", borderRadius: 6, border: active ? `1.5px solid ${a}` : "1px solid #e7e5e4" }} aria-hidden="true">
+        {d.header === "band" && <rect x="0" y="0" width="34" height="9" fill={a} />}
+        {two && <rect x={sx} y={d.header === "side" || d.sideFull ? 0 : 10} width={sw} height={d.header === "side" || d.sideFull ? 48 : 36} fill={sideFill} rx={d.sideFull ? 0 : 1} />}
+        {d.photo.show && <circle cx={d.header === "center" ? 17 : d.header === "side" ? sx + sw / 2 : 6} cy={d.header === "side" ? 6 : 5} r="2.6" fill={d.header === "band" ? "#fff" : "#d6d3d1"} />}
+        <rect x={d.header === "center" ? 9 : d.header === "side" ? sx + 2 : d.photo.show ? 10 : 3} y={d.header === "side" ? 10 : 3} width={d.header === "side" ? sw - 4 : 16} height="2" rx="0.6" fill={d.header === "band" ? "#fff" : a} />
+        {[0, 1, 2, 3].map((i) => <rect key={i} x={mx} y={14 + i * 8} width={mw} height="1.4" rx="0.5" fill={a} opacity={0.9} />)}
+        {[0, 1, 2, 3].map((i) => <rect key={`l${i}`} x={mx} y={17 + i * 8} width={mw * 0.85} height="0.9" rx="0.4" fill="#c7c7c7" />)}
+        {two && [0, 1, 2].map((i) => <rect key={`s${i}`} x={sx + 2} y={20 + i * 7} width={sw - 4} height="0.9" rx="0.4" fill={luminance(d.colors.side) < 0.35 ? "#fff" : "#bdbdbd"} />)}
+      </svg>
+      <div className="text-xs font-medium mt-1.5">{tpl.label}</div>
+      <div className={`text-xs leading-snug ${T.faint}`}>{tpl.hint}</div>
+    </button>
+  );
+}
+
+/* Petits contrôles du panneau Design. */
+function Slider({ label, value, min, max, step = 1, unit = "", onChange }) {
+  const T = useT();
+  return (
+    <label className="block">
+      <span className="flex items-center justify-between text-xs mb-1"><span className={T.muted}>{label}</span><span className="tabular-nums">{String(Math.round(value * 100) / 100).replace(".", ",")}{unit}</span></span>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full" aria-label={label} />
+    </label>
+  );
+}
+function Seg({ label, value, options, onChange }) {
+  const T = useT();
+  return (
+    <div>
+      {label && <div className={`text-xs mb-1 ${T.muted}`}>{label}</div>}
+      <div role="radiogroup" aria-label={label} className={`flex flex-wrap gap-1 p-1 rounded-xl ${T.sub}`}>
+        {options.map(([v, l]) => (
+          <button key={String(v)} type="button" role="radio" aria-checked={value === v} onClick={() => onChange(v)} className={`flex-1 min-w-0 px-2 h-7 rounded-lg text-xs truncate transition-colors duration-150 ${value === v ? `${T.navActive} font-medium` : T.muted} ${T.ring}`} style={value === v ? T.shadow : undefined}>{l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+const SWATCHES = ["#1f3a5f", "#1e293b", "#2563eb", "#0f766e", "#047857", "#7c2d12", "#9f1239", "#6d28d9", "#c2410c", "#111827", "#ffffff", "#f1f5f9"];
+function ColorField({ label, value, onChange, swatches = SWATCHES }) {
+  const T = useT();
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <span className={`text-xs ${T.muted}`}>{label}</span>
+        <input type="color" value={cleanHex(value)} onChange={(e) => onChange(e.target.value)} aria-label={label} style={{ width: 34, height: 24, border: "none", background: "transparent", cursor: "pointer" }} />
+      </div>
+      <div className="flex flex-wrap gap-1 mt-1">
+        {swatches.map((c) => (
+          <button key={c} type="button" onClick={() => onChange(c)} aria-label={`${label} ${c}`} className={`w-5 h-5 rounded-full ${T.ring}`} style={{ background: c, border: cleanHex(value) === c ? "2px solid #4f46e5" : "1px solid #d6d3d1" }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+function Fold({ title, children, open: open0 = false }) {
+  const T = useT();
+  const [open, setOpen] = useState(open0);
+  return (
+    <section className={`border-b ${T.line}`}>
+      <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} className={`w-full flex items-center justify-between py-3 text-sm font-medium ${T.ring} rounded-lg`}>
+        {title}<ChevronRight className={`w-4 h-4 transition-transform duration-150 ${open ? "rotate-90" : ""} ${T.faint}`} aria-hidden="true" />
+      </button>
+      {open && <div className="pb-4 space-y-4">{children}</div>}
+    </section>
+  );
+}
+
+/* ── Photo : import, recadrage, rotation (locale, jamais envoyée à l'IA) ── */
+function PhotoEditor({ open, onClose }) {
+  const T = useT();
+  const { media, setMedia, toast } = useApp();
+  const [orig, setOrig] = useState(null);
+  const [crop, setCrop] = useState({ zoom: 1, x: 0, y: 0, rot: 0 });
+  const [shape, setShape] = useState("circle");
+  const cv = useRef(null);
+  const img = useRef(null);
+  const drag = useRef(null);
+  const file = useRef(null);
+  const V = 260;
+  useEffect(() => {
+    if (!open) return;
+    setOrig(media.photo?.original || null);
+    setCrop(media.photo?.crop || { zoom: 1, x: 0, y: 0, rot: 0 });
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    let off = false;
+    if (!orig) { img.current = null; return undefined; }
+    loadImg(orig).then((i) => { if (!off) { img.current = i; draw(); } }).catch(() => toast("Image illisible", "danger"));
+    return () => { off = true; };
+  }, [orig]); // eslint-disable-line react-hooks/exhaustive-deps
+  const draw = () => { const c = cv.current; if (c && img.current) drawCrop(c.getContext("2d"), img.current, V * 2, crop); };
+  useEffect(draw, [crop]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onFile = (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    if (!/^image\//.test(f.type)) { toast("Choisissez une image (JPEG, PNG…)", "warn"); return; }
+    const r = new FileReader();
+    r.onload = async () => { try { setOrig(await downscaleImage(String(r.result))); setCrop({ zoom: 1, x: 0, y: 0, rot: 0 }); } catch (err) { toast(err.message, "danger"); } };
+    r.readAsDataURL(f);
+  };
+  const save = async () => {
+    if (!orig) return;
+    const src = await cropPhoto(orig, crop);
+    setMedia((m) => ({ ...m, photo: { src, original: orig, crop, updatedAt: nowISO() } }));
+    toast("Photo enregistrée (stockée localement, jamais envoyée à l'IA)", "ok");
+    onClose(shape);
+  };
+  const clip = { circle: "circle(50% at 50% 50%)", rounded: "inset(0 round 18%)", square: "none", hexagon: "polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%)" }[shape];
+  return (
+    <Modal open={open} onClose={() => onClose()} title="Photo de profil" footer={<><Btn variant="ghost" onClick={() => onClose()}>Annuler</Btn><Btn variant="primary" icon={Check} disabled={!orig} onClick={save}>Valider le recadrage</Btn></>}>
+      <div className="space-y-4">
+        <div className="flex flex-col items-center gap-3">
+          <div
+            className="relative rounded-2xl overflow-hidden"
+            style={{ width: V, height: V, background: T.dark ? "#292524" : "#f5f5f4", cursor: orig ? "grab" : "default", touchAction: "none" }}
+            onPointerDown={(e) => { if (!orig) return; e.currentTarget.setPointerCapture(e.pointerId); drag.current = { x: e.clientX, y: e.clientY, c: crop }; }}
+            onPointerMove={(e) => { const d = drag.current; if (!d) return; setCrop({ ...d.c, x: clamp(d.c.x + (e.clientX - d.x) / V, -1, 1), y: clamp(d.c.y + (e.clientY - d.y) / V, -1, 1) }); }}
+            onPointerUp={() => { drag.current = null; }}
+            onWheel={(e) => { if (orig) setCrop((c) => ({ ...c, zoom: clamp(c.zoom * (e.deltaY < 0 ? 1.06 : 0.94), 1, 4) })); }}
+          >
+            {orig ? (
+              <>
+                <canvas ref={cv} width={V * 2} height={V * 2} style={{ width: V, height: V, opacity: 0.35, position: "absolute", inset: 0 }} aria-hidden="true" />
+                <canvas width={V * 2} height={V * 2} style={{ width: V, height: V, position: "absolute", inset: 0, clipPath: clip }} ref={(el) => { if (el && img.current) drawCrop(el.getContext("2d"), img.current, V * 2, crop); }} aria-label="Aperçu du recadrage" />
+              </>
+            ) : (
+              <button type="button" onClick={() => file.current?.click()} className={`absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm ${T.muted} ${T.ring}`}>
+                <Upload className="w-6 h-6" aria-hidden="true" />Importer une photo
+              </button>
+            )}
+          </div>
+          <input ref={file} type="file" accept="image/*" className="hidden" onChange={onFile} aria-label="Fichier photo" />
+          <p className={`text-xs text-center ${T.faint}`}>Glissez pour cadrer, molette ou curseur pour zoomer. La forme finale se règle aussi dans le panneau Design.</p>
+        </div>
+        {orig && (
+          <>
+            <Slider label="Zoom" value={crop.zoom} min={1} max={4} step={0.01} unit="×" onChange={(zoom) => setCrop({ ...crop, zoom })} />
+            <div className="flex flex-wrap gap-2">
+              <Btn size="sm" icon={RotateCw} onClick={() => setCrop({ ...crop, rot: (crop.rot + 90) % 360 })}>Pivoter</Btn>
+              <Btn size="sm" variant="ghost" onClick={() => setCrop({ zoom: 1, x: 0, y: 0, rot: 0 })}>Recentrer</Btn>
+              <Btn size="sm" variant="ghost" icon={Upload} onClick={() => file.current?.click()}>Autre photo</Btn>
+            </div>
+            <Seg label="Aperçu de forme" value={shape} onChange={setShape} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Panneau Design ── */
+function DesignPanel({ design, setDesign, accentSuggested, onPhoto, hasPhoto, kind }) {
+  const T = useT();
+  const { settings, setSettings, toast, setMedia } = useApp();
+  const D = design;
+  const set = (patch) => setDesign({ ...D, ...patch });
+  const setC = (k, v) => setDesign({ ...D, colors: { ...D.colors, [k]: v } });
+  const setM = (k, v) => setDesign({ ...D, margin: D.linkMargins ? { t: v, r: v, b: v, l: v } : { ...D.margin, [k]: v } });
+  const setP = (k, v) => setDesign({ ...D, photo: { ...D.photo, [k]: v } });
+  const [keepAccent, setKeepAccent] = useState(true);
+  return (
+    <div>
+      <Fold title="Modèles" open>
+        <label className={`flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={keepAccent} onChange={(e) => setKeepAccent(e.target.checked)} />Garder ma couleur d'accent</label>
+        <div className="grid grid-cols-2 gap-2">
+          {TEMPLATES.map((t) => (
+            <TemplateThumb key={t.id} tpl={t} accent={keepAccent ? D.colors.accent : null} active={D.template === t.id}
+              onClick={() => setDesign(designFromTemplate(t.id, { layout: D.layout, accent: keepAccent ? D.colors.accent : null, page: D.page }))} />
+          ))}
+        </div>
+      </Fold>
+      <Fold title="Couleurs" open>
+        {accentSuggested && cleanHex(accentSuggested) !== cleanHex(D.colors.accent) && (
+          <button type="button" onClick={() => setDesign({ ...D, colors: { ...D.colors, accent: accentSuggested, ...(D.colors.band === D.colors.accent ? { band: accentSuggested } : {}) } })} className={`w-full flex items-center gap-2 rounded-xl px-3 py-2 text-xs ${T.sub} ${T.ring}`}>
+            <span className="w-4 h-4 rounded-full" style={{ background: accentSuggested }} />Appliquer la couleur de l'entreprise (suggestion IA)
+          </button>
+        )}
+        <ColorField label="Accent (titres, puces)" value={D.colors.accent} onChange={(v) => setC("accent", v)} />
+        <ColorField label="Texte" value={D.colors.text} onChange={(v) => setC("text", v)} swatches={["#111827", "#262626", "#374151", "#1f2937", "#0f172a"]} />
+        <ColorField label="Texte secondaire" value={D.colors.muted} onChange={(v) => setC("muted", v)} swatches={["#6b6b6b", "#6b7280", "#64748b", "#78716c", "#57534e"]} />
+        <ColorField label="Filets" value={D.colors.rule} onChange={(v) => setC("rule", v)} swatches={["#d4d4d4", "#e5e7eb", "#94a3b8", D.colors.accent]} />
+        {Number(D.columns) === 2 && <>
+          <ColorField label="Fond de colonne" value={D.colors.side} onChange={(v) => setC("side", v)} swatches={["#ffffff", "#f1f5f9", "#f5f5f4", "#f0fdfa", "#eff6ff", "#134e4a", "#1e293b", "#1f3a5f", D.colors.accent]} />
+          <ColorField label="Texte de colonne" value={D.colors.sideText} onChange={(v) => setC("sideText", v)} swatches={["#262626", "#ffffff", "#f0fdfa", "#e2e8f0"]} />
+        </>}
+        {D.header === "band" && <>
+          <ColorField label="Bandeau" value={D.colors.band} onChange={(v) => setC("band", v)} />
+          <ColorField label="Texte du bandeau" value={D.colors.bandText} onChange={(v) => setC("bandText", v)} swatches={["#ffffff", "#f8fafc", "#111827"]} />
+        </>}
+      </Fold>
+      <Fold title="Typographie">
+        <Seg label="Police des titres" value={D.headingFont} onChange={(v) => set({ headingFont: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
+        <Seg label="Police du texte" value={D.font} onChange={(v) => set({ font: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
+        <Slider label="Taille du texte" value={D.size} min={8.5} max={12} step={0.25} unit=" pt" onChange={(size) => set({ size })} />
+        <Slider label="Interligne" value={D.lineHeight} min={1.05} max={1.8} step={0.05} onChange={(lineHeight) => set({ lineHeight })} />
+        <Slider label="Taille du nom" value={D.nameSize} min={1.5} max={3.4} step={0.05} unit="×" onChange={(nameSize) => set({ nameSize })} />
+        <Slider label="Taille des titres" value={D.headingSize} min={0.85} max={1.6} step={0.01} unit="×" onChange={(headingSize) => set({ headingSize })} />
+        <Seg label="Casse des titres" value={D.headingCase} onChange={(v) => set({ headingCase: v })} options={[["upper", "MAJUSCULES"], ["normal", "Normale"]]} />
+        {D.headingCase === "upper" && <Slider label="Espacement des lettres (titres)" value={D.headingSpacing} min={0} max={2.5} step={0.1} unit=" pt" onChange={(headingSpacing) => set({ headingSpacing })} />}
+      </Fold>
+      <Fold title="Mise en page">
+        <Seg label="Format" value={D.page} onChange={(v) => set({ page: v })} options={[["a4", "A4"], ["letter", "US Letter"]]} />
+        {kind === "cv" && <Seg label="Colonnes" value={Number(D.columns)} onChange={(v) => set({ columns: v })} options={[[1, "Une"], [2, "Deux"]]} />}
+        {kind === "cv" && Number(D.columns) === 2 && <>
+          <Seg label="Colonne secondaire" value={D.side} onChange={(v) => set({ side: v })} options={[["left", "À gauche"], ["right", "À droite"]]} />
+          <Slider label="Largeur de la colonne" value={D.sideWidth} min={22} max={42} step={1} unit=" %" onChange={(sideWidth) => set({ sideWidth })} />
+          <Slider label="Écart entre colonnes" value={D.colGap} min={3} max={14} step={0.5} unit=" mm" onChange={(colGap) => set({ colGap })} />
+          <Toggle checked={!!D.sideFull} onChange={(v) => set({ sideFull: v })} label="Fond de colonne bord à bord" description="Le fond va jusqu'au bord de la feuille." />
+        </>}
+        <Seg label="En-tête" value={D.header} onChange={(v) => set({ header: v })} options={[["left", "Gauche"], ["center", "Centré"], ["band", "Bandeau"], ...(kind === "cv" && Number(D.columns) === 2 ? [["side", "Colonne"]] : [])]} />
+        <Toggle checked={!!D.linkMargins} onChange={(v) => setDesign({ ...D, linkMargins: v, margin: v ? { t: D.margin.l, r: D.margin.l, b: D.margin.l, l: D.margin.l } : D.margin })} label="Marges identiques" />
+        <div className="grid grid-cols-2 gap-3">
+          {(D.linkMargins ? [["l", "Marges"]] : [["t", "Haut"], ["b", "Bas"], ["l", "Gauche"], ["r", "Droite"]]).map(([k, l]) => (
+            <Slider key={k} label={l} value={D.margin[k]} min={0} max={30} step={0.5} unit=" mm" onChange={(v) => setM(k, v)} />
+          ))}
+        </div>
+        <Slider label="Espace entre sections" value={D.sectionGap} min={1} max={12} step={0.25} unit=" mm" onChange={(sectionGap) => set({ sectionGap })} />
+        <Slider label="Espace entre éléments" value={D.itemGap} min={0} max={6} step={0.1} unit=" mm" onChange={(itemGap) => set({ itemGap })} />
+        <Slider label="Espace entre paragraphes" value={D.paraGap} min={0} max={6} step={0.1} unit=" mm" onChange={(paraGap) => set({ paraGap })} />
+      </Fold>
+      <Fold title="Éléments">
+        <Seg label="Style des titres" value={D.headingStyle} onChange={(v) => set({ headingStyle: v })} options={[["line", "Trait"], ["bar", "Barre"], ["pill", "Pastille"], ["double", "Double"], ["plain", "Simple"]]} />
+        <Slider label="Épaisseur des traits" value={D.rule} min={0} max={2} step={0.05} unit=" mm" onChange={(rule) => set({ rule })} />
+        <Seg label="Puces" value={D.bullet} onChange={(v) => set({ bullet: v })} options={[["dot", "●"], ["square", "■"], ["dash", "–"], ["arrow", "›"], ["none", "Aucune"]]} />
+        <Toggle checked={!!D.icons} onChange={(v) => set({ icons: v })} label="Icônes des coordonnées" />
+        {kind === "cv" && <Toggle checked={!!D.sectionIcons} onChange={(v) => set({ sectionIcons: v })} label="Icônes des sections" />}
+        {kind === "cv" && <Toggle checked={!!D.datesRight} onChange={(v) => set({ datesRight: v })} label="Dates alignées à droite" />}
+        {kind === "cv" && <Toggle checked={!!D.skillsAsTags} onChange={(v) => set({ skillsAsTags: v })} label="Compétences en étiquettes" />}
+        {kind === "letter" && <Toggle checked={!!D.justify} onChange={(v) => set({ justify: v })} label="Paragraphes justifiés" />}
+      </Fold>
+      <Fold title="Photo">
+        <Toggle checked={!!D.photo.show} onChange={(v) => setP("show", v)} label="Afficher la photo" description={hasPhoto ? "Courant en Belgique ; déconseillé pour l'anglais." : "Aucune photo importée."} />
+        <div className="flex flex-wrap gap-2">
+          <Btn size="sm" icon={hasPhoto ? Crop : Upload} onClick={onPhoto}>{hasPhoto ? "Recadrer / changer" : "Importer une photo"}</Btn>
+          {hasPhoto && <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => { setMedia((m) => ({ ...m, photo: null })); toast("Photo supprimée", "ok"); }}>Supprimer</Btn>}
+        </div>
+        <Seg label="Forme" value={D.photo.shape} onChange={(v) => setP("shape", v)} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
+        <Slider label="Taille" value={D.photo.size} min={16} max={48} step={0.5} unit=" mm" onChange={(v) => setP("size", v)} />
+        <Slider label="Bordure" value={D.photo.border} min={0} max={3} step={0.1} unit=" mm" onChange={(v) => setP("border", v)} />
+        {D.photo.border > 0 && <ColorField label="Couleur de bordure" value={D.photo.borderColor} onChange={(v) => setP("borderColor", v)} swatches={["#ffffff", "#e7e5e4", D.colors.accent, "#111827"]} />}
+      </Fold>
+      <div className="flex flex-wrap gap-2 pt-4">
+        <Btn size="sm" icon={Star} onClick={() => { const { layout, ...rest } = D; setSettings((s) => ({ ...s, designDefault: rest })); toast("Style enregistré par défaut pour les prochains dossiers", "ok"); }}>Style par défaut</Btn>
+        <Btn size="sm" variant="ghost" icon={RotateCcw} onClick={() => setDesign(designFromTemplate(D.template, { layout: D.layout, accent: D.colors.accent, page: D.page }))}>Réinitialiser le modèle</Btn>
+      </div>
+      {settings.designDefault && <p className={`text-xs mt-2 ${T.faint}`}>Style par défaut : {TEMPLATE_BY_ID[settings.designDefault.template]?.label || "personnalisé"}.</p>}
+    </div>
+  );
+}
+
+/* ── Panneau Structure : ordre, colonne, visibilité des sections ── */
+function StructurePanel({ model, design, setDesign, onAddSection, onDeleteSection, lang }) {
+  const T = useT();
+  const two = Number(design.columns) === 2;
+  const arr = arrangeSections(model.sections, design.layout, two);
+  const [dragKey, setDragKey] = useState(null);
+  const [overCol, setOverCol] = useState(null);
+  const L = design.layout || {};
+  const sideList = Array.isArray(L.side) ? L.side : model.sections.filter((s) => arr.isSide(s.key)).map((s) => s.key);
+  const setLayout = (patch) => setDesign({ ...design, layout: { ...L, order: arr.order, side: sideList, ...patch } });
+  const colOf = (k) => (two && sideList.includes(k) ? "side" : "main");
+  const moveTo = (key, target, beforeKey) => {
+    const order = arr.order.filter((k) => k !== key);
+    const i = beforeKey ? order.indexOf(beforeKey) : -1;
+    order.splice(i >= 0 ? i : order.length, 0, key);
+    const side = target === "side" ? [...new Set([...sideList, key])] : sideList.filter((k) => k !== key);
+    setLayout({ order, side });
+  };
+  const step = (key, dir) => {
+    const col = colOf(key);
+    const same = arr.order.filter((k) => colOf(k) === col);
+    const i = same.indexOf(key), j = i + dir;
+    if (j < 0 || j >= same.length) return;
+    const order = [...arr.order];
+    const a = order.indexOf(same[i]), b = order.indexOf(same[j]);
+    [order[a], order[b]] = [order[b], order[a]];
+    setLayout({ order });
+  };
+  const toggleHide = (key) => setLayout({ hidden: arr.hidden.has(key) ? [...arr.hidden].filter((k) => k !== key) : [...arr.hidden, key] });
+  const missing = Object.keys(SECTION_TITLES.fr).filter((k) => !model.sections.some((s) => baseKey(s.key) === k));
+  const cols = two ? [["main", "Colonne principale"], ["side", "Colonne secondaire"]] : [["main", "Sections"]];
+  return (
+    <div className="space-y-5">
+      <p className={`text-xs ${T.muted}`}>Glissez les sections pour les réordonner{two ? " ou les changer de colonne" : ""}. Survolez une section dans l'aperçu pour la déplacer sur place.</p>
+      {cols.map(([col, label]) => {
+        const keys = arr.order.filter((k) => colOf(k) === col);
+        return (
+          <div key={col}
+            onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
+            onDragLeave={() => setOverCol((c) => (c === col ? null : c))}
+            onDrop={(e) => { e.preventDefault(); setOverCol(null); if (dragKey) moveTo(dragKey, col, null); setDragKey(null); }}
+            className={`rounded-2xl p-2 transition-colors duration-150 ${overCol === col ? T.accentSoft : T.sub}`}>
+            <div className={`px-2 pb-2 text-xs font-semibold uppercase tracking-wider ${T.faint}`}>{label}</div>
+            <ul className="space-y-1">
+              {keys.map((k) => {
+                const sec = model.sections.find((s) => s.key === k);
+                const hidden = arr.hidden.has(k);
+                return (
+                  <li key={k} draggable
+                    onDragStart={(e) => { setDragKey(k); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", k); }}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => { e.preventDefault(); e.stopPropagation(); setOverCol(null); if (dragKey && dragKey !== k) moveTo(dragKey, col, k); setDragKey(null); }}
+                    className={`flex items-center gap-1 rounded-xl pl-1 pr-1 py-1 ${T.surface} ${hidden ? "opacity-50" : ""}`} style={T.shadow}>
+                    <GripVertical className={`w-4 h-4 shrink-0 cursor-grab ${T.faint}`} aria-hidden="true" />
+                    <span className="flex-1 min-w-0 text-sm truncate">{sectionLabel(sec)}</span>
+                    <IconBtn icon={ArrowUp} label="Monter" onClick={() => step(k, -1)} small />
+                    <IconBtn icon={ArrowDown} label="Descendre" onClick={() => step(k, 1)} small />
+                    {two && <IconBtn icon={ArrowLeftRight} label={col === "side" ? "Vers la colonne principale" : "Vers la colonne secondaire"} onClick={() => moveTo(k, col === "side" ? "main" : "side", null)} small />}
+                    <IconBtn icon={hidden ? EyeOff : Eye} label={hidden ? "Afficher" : "Masquer à l'export"} onClick={() => toggleHide(k)} small />
+                    {sec?.heading && <IconBtn icon={Trash2} label="Supprimer la section du texte" onClick={() => onDeleteSection(sec)} small />}
+                  </li>
+                );
+              })}
+              {!keys.length && <li className={`text-xs text-center py-4 ${T.faint}`}>Déposez une section ici</li>}
+            </ul>
+          </div>
+        );
+      })}
+      {missing.length > 0 && (
+        <div>
+          <div className={`text-xs mb-2 ${T.muted}`}>Ajouter une section</div>
+          <div className="flex flex-wrap gap-1.5">
+            {missing.map((k) => <Btn key={k} size="sm" variant="ghost" icon={Plus} onClick={() => onAddSection(k)}>{(SECTION_TITLES[lang] || SECTION_TITLES.fr)[k]}</Btn>)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Panneau Qualité : score local + mots-clés ── */
+function QualityPanel({ q, cov, kwInfo, tips, missingInProfile }) {
+  const T = useT();
+  const tone = q.score >= 85 ? "#059669" : q.score >= 65 ? "#d97706" : "#e11d48";
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center gap-4">
+        <svg width="64" height="64" viewBox="0 0 36 36" aria-label={`Score qualité ${q.score} sur 100`} role="img">
+          <circle cx="18" cy="18" r="15.5" fill="none" stroke={T.dark ? "#292524" : "#e7e5e4"} strokeWidth="3.5" />
+          <circle cx="18" cy="18" r="15.5" fill="none" stroke={tone} strokeWidth="3.5" strokeDasharray={`${(q.score / 100) * 97.4} 97.4`} strokeLinecap="round" transform="rotate(-90 18 18)" />
+          <text x="18" y="21.5" textAnchor="middle" fontSize="10" fontWeight="600" fill="currentColor">{q.score}</text>
+        </svg>
+        <div>
+          <div className="text-sm font-medium">Score qualité</div>
+          <div className={`text-xs ${T.muted}`}>{q.words} mots · calculé localement, sans IA. Visez 85 et plus.</div>
+        </div>
+      </div>
+      <ul className="space-y-2">
+        {q.checks.map((c) => (
+          <li key={c.id} className="flex gap-2 text-sm">
+            {c.tone === "info" ? <Info className={`w-4 h-4 mt-0.5 shrink-0 ${T.muted}`} aria-hidden="true" /> : c.ok ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" aria-label="Conforme" /> : <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${c.tone === "danger" ? "text-rose-500" : "text-amber-500"}`} aria-label="À améliorer" />}
+            <span className="min-w-0"><span className="block">{c.label}</span><span className={`block text-xs ${T.muted}`}>{c.detail}</span></span>
+          </li>
+        ))}
+      </ul>
+      {cov && cov.pct !== null && (
+        <div>
+          <SectionTitle>Mots-clés de l'annonce · {cov.pct} %</SectionTitle>
+          {kwInfo && <p className={`text-xs mb-2 ${T.muted}`}>{kwInfo}</p>}
+          <div className="flex flex-wrap gap-1.5">{cov.covered.map((k) => <Chip key={k} tone="ok">{k}</Chip>)}{cov.missing.map((k) => <Chip key={k} tone="warn">{k}</Chip>)}</div>
+          {cov.missing.length > 0 && <p className={`text-xs mt-2 ${T.faint}`}>En orange : absents. Ajoutez-les seulement si c'est vrai.</p>}
+        </div>
+      )}
+      {missingInProfile?.length > 0 && <Notice icon={HelpCircle}>Exigences non couvertes par votre profil : {missingInProfile.join(", ")}. À préparer pour l'entretien.</Notice>}
+      {tips?.length > 0 && (
+        <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
+          <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
+          <ul className="text-sm space-y-1">{tips.map((t, i) => <li key={i}>• {t}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Édition d'un bloc à l'emplacement cliqué. */
+const BLOCK_PREFIX = { name: "# ", h2: "## ", h3: "### ", bullet: "- ", quote: "> ", contact: "@ ", date: "= ", sign: "~ " };
+const BLOCK_LABEL = { name: "Nom", h2: "Titre de section", h3: "Poste | Organisation | Lieu | Période", bullet: "Puces (une par ligne)", quote: "Accroche / destinataire", contact: "Coordonnées (séparées par |)", date: "Lieu et date", sign: "Signature", kv: "**Libellé :** valeurs", para: "Paragraphe" };
+const splitLines = (t) => String(t || "").split("\n");
+function blockValue(text, b) {
+  const ls = splitLines(text).slice(b.l0, b.l1 + 1);
+  if (BLOCK_PREFIX[b.t]) return ls.map((l) => l.trim().replace(/^(#{1,3}|[-•*]|>|@|=|~)\s/, "")).join("\n");
+  return ls.join("\n");
+}
+function replaceLines(text, l0, l1, newLines) { const ls = splitLines(text); ls.splice(l0, l1 - l0 + 1, ...newLines); return ls.join("\n"); }
+function BlockEditor({ block, text, onChange, onClose, onMove, onDuplicate, onDelete, style }) {
+  const T = useT();
+  const ref = useRef(null);
+  const [val, setVal] = useState(() => blockValue(text, block));
+  useEffect(() => { const el = ref.current; if (el) { el.focus(); const n = el.value.length; try { el.setSelectionRange(n, n); } catch { /* ignore */ } } }, [block.l0]);
+  useEffect(() => { if (document.activeElement !== ref.current) setVal(blockValue(text, block)); }, [text, block.l0, block.l1]); // eslint-disable-line react-hooks/exhaustive-deps
+  const commit = (v) => {
+    setVal(v);
+    const pre = BLOCK_PREFIX[block.t];
+    const out = pre ? splitLines(v).map((l) => (l.trim() ? pre + l.trim() : "")).filter((l, i, a) => l || i < a.length - 1) : splitLines(v);
+    onChange(out.length ? out : [""]);
+  };
+  return (
+    <div className="absolute rounded-2xl p-3 space-y-2" style={{ ...T.glass, ...T.shadow, zIndex: 5, ...style }} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Modifier le bloc">
+      <div className="flex items-center justify-between gap-2">
+        <span className={`text-xs ${T.muted}`}>{BLOCK_LABEL[block.t] || "Bloc"}</span>
+        <span className="flex gap-0.5">
+          <IconBtn icon={ArrowUp} label="Monter le bloc" onClick={() => onMove(-1)} small />
+          <IconBtn icon={ArrowDown} label="Descendre le bloc" onClick={() => onMove(1)} small />
+          <IconBtn icon={Copy} label="Dupliquer" onClick={onDuplicate} small />
+          <IconBtn icon={Trash2} label="Supprimer le bloc" onClick={onDelete} small />
+          <IconBtn icon={X} label="Fermer (Échap)" onClick={onClose} small />
+        </span>
+      </div>
+      <textarea ref={ref} value={val} onChange={(e) => commit(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } }}
+        rows={Math.min(8, Math.max(2, val.split("\n").length + 1))} className={`w-full rounded-xl px-3 py-2 text-sm leading-relaxed ${T.input} ${T.ring}`} aria-label={BLOCK_LABEL[block.t] || "Texte du bloc"} />
+      {block.t === "bullet" && <p className={`text-xs ${T.faint}`}>Entrée = nouvelle puce. Commencez par un verbe d'action et un chiffre.</p>}
+    </div>
+  );
+}
+
+/* ── Studio plein écran ── */
+function Studio({ appId, initialKind = "cv", onClose }) {
+  const T = useT();
+  const { apps, offers, settings, media, saveDocVersion, translateDoc, generateDocs, setAppDesign, busy, toast, openExport } = useApp();
+  const app = apps.find((a) => a.id === appId);
+  const offer = offers.find((o) => o.id === app?.offerId);
+  const ref = useRef(null);
+  const center = useRef(null);
+  const taRef = useRef(null);
+  const [kind, setKind] = useState(initialKind);
+  const firstLang = (k) => { const l = docLangs(app, offer, k); return l.includes(app?.docLanguage) ? app.docLanguage : l[0] || offerLang(offer); };
+  const [lang, setLang] = useState(() => firstLang(initialKind));
+  const key = `${kind}:${lang}`;
+  const latest = latestDoc(app, offer, kind, lang);
+  const [drafts, setDrafts] = useState({});
+  const text = drafts[key] ?? latest?.text ?? "";
+  const cvLatest = latestDoc(app, offer, "cv", lang) || (app?.docs?.cv || []).slice(-1)[0];
+  const [design, setDesignState] = useState(() => resolveDesign(app, settings, cvLatest?.accent));
+  const [sel, setSel] = useState(null);
+  const [hover, setHover] = useState(null);
+  const [left, setLeft] = useState("content");
+  const [mobile, setMobile] = useState("preview");
+  const [zoom, setZoom] = useState("fit");
+  const [fit, setFit] = useState(0.7);
+  const [photoOpen, setPhotoOpen] = useState(false);
+  const [instr, setInstr] = useState("");
+  const [trOpen, setTrOpen] = useState(false);
+  const hist = useRef({ past: [], future: [], at: 0 });
+  // Échap : ferme d'abord l'éditeur de bloc ou le menu, puis le Studio (le piège de focus garde la première fonction reçue).
+  const escRef = useRef(null);
+  escRef.current = () => { if (trOpen) setTrOpen(false); else if (sel) setSel(null); else tryClose(); };
+  useFocusTrap(true, ref, () => escRef.current());
+
+  /* Historique (annuler / rétablir) : texte et design. Les frappes rapprochées sont regroupées. */
+  const snapshot = () => ({ drafts, design });
+  const remember = (coalesce) => {
+    const h = hist.current;
+    const now = Date.now();
+    if (!(coalesce && now - h.at < 900)) { h.past.push(snapshot()); if (h.past.length > 80) h.past.shift(); h.future = []; }
+    h.at = now;
+  };
+  const setText = (v, coalesce = true) => { remember(coalesce); setDrafts((d) => ({ ...d, [key]: v })); };
+  const setDesign = (d) => { remember(false); setDesignState(d); };
+  const undo = () => { const h = hist.current; const s = h.past.pop(); if (!s) return; h.future.push(snapshot()); setDrafts(s.drafts); setDesignState(s.design); h.at = 0; };
+  const redo = () => { const h = hist.current; const s = h.future.pop(); if (!s) return; h.past.push(snapshot()); setDrafts(s.drafts); setDesignState(s.design); h.at = 0; };
+
+  // Le design (commun au CV et à la lettre) est enregistré sur la candidature au fil de l'eau.
+  useEffect(() => { const t = setTimeout(() => setAppDesign(appId, design), 400); return () => clearTimeout(t); }, [design]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "s") { e.preventDefault(); save(); return; }
+      if (/^(INPUT|TEXTAREA)$/.test(e.target?.tagName)) return;
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); redo(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  useEffect(() => {
+    const el = center.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(([e]) => setFit(clamp((e.contentRect.width - 48) / (PAGE_SIZES[design.page]?.[0] || 210) / PX_MM, 0.35, 1.6)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [design.page]);
+
+  const deferred = useDeferredValue(text);
+  const model = useMemo(() => docModel(deferred, kind), [deferred, kind]);
+  const layout = useMemo(() => layoutDocument(model, design, { photo: media.photo, lang }), [model, design, media.photo, lang]);
+  const k = zoom === "fit" ? fit : zoom;
+  const kw = latest?.keywords || cvLatest?.keywords || [];
+  const kwLang = offer?.language || app?.docLanguage;
+  const q = useMemo(() => docQuality(deferred, { kind, lang, keywords: kind === "cv" ? kw : [], kwLang, design }), [deferred, kind, lang, design]); // eslint-disable-line react-hooks/exhaustive-deps
+  const cov = kind === "cv" && kw.length ? keywordCoverage(deferred, kw) : null;
+  const dirtyKeys = Object.keys(drafts).filter((dk) => { const [kk, ll] = dk.split(":"); return drafts[dk] !== (latestDoc(app, offer, kk, ll)?.text ?? ""); });
+  const dirty = dirtyKeys.includes(key);
+  const langs = docLangs(app, offer, kind);
+  const allLangs = [...new Set([...langs, ...dirtyKeys.filter((dk) => dk.startsWith(`${kind}:`)).map((dk) => dk.split(":")[1])])];
+
+  function save() {
+    if (!dirty || !text.trim()) return;
+    saveDocVersion(appId, kind, text, undefined, { lang, format: "markup" });
+    toast(`${kind === "cv" ? "CV" : "Lettre"} ${LANG_FLAG[lang]} enregistré(e) — nouvelle version`, "ok");
+  }
+  function saveAll() {
+    const todo = dirtyKeys.filter((dk) => drafts[dk]?.trim());
+    todo.forEach((dk) => { const [kk, ll] = dk.split(":"); saveDocVersion(appId, kk, drafts[dk], undefined, { lang: ll, format: "markup" }); });
+    if (todo.length) toast(`${todo.length} document(s) modifié(s) enregistré(s) en nouvelle version`, "ok");
+  }
+  function tryClose() { saveAll(); onClose(); }
+  const switchTo = (nk, nl) => { setSel(null); setKind(nk); setLang(nl ?? (docLangs(app, offer, nk).includes(lang) ? lang : firstLang(nk))); };
+  const translate = async (to) => {
+    setTrOpen(false);
+    if (dirty) save();
+    const from = langs.includes(app?.docLanguage) ? app.docLanguage : langs[0] || lang;
+    const v = await translateDoc(appId, kind, from, to);
+    if (v) { setLang(to); toast(`Traduction ${LANG_FLAG[from]} → ${LANG_FLAG[to]} prête : relisez-la avant l'envoi`, "ok"); }
+  };
+  const regenerate = async () => {
+    if (dirty) save();
+    setDrafts((d) => { const n = { ...d }; delete n[key]; return n; });
+    await generateDocs(appId, [kind], instr, lang);
+    setInstr("");
+  };
+
+  /* Clic dans l'aperçu : sélection du bloc (ou de la photo), synchronisation de la zone de texte. */
+  const pick = (h) => {
+    if (h.src.photo) { setSel({ photo: true }); setPhotoOpen(true); return; }
+    const b = model.blocks.find((x) => x.l0 === h.src.l0) || h.src;
+    setSel({ ...b, page: layout.pages.findIndex((pg) => pg.hits.includes(h)), hit: h });
+    const ta = taRef.current;
+    if (ta) {
+      const ls = splitLines(text);
+      const start = ls.slice(0, b.l0).reduce((n, l) => n + l.length + 1, 0);
+      const end = start + ls.slice(b.l0, b.l1 + 1).join("\n").length;
+      try { ta.setSelectionRange(start, end); ta.scrollTop = Math.max(0, b.l0 * 19 - 60); } catch { /* zone non visible */ }
+    }
+  };
+  const editBlock = (newLines) => {
+    if (!sel || sel.photo) return;
+    setText(replaceLines(text, sel.l0, sel.l1, newLines));
+    setSel((s) => s && { ...s, l1: s.l0 + newLines.length - 1 });
+  };
+  const blockAt = (l0) => model.blocks.find((x) => x.l0 === l0);
+  const moveBlock = (dir) => {
+    const bs = model.blocks;
+    const i = bs.findIndex((x) => x.l0 === sel.l0);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= bs.length) return;
+    const [a, b] = dir < 0 ? [bs[j], bs[i]] : [bs[i], bs[j]];
+    const ls = splitLines(text);
+    const A = ls.slice(a.l0, a.l1 + 1), B = ls.slice(b.l0, b.l1 + 1), mid = ls.slice(a.l1 + 1, b.l0);
+    const out = [...ls.slice(0, a.l0), ...B, ...mid, ...A, ...ls.slice(b.l1 + 1)];
+    setText(out.join("\n"), false);
+    const nl0 = dir < 0 ? a.l0 : a.l0 + B.length + mid.length;
+    setSel((s) => ({ ...s, l0: nl0, l1: nl0 + (s.l1 - s.l0), hit: null }));
+  };
+  const duplicateBlock = () => {
+    const ls = splitLines(text);
+    const chunk = ls.slice(sel.l0, sel.l1 + 1);
+    ls.splice(sel.l1 + 1, 0, ...(sel.t === "para" ? ["", ...chunk] : chunk));
+    setText(ls.join("\n"), false);
+  };
+  const deleteBlock = () => { setText(replaceLines(text, sel.l0, sel.l1, []), false); setSel(null); toast("Bloc supprimé — Ctrl+Z pour annuler", "neutral"); };
+  const addSection = (k2) => {
+    const title = (SECTION_TITLES[lang] || SECTION_TITLES.fr)[k2];
+    setText(`${text.replace(/\s+$/, "")}\n\n## ${title}\n${k2 === "skills" || k2 === "languages" ? "**Groupe :** élément, élément" : "- "}`, false);
+  };
+  const deleteSection = (sec) => {
+    const next = model.sections.map((s) => s.heading?.l0).filter((x) => x > sec.heading.l0).sort((a, b) => a - b)[0];
+    const ls = splitLines(text);
+    ls.splice(sec.heading.l0, (next ?? ls.length) - sec.heading.l0);
+    setText(ls.join("\n"), false);
+    setSel(null);
+    toast(`Section « ${sec.title} » supprimée — Ctrl+Z pour annuler`, "neutral");
+  };
+  const sectionMove = (key2, dir) => {
+    const two = Number(design.columns) === 2;
+    const arr = arrangeSections(model.sections, design.layout, two);
+    const sideList = Array.isArray(design.layout?.side) ? design.layout.side : model.sections.filter((s) => arr.isSide(s.key)).map((s) => s.key);
+    const col = (k3) => (two && sideList.includes(k3) ? "side" : "main");
+    if (dir === "swap") {
+      setDesign({ ...design, layout: { ...design.layout, order: arr.order, side: col(key2) === "side" ? sideList.filter((x) => x !== key2) : [...sideList, key2] } });
+      return;
+    }
+    if (dir === "hide") { setDesign({ ...design, layout: { ...design.layout, order: arr.order, side: sideList, hidden: [...arr.hidden, key2] } }); setHover(null); return; }
+    const same = arr.order.filter((k3) => col(k3) === col(key2) && !arr.hidden.has(k3));
+    const i = same.indexOf(key2), j = i + dir;
+    if (j < 0 || j >= same.length) return;
+    const order = [...arr.order];
+    const a = order.indexOf(same[i]), b = order.indexOf(same[j]);
+    [order[a], order[b]] = [order[b], order[a]];
+    setDesign({ ...design, layout: { ...design.layout, order, side: sideList } });
+  };
+  const generating = busy[`dossier:${appId}`];
+  const translating = DOC_LANGS.find((l) => busy[`tr:${appId}:${kind}:${l}`]);
+  const accent = "#4f46e5";
+  const selHit = sel && !sel.photo && (() => {
+    for (let p = 0; p < layout.pages.length; p++) { const h = layout.pages[p].hits.find((x) => x.kind === "block" && x.src.l0 === sel.l0); if (h) return { p, h }; }
+    return null;
+  })();
+
+  if (!app) return null;
+  const leftPanel = (
+    <div className="flex flex-col min-h-0 h-full">
+      <div className="px-4 pt-4 pb-3"><Tabs value={left} onChange={setLeft} tabs={[{ id: "content", label: "Contenu" }, ...(kind === "cv" ? [{ id: "structure", label: "Structure" }] : []), { id: "quality", label: "Qualité", count: q.score }]} /></div>
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-6">
+        {left === "content" && (
+          <div className="space-y-3">
+            {!latest && !text ? (
+              <Empty icon={FileText} title={`${kind === "cv" ? "CV" : "Lettre"} ${LANG_FLAG[lang]} pas encore généré(e)`} text="L'IA rédige à partir de votre profil et de l'annonce, sans rien inventer." action={<Btn variant="primary" icon={Sparkles} loading={generating} onClick={regenerate}>Générer</Btn>} />
+            ) : (
+              <>
+                <textarea ref={taRef} value={text} onChange={(e) => setText(e.target.value)} spellCheck lang={DOCX_LANG[lang]} rows={24} aria-label="Texte du document (balisage léger)"
+                  className={`w-full rounded-xl px-3 py-2.5 ${T.input} ${T.ring}`} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: "19px", minHeight: 320 }} />
+                <p className={`text-xs ${T.faint}`}># nom · &gt; accroche ou destinataire · @ coordonnées (séparées par |) · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
+              </>
+            )}
+            <div className={`pt-3 border-t ${T.line} space-y-2`}>
+              <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Consigne : plus court, accent sur l'automatisation…" aria-label="Consigne de régénération" />
+              <Btn size="sm" icon={RefreshCw} loading={generating} onClick={regenerate}>{latest ? "Régénérer" : "Générer"} en {LANG_FLAG[lang]}</Btn>
+            </div>
+          </div>
+        )}
+        {left === "structure" && <StructurePanel model={model} design={design} setDesign={setDesign} onAddSection={addSection} onDeleteSection={deleteSection} lang={lang} />}
+        {left === "quality" && <QualityPanel q={q} cov={cov} kwInfo={kwLang && kwLang !== lang ? `Annonce en ${LANG_NAME[kwLang] || kwLang} : analyse pertinente surtout sur la version ${LANG_FLAG[kwLang] || ""}.` : null} tips={latest?.tips || cvLatest?.tips} missingInProfile={kind === "cv" ? latest?.missingInProfile : null} />}
+      </div>
+    </div>
+  );
+  const pageW = layout.W * PX_MM * k, pageH = layout.H * PX_MM * k;
+  const preview = (
+    <div ref={center} className="h-full overflow-auto" style={{ background: T.dark ? "#1c1917" : "#e7e5e4" }} onClick={() => setSel(null)}>
+      <div className="flex flex-col items-center gap-6 py-6 px-6" onMouseLeave={() => setHover(null)}>
+        {layout.pages.map((pg, i) => {
+          const secHit = hover && pg.hits.find((h) => h.kind === "section" && h.src.key === hover);
+          return (
+            <div key={i} className="relative shrink-0" style={{ width: pageW, height: pageH, boxShadow: "0 18px 40px -24px rgba(0,0,0,.45)" }}>
+              <PageSvg page={pg} W={layout.W} H={layout.H} photo={media.photo} idp={`st-${i}`} interactive sel={sel} hover={hover} onPick={pick} onHover={setHover} accent={accent} />
+              {secHit && kind === "cv" && (
+                <div className="absolute flex gap-0.5 rounded-xl p-0.5" style={{ left: Math.min(pageW - 150, (secHit.x + secHit.w) * PX_MM * k - 150), top: Math.max(0, secHit.y * PX_MM * k - 30), ...T.glass, ...T.shadow }} onClick={(e) => e.stopPropagation()}>
+                  <IconBtn icon={ArrowUp} label="Monter la section" onClick={() => sectionMove(hover, -1)} small />
+                  <IconBtn icon={ArrowDown} label="Descendre la section" onClick={() => sectionMove(hover, 1)} small />
+                  {Number(design.columns) === 2 && <IconBtn icon={ArrowLeftRight} label="Changer de colonne" onClick={() => sectionMove(hover, "swap")} small />}
+                  <IconBtn icon={EyeOff} label="Masquer la section" onClick={() => sectionMove(hover, "hide")} small />
+                </div>
+              )}
+              {selHit?.p === i && (
+                <BlockEditor key={sel.l0} block={blockAt(sel.l0) || sel} text={text} onChange={editBlock} onClose={() => setSel(null)} onMove={moveBlock} onDuplicate={duplicateBlock} onDelete={deleteBlock}
+                  style={{ left: clamp(selHit.h.x * PX_MM * k, 8, Math.max(8, pageW - 340)), top: (selHit.h.y + selHit.h.h) * PX_MM * k + 8, width: Math.min(340, pageW - 16) }} />
+              )}
+              <span className={`absolute -bottom-5 right-0 text-xs ${T.faint}`}>{i + 1} / {layout.pages.length}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+  return (
+    <div ref={ref} className={`fixed inset-0 flex flex-col ${T.app}`} style={{ zIndex: 45 }} role="dialog" aria-modal="true" aria-label="Studio CV et lettre">
+      <div className={`flex flex-wrap items-center gap-2 px-3 sm:px-4 py-2 border-b ${T.line}`} style={T.glass}>
+        <IconBtn icon={X} label="Fermer le Studio (les modifications sont enregistrées)" onClick={tryClose} />
+        <div className="min-w-0 mr-2">
+          <div className="text-sm font-medium truncate" style={{ maxWidth: 260 }}>{offer?.title || "Candidature"}</div>
+          <div className={`text-xs truncate ${T.muted}`} style={{ maxWidth: 260 }}>{show(offer?.company)}</div>
+        </div>
+        <Tabs value={kind} onChange={(v) => switchTo(v)} tabs={[{ id: "cv", label: "CV" }, { id: "letter", label: "Lettre" }]} />
+        <div className="flex items-center gap-1" role="group" aria-label="Langue du document">
+          {allLangs.map((l) => (
+            <button key={l} type="button" onClick={() => switchTo(kind, l)} aria-pressed={l === lang} className={`h-8 px-2.5 rounded-xl text-xs font-semibold ${l === lang ? T.accentSoft : T.btnGhost} ${T.ring}`}>
+              {LANG_FLAG[l]}{dirtyKeys.includes(`${kind}:${l}`) ? " •" : ""}
+            </button>
+          ))}
+          {!allLangs.includes(lang) && <span className={`h-8 px-2.5 inline-flex items-center rounded-xl text-xs font-semibold ${T.accentSoft}`}>{LANG_FLAG[lang]}</span>}
+          <div className="relative">
+            <Btn size="sm" variant="ghost" icon={Languages} loading={!!translating} disabled={!langs.length} onClick={() => setTrOpen(!trOpen)}>{translating ? `→ ${LANG_FLAG[translating]}` : "Traduire"}</Btn>
+            {trOpen && (
+              <div className="absolute mt-1 rounded-2xl p-1 w-56" style={{ ...T.glass, ...T.shadow, zIndex: 6 }}>
+                {DOC_LANGS.filter((l) => !langs.includes(l)).map((l) => (
+                  <button key={l} type="button" onClick={() => translate(l)} className={`w-full text-left px-3 h-9 rounded-xl text-sm ${T.subHover} ${T.ring}`}>Traduire en {LANG_NAME[l]}</button>
+                ))}
+                {DOC_LANGS.filter((l) => !langs.includes(l)).map((l) => (
+                  <button key={`g${l}`} type="button" onClick={() => { setTrOpen(false); switchTo(kind, l); }} className={`w-full text-left px-3 h-9 rounded-xl text-xs ${T.muted} ${T.subHover} ${T.ring}`}>Rédiger directement en {LANG_NAME[l]}</button>
+                ))}
+                {DOC_LANGS.every((l) => langs.includes(l)) && <div className={`px-3 py-2 text-xs ${T.faint}`}>Toutes les langues sont disponibles.</div>}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex-1" />
+        <div className="hidden sm:flex items-center gap-1">
+          <IconBtn icon={Undo2} label="Annuler (Ctrl+Z)" onClick={undo} disabled={!hist.current.past.length} />
+          <IconBtn icon={Redo2} label="Rétablir (Ctrl+Maj+Z)" onClick={redo} disabled={!hist.current.future.length} />
+          <IconBtn icon={ZoomOut} label="Zoom arrière" onClick={() => setZoom(clamp(k - 0.1, 0.35, 2))} />
+          <button type="button" onClick={() => setZoom("fit")} className={`h-9 px-2 rounded-xl text-xs tabular-nums ${T.btnGhost} ${T.ring}`} aria-label="Ajuster à la largeur">{Math.round(k * 100)} %</button>
+          <IconBtn icon={ZoomIn} label="Zoom avant" onClick={() => setZoom(clamp(k + 0.1, 0.35, 2))} />
+        </div>
+        <Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"} className="hidden sm:inline-flex">qualité {q.score}</Chip>
+        <Chip className="hidden md:inline-flex">{layout.pages.length} page(s)</Chip>
+        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={save}>Enregistrer</Btn>
+        <Btn icon={FileDown} onClick={() => { saveAll(); openExport(appId); }}>Exporter</Btn>
+      </div>
+      <div className="flex-1 min-h-0 flex">
+        <aside className={`${mobile === "content" ? "flex" : "hidden"} md:flex w-full md:w-80 shrink-0 border-r ${T.line} flex-col min-h-0`} aria-label="Contenu">{leftPanel}</aside>
+        <main className={`${mobile === "preview" ? "flex" : "hidden"} md:flex flex-1 min-w-0 flex-col min-h-0`}>{preview}</main>
+        <aside className={`${mobile === "design" ? "flex" : "hidden"} md:flex w-full md:w-80 shrink-0 border-l ${T.line} flex-col min-h-0`} aria-label="Design">
+          <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-8">
+            <DesignPanel design={design} setDesign={setDesign} accentSuggested={cvLatest?.accent} onPhoto={() => setPhotoOpen(true)} hasPhoto={!!media.photo?.src} kind={kind} />
+          </div>
+        </aside>
+      </div>
+      <div className={`md:hidden flex border-t ${T.line}`}>
+        {[["content", "Contenu", Pencil], ["preview", "Aperçu", Eye], ["design", "Design", Palette]].map(([id, l, I]) => (
+          <button key={id} type="button" onClick={() => setMobile(id)} className={`flex-1 h-12 flex flex-col items-center justify-center text-xs ${mobile === id ? T.accentText : T.muted} ${T.ring}`}><I className="w-4 h-4" aria-hidden="true" />{l}</button>
+        ))}
+      </div>
+      <PhotoEditor open={photoOpen} onClose={(shape) => { setPhotoOpen(false); setSel(null); if (shape) setDesign({ ...design, photo: { ...design.photo, show: true, shape } }); }} />
+    </div>
+  );
+}
+
+/* ── Export : documents × langues × formats, fichiers séparés ou fusionnés ── */
+function ExportModal({ appId, onClose }) {
+  const T = useT();
+  const { apps, offers, settings, media, profile, translateDoc, toast } = useApp();
+  const app = apps.find((a) => a.id === appId);
+  const offer = offers.find((o) => o.id === app?.offerId);
+  const avail = { cv: docLangs(app, offer, "cv"), letter: docLangs(app, offer, "letter") };
+  const known = [...new Set([...avail.cv, ...avail.letter])];
+  const [docs, setDocs] = useState({ cv: avail.cv.length > 0, letter: avail.letter.length > 0 });
+  const [langs, setLangs] = useState(() => (known.length ? known : [offerLang(offer)]));
+  const [format, setFormat] = useState("pdf");
+  const [group, setGroup] = useState("perLang");
+  const [order, setOrder] = useState("cvFirst");
+  const [wordMode, setWordMode] = useState("design");
+  const [run, setRun] = useState(null);
+  if (!app) return null;
+  const kinds = (order === "cvFirst" ? ["cv", "letter"] : ["letter", "cv"]).filter((k) => docs[k]);
+  const missing = kinds.flatMap((k) => langs.filter((l) => !avail[k].includes(l)).map((l) => ({ k, l })));
+  const noSource = missing.filter((m) => !avail[m.k].length);
+  const design = resolveDesign(app, settings, (app.docs?.cv || []).slice(-1)[0]?.accent);
+  const name = profile.name || "candidat";
+  const base = (k, ls) => `${k === "both" ? "Dossier" : k === "cv" ? "CV" : "Lettre"}_${slugFile(name)}_${slugFile(offer?.company || offer?.title)}_${ls.map((l) => LANG_FLAG[l]).join("-")}`;
+  const nFiles = (() => {
+    const per = group === "merged" ? 1 : group === "perLang" ? langs.length : langs.length * kinds.length;
+    return per * (format === "both" ? 2 : 1);
+  })();
+  const go = async () => {
+    try {
+      const texts = {};
+      for (const { k, l } of missing) {
+        if (!avail[k].length) continue;
+        setRun(`Traduction ${k === "cv" ? "du CV" : "de la lettre"} en ${LANG_NAME[l]}…`);
+        const from = avail[k].includes(app.docLanguage) ? app.docLanguage : avail[k][0];
+        const v = await translateDoc(appId, k, from, l);
+        if (!v) throw new Error(`Traduction ${LANG_FLAG[l]} impossible.`);
+        texts[`${k}:${l}`] = v.text;
+      }
+      setRun("Mise en page…");
+      const items = [];
+      for (const l of langs) for (const k of kinds) {
+        const t = texts[`${k}:${l}`] ?? latestDoc(app, offer, k, l)?.text;
+        if (t) items.push({ kind: k, lang: l, text: t, title: `${k === "cv" ? "CV" : "Lettre de motivation"} (${LANG_FLAG[l]})` });
+      }
+      if (!items.length) throw new Error("Aucun document à exporter.");
+      const groups = group === "merged" ? [items] : group === "perLang" ? langs.map((l) => items.filter((i) => i.lang === l)).filter((g) => g.length) : items.map((i) => [i]);
+      const kw = (app.docs?.cv || []).slice(-1)[0]?.keywords || [];
+      const files = [];
+      for (const g of groups) {
+        const ks = [...new Set(g.map((i) => i.kind))];
+        const fname = base(ks.length > 1 ? "both" : ks[0], [...new Set(g.map((i) => i.lang))]);
+        const meta = { title: [ks.length > 1 ? "Dossier de candidature" : g[0].title, name, offer?.title, offer?.company].filter(Boolean).join(" - "), author: profile.name, keywords: kw, subject: offer?.title };
+        if (format !== "docx") {
+          setRun(`PDF : ${fname}…`);
+          const pdf = await buildPdf(g.map((i) => ({ ...i, photo: media.photo, layout: layoutDocument(docModel(i.text, i.kind), design, { photo: media.photo, lang: i.lang }) })), meta);
+          files.push({ name: `${fname}.pdf`, data: new Uint8Array(pdf), mime: "application/pdf" });
+        }
+        if (format !== "pdf") {
+          setRun(`Word : ${fname}…`);
+          files.push({ name: `${fname}${wordMode === "ats" ? "_ATS" : ""}.docx`, data: buildDocx(g.map((i) => ({ ...i, design })), { photo: media.photo, mode: wordMode, ...meta }), mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+        }
+      }
+      setRun("Téléchargement…");
+      const out = files.length === 1 ? files[0] : { name: `${base(kinds.length > 1 ? "both" : kinds[0], langs)}.zip`, data: zipStore(files.map((f) => ({ name: f.name, data: f.data }))), mime: "application/zip" };
+      const buf = out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength);
+      const r = await saveFile(out.name, buf, out.mime);
+      if (r === "saved") { toast(files.length === 1 ? `${out.name} prêt` : `${files.length} fichiers regroupés dans ${out.name}`, "ok"); onClose(); }
+    } catch (e) {
+      toast(`Export impossible : ${e.message}`, "danger");
+    } finally { setRun(null); }
+  };
+  return (
+    <Modal open wide onClose={() => !run && onClose()} title="Exporter le dossier"
+      footer={<><Btn variant="ghost" onClick={onClose} disabled={!!run}>Annuler</Btn><Btn variant="primary" icon={FileDown} loading={!!run} disabled={!kinds.length || !langs.length || noSource.length === kinds.length * langs.length} onClick={go}>{missing.length - noSource.length ? `Traduire ${missing.length - noSource.length} et exporter` : `Exporter (${nFiles} fichier${nFiles > 1 ? "s" : ""})`}</Btn></>}>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="space-y-5">
+          <div>
+            <div className={`text-xs mb-2 ${T.muted}`}>Documents</div>
+            <div className="flex flex-wrap gap-2">
+              {[["cv", "CV"], ["letter", "Lettre de motivation"]].map(([k, l]) => (
+                <label key={k} className={`inline-flex items-center gap-2 rounded-xl px-3 h-9 text-sm ${T.sub}`}><input type="checkbox" checked={docs[k]} onChange={(e) => setDocs({ ...docs, [k]: e.target.checked })} />{l}<span className={`text-xs ${T.faint}`}>{avail[k].map((x) => LANG_FLAG[x]).join(" ") || "—"}</span></label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className={`text-xs mb-2 ${T.muted}`}>Langues</div>
+            <div className="flex flex-wrap gap-2">
+              {DOC_LANGS.map((l) => {
+                const on = langs.includes(l);
+                const todo = kinds.some((k) => !avail[k].includes(l));
+                return (
+                  <button key={l} type="button" aria-pressed={on} onClick={() => setLangs(on ? langs.filter((x) => x !== l) : DOC_LANGS.filter((x) => x === l || langs.includes(x)))} className={`h-9 px-3 rounded-xl text-sm ${on ? T.accentSoft : T.btnSoft} ${T.ring}`}>
+                    {LANG_NAME[l]}{on && todo ? " · à traduire" : ""}
+                  </button>
+                );
+              })}
+            </div>
+            {missing.length - noSource.length > 0 && <p className={`text-xs mt-2 ${T.muted}`}>{missing.length - noSource.length} traduction(s) seront générées puis enregistrées comme nouvelles versions (relisez-les ensuite dans le Studio).</p>}
+          </div>
+          <Seg label="Ordre" value={order} onChange={setOrder} options={[["cvFirst", "CV puis lettre"], ["letterFirst", "Lettre puis CV"]]} />
+        </div>
+        <div className="space-y-5">
+          <Seg label="Format" value={format} onChange={setFormat} options={[["pdf", "PDF"], ["docx", "Word"], ["both", "PDF + Word"]]} />
+          {format !== "pdf" && <Seg label="Word" value={wordMode} onChange={setWordMode} options={[["design", "Fidèle au design"], ["ats", "ATS 1 colonne"]]} />}
+          <Seg label="Regroupement" value={group} onChange={setGroup} options={[["perLang", "Un fichier par langue"], ["merged", "Tout en un"], ["separate", "Fichiers séparés"]]} />
+          <Notice icon={Info}>
+            {group === "merged" ? "Un seul fichier avec tous les documents, dans l'ordre choisi (signets PDF par document)." : group === "perLang" ? "Un fichier par langue réunissant CV et lettre : idéal pour un envoi bilingue." : "Un fichier par document et par langue."}
+            {nFiles > 1 ? ` ${nFiles} fichiers, livrés dans un ZIP.` : ""} PDF texte (lisible par les ATS), Word modifiable.
+          </Notice>
+          {run && <p className={`text-sm ${T.muted}`} aria-live="polite"><Loader2 className="inline w-4 h-4 mr-1 animate-spin" aria-hidden="true" />{run}</p>}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Comparateur d'offres (2 à 4) ── */
+function CompareModal({ ids, onClose }) {
+  const T = useT();
+  const { offers, settings, ratings } = useApp();
+  const list = ids.map((id) => offers.find((o) => o.id === id)).filter(Boolean);
+  if (!list.length) return null;
+  const crits = [...new Set(list.flatMap((o) => (o.score?.breakdown || []).map((b) => b.criterion)))];
+  const row = (label, f) => (
+    <tr key={label} className={`border-t ${T.line}`}>
+      <th scope="row" className={`text-left align-top py-2 pr-3 text-xs font-medium ${T.muted}`} style={{ minWidth: 120 }}>{label}</th>
+      {list.map((o) => <td key={o.id} className="align-top py-2 px-2 text-sm">{f(o)}</td>)}
+    </tr>
+  );
+  const facts = (o) => o.score?.facts || {};
+  return (
+    <Modal open wide onClose={onClose} title={`Comparer ${list.length} offres`}>
+      <div className="overflow-x-auto">
+        <table className="w-full" style={{ borderCollapse: "collapse" }}>
+          <thead><tr><th />{list.map((o) => <th key={o.id} className="text-left align-bottom px-2 pb-2" style={{ minWidth: 180 }}><div className="text-sm font-medium leading-snug">{o.title}</div><div className={`text-xs font-normal ${T.muted}`}>{show(o.company)}</div></th>)}</tr></thead>
+          <tbody>
+            {row("Score", (o) => <span className="inline-flex items-center gap-2"><ScorePill score={o.score} threshold={settings.threshold} />{offerVerdict(o, settings.threshold) && <Chip tone={offerVerdict(o, settings.threshold).tone}>{offerVerdict(o, settings.threshold).label}</Chip>}</span>)}
+            {row("En bref", (o) => o.score?.tldr || o.score?.summary || <span className={T.faint}>{NC}</span>)}
+            {row("Lieu · trajet", (o) => `${show(o.location)} · ${commuteLabel(o.commute)}`)}
+            {row("Contrat", (o) => show(facts(o).contract || o.contract))}
+            {row("Télétravail", (o) => (facts(o).remoteDays != null ? `${facts(o).remoteDays} j / semaine` : show(o.remote)))}
+            {row("Salaire", (o) => show(fmtSalary(facts(o), o.salary)))}
+            {row("Équipe", (o) => (facts(o).teamSize ? `${facts(o).teamSize} pers.${facts(o).reportsTo ? ` · ${facts(o).reportsTo}` : ""}` : show(facts(o).reportsTo)))}
+            {row("Langues", (o) => (facts(o).languages?.length ? facts(o).languages.map((l) => LANG_FLAG[l]).join(" · ") : show(o.language && LANG_FLAG[o.language])))}
+            {row("Note employeur", (o) => fmtRating(ratings[ratingKey(o.company)]) ? `★ ${fmtRating(ratings[ratingKey(o.company)])}` : <span className={T.faint}>{NC}</span>)}
+            {crits.map((c) => row(c, (o) => { const b = (o.score?.breakdown || []).find((x) => x.criterion === c); return b ? <div><MatchBar value={b.match} kind={b.kind} /><div className={`text-xs mt-1 ${T.muted}`}>{b.note || b.match}</div></div> : <span className={T.faint}>—</span>; }))}
+            {row("Points forts", (o) => <ul className="space-y-1">{(o.score?.strengths || []).slice(0, 4).map((x, i) => <li key={i}>+ {x}</li>)}</ul>)}
+            {row("Écarts", (o) => <ul className="space-y-1">{(o.score?.gaps || []).slice(0, 4).map((x, i) => <li key={i}>− {x}</li>)}</ul>)}
+            {row("Alertes", (o) => (o.score?.redFlags?.length ? <span className="text-rose-600">{o.score.redFlags.map((r) => r.evidence).join(" · ")}</span> : <span className={T.faint}>aucune</span>))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Onglet E-mails d'une candidature ── */
+function EmailsPanel({ app }) {
+  const T = useT();
+  const { checkReplies, busy, settings } = useApp();
+  const list = [...(app.emails || [])].sort((a, b) => new Date(b.date || b.at) - new Date(a.date || a.at));
+  const silent = silenceDays(app);
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={`text-xs ${T.faint}`}>Gmail vérifié {relTime(settings.lastReplyCheckAt)} · lecture seule</span>
+        <Btn size="sm" icon={MailCheck} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
+      </div>
+      {silent !== null && silent >= (settings.ghostDays || 21) && <Notice tone="warn" icon={Clock}>Sans nouvelles depuis {silent} jours. Relancez une dernière fois ou clôturez avec l'issue « Sans réponse ».</Notice>}
+      {!list.length ? <Empty icon={Mail} title="Aucun e-mail rattaché" text="Les réponses validées depuis la surveillance Gmail apparaissent ici, avec un lien vers le fil." /> : (
+        <ul className="space-y-2">
+          {list.map((m) => (
+            <li key={m.id} className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Chip tone={m.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(m.kind) ? "ok" : "neutral"}>{REPLY_KINDS[m.kind] || "E-mail"}</Chip>
+                <span className={`text-xs ${T.muted}`}>{m.date ? fmtDate(m.date) : NC} · {show(m.from)}</span>
+              </div>
+              <div className="text-sm mt-2">« {m.subject} »</div>
+              {m.summary && <div className={`text-sm mt-1 ${T.muted}`}>{m.summary}</div>}
+              {gmailLink(m) && <div className="mt-2"><ExtLink href={gmailLink(m)}>Ouvrir dans Gmail</ExtLink></div>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* ── Entraînement à l'entretien (évaluation de réponses écrites) ── */
+function PracticePanel({ app, offer }) {
+  const T = useT();
+  const { evaluatePractice, busy } = useApp();
+  const qs = (app.prep?.likelyQuestions || []).map((x) => x.question).filter(Boolean);
+  const [q, setQ] = useState(qs[0] || "");
+  const [a, setA] = useState("");
+  const loading = busy[`practice:${app.id}`];
+  const hist = [...(app.practice || [])].reverse();
+  const words = a.split(/\s+/).filter(Boolean).length;
+  return (
+    <section className="space-y-4">
+      <SectionTitle>Entraînement</SectionTitle>
+      <p className={`text-xs ${T.muted}`}>Répondez par écrit comme à l'oral. L'IA note la réponse, vérifie la structure STAR et propose une version améliorée sans inventer de faits.</p>
+      {qs.length > 0 && (
+        <Select value={qs.includes(q) ? q : ""} onChange={(e) => setQ(e.target.value)} className="w-full" aria-label="Question probable">
+          <option value="">Question personnalisée…</option>
+          {qs.map((x) => <option key={x} value={x}>{x}</option>)}
+        </Select>
+      )}
+      <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Question d'entretien" aria-label="Question" />
+      <Textarea rows={6} value={a} onChange={(e) => setA(e.target.value)} placeholder="Votre réponse…" aria-label="Votre réponse" />
+      <div className="flex flex-wrap items-center gap-3">
+        <Btn variant="primary" icon={Sparkles} loading={loading} disabled={!q.trim() || words < 15} onClick={async () => { if (await evaluatePractice(app.id, q.trim(), a.trim())) setA(""); }}>Évaluer ma réponse</Btn>
+        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots · ~{Math.round((words / 130) * 60)} s à l'oral</span>
+      </div>
+      {hist.map((p) => (
+        <div key={p.id} className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium flex-1 min-w-0">{p.question}</span>
+            <Chip tone={p.feedback.score >= 4 ? "ok" : p.feedback.score >= 3 ? "warn" : "danger"}>{p.feedback.score} / 5</Chip>
+          </div>
+          <div className="flex flex-wrap gap-1.5">{[["situation", "S"], ["task", "T"], ["action", "A"], ["result", "R"]].map(([k, l]) => <Chip key={k} tone={p.feedback.star?.[k] ? "ok" : "neutral"}>{l}{p.feedback.star?.[k] ? " ✓" : " —"}</Chip>)}<Chip>~{p.feedback.seconds} s</Chip></div>
+          {p.feedback.strengths.length > 0 && <ul className="text-sm space-y-0.5">{p.feedback.strengths.map((x, i) => <li key={i}>+ {x}</li>)}</ul>}
+          {p.feedback.improvements.length > 0 && <ul className={`text-sm space-y-0.5 ${T.muted}`}>{p.feedback.improvements.map((x, i) => <li key={i}>→ {x}</li>)}</ul>}
+          {p.feedback.improved && (
+            <details className="text-sm">
+              <summary className={`cursor-pointer text-xs ${T.accentText}`}>Version améliorée</summary>
+              <p className="mt-2 whitespace-pre-line">{p.feedback.improved}</p>
+              <CopyBtn text={p.feedback.improved} />
+            </details>
+          )}
+          <div className={`text-xs ${T.faint}`}>{fmtDate(p.at, { time: true })}</div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    14. ASSISTANT CANDIDATURE
    ════════════════════════════════════════════════════════════════════════ */
 
 function AssistantView() {
   const T = useT();
-  const { apps, offers, settings, openApp, addToPipeline, go } = useApp();
-  const inPrep = apps.filter((a) => ["new", "retained", "prep"].includes(a.stage));
+  const { apps, offers, settings, media, openApp, openStudio, openExport, addToPipeline, go } = useApp();
+  const active = apps.filter((a) => ["new", "retained", "prep", "sent", "followup", "interview"].includes(a.stage));
   const candidates = offers.filter((o) => o.status === "new" && o.score?.value >= settings.threshold).sort((a, b) => b.score.value - a.score.value).slice(0, 6);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
+  const def = settings.designDefault ? TEMPLATE_BY_ID[settings.designDefault.template]?.label || "personnalisé" : "Classique ATS";
   return (
     <div>
-      <PageHeader title="Assistant candidature" subtitle="L'IA prépare, vous validez. Aucun document n'est envoyé en votre nom." />
+      <PageHeader title="Assistant candidature" subtitle="L'IA rédige, vous mettez en forme dans le Studio et vous validez. Aucun document n'est envoyé en votre nom." />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="p-6 lg:col-span-2">
-          <SectionTitle>Candidatures à préparer</SectionTitle>
-          {inPrep.length === 0 ? (
+          <SectionTitle>Dossiers en cours</SectionTitle>
+          {active.length === 0 ? (
             <Empty icon={Sparkles} title="Rien en préparation" text="Retenez une offre pour générer son dossier." action={<Btn onClick={() => go("offers")}>Voir les offres</Btn>} />
           ) : (
             <ul className="space-y-2">
-              {inPrep.map((a) => {
+              {active.map((a) => {
                 const o = offerOf(a);
-                const n = Object.keys(a.docs || {}).length;
+                const cvL = docLangs(a, o, "cv"), lL = docLangs(a, o, "letter");
+                const lang = cvL.includes(a.docLanguage) ? a.docLanguage : cvL[0];
+                const cv = lang ? latestDoc(a, o, "cv", lang) : null;
+                const design = resolveDesign(a, settings, cv?.accent);
+                const q = cv ? docQuality(cv.text, { kind: "cv", lang, keywords: cv.keywords, kwLang: o?.language, design }) : null;
                 return (
-                  <li key={a.id} className={`flex flex-wrap items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
-                    <div className="flex-1 min-w-0">
+                  <li key={a.id} className={`flex flex-wrap items-center gap-4 rounded-2xl p-3 ${T.sub}`}>
+                    {cv ? <button type="button" onClick={() => openStudio(a.id, "cv")} className={`rounded-lg ${T.ring}`} aria-label="Ouvrir le CV dans le Studio"><DocThumb text={cv.text} kind="cv" design={design} photo={media.photo} lang={lang} width={56} /></button>
+                      : <span className={`rounded-lg flex items-center justify-center ${T.surface}`} style={{ width: 56, height: 79 }}><FileText className={`w-5 h-5 ${T.faint}`} aria-hidden="true" /></span>}
+                    <div className="flex-1 min-w-48">
                       <div className="text-sm font-medium">{o?.title}{a.demo && <Chip className="ml-2">exemple</Chip>}</div>
-                      <div className={`text-xs ${T.muted}`}>{show(o?.company)} · {STAGE_LABEL[a.stage]} · {n}/{DOC_TYPES.length} documents</div>
-                      <div className={`mt-2 h-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}><div className="h-full bg-indigo-600" style={{ width: `${(n / DOC_TYPES.length) * 100}%` }} /></div>
+                      <div className={`text-xs ${T.muted}`}>{show(o?.company)} · {STAGE_LABEL[a.stage]}</div>
+                      <div className="flex flex-wrap gap-1 mt-2">
+                        {cvL.length > 0 && <Chip>CV {cvL.map((l) => LANG_FLAG[l]).join(" ")}</Chip>}
+                        {lL.length > 0 && <Chip>Lettre {lL.map((l) => LANG_FLAG[l]).join(" ")}</Chip>}
+                        {q && <Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"}>qualité {q.score}</Chip>}
+                        {!cvL.length && !lL.length && <Chip tone="warn">dossier à générer</Chip>}
+                      </div>
                     </div>
-                    <Btn variant={n ? "soft" : "primary"} icon={Sparkles} onClick={() => openApp(a.id, "docs")}>{n ? "Ouvrir le dossier" : "Préparer"}</Btn>
+                    <div className="flex flex-wrap gap-2">
+                      {cvL.length || lL.length ? <>
+                        <Btn size="sm" variant="primary" icon={Palette} onClick={() => openStudio(a.id, cvL.length ? "cv" : "letter")}>Studio</Btn>
+                        <Btn size="sm" icon={FileDown} onClick={() => openExport(a.id)}>Exporter</Btn>
+                      </> : <Btn size="sm" variant="primary" icon={Sparkles} onClick={() => openApp(a.id, "docs")}>Préparer</Btn>}
+                      <Btn size="sm" variant="ghost" onClick={() => openApp(a.id, "docs")}>Dossier</Btn>
+                    </div>
                   </li>
                 );
               })}
@@ -4557,19 +6923,20 @@ function AssistantView() {
           )}
         </Card>
         <Card className="p-6">
-          <SectionTitle>Ce que l'assistant fait — et ne fait pas</SectionTitle>
+          <SectionTitle>Studio & export</SectionTitle>
           <ul className="space-y-3 text-sm">
             {[
-              [true, "CV adapté, lettre, message LinkedIn, réponses au formulaire, e-mail — dans la langue de l'annonce"],
-              [true, "Brouillon Gmail (jamais envoyé) et rappels Google Calendar, après confirmation"],
-              [true, "Versions éditables et régénérables, alerte si l'employeur actuel est cité"],
-              [false, "Soumettre un formulaire sur le site de l'employeur ou d'un job board"],
-              [false, "Envoyer un e-mail ou un message LinkedIn à votre place"],
-              [false, "Inventer des réalisations ou des chiffres : les manques sont marqués [à compléter]"],
+              [true, "7 modèles réglables en direct : polices, tailles, marges, bord à bord, couleurs, traits, puces, colonnes"],
+              [true, "Photo recadrée (cercle, arrondi, carré, hexagone), icônes, sections déplaçables entre colonnes"],
+              [true, "Clic sur un bloc de l'aperçu pour l'éditer sur place ; annuler / rétablir"],
+              [true, "Traduction FR / NL / EN / DE ; export PDF ou Word, séparé ou fusionné"],
+              [true, "Score qualité local et correspondance aux mots-clés de l'annonce"],
+              [false, "Envoyer, soumettre un formulaire ou inventer un chiffre : jamais"],
             ].map(([ok, t]) => (
               <li key={t} className="flex gap-2">{ok ? <Check className={`w-4 h-4 mt-0.5 shrink-0 ${T.accentText}`} aria-label="Oui" /> : <X className="w-4 h-4 mt-0.5 shrink-0 text-rose-500" aria-label="Non" />}<span>{t}</span></li>
             ))}
           </ul>
+          <p className={`text-xs mt-4 ${T.faint}`}>Style par défaut des nouveaux dossiers : {def}. Il se change depuis le Studio (« Style par défaut »).</p>
         </Card>
         <Card className="p-6 lg:col-span-3">
           <SectionTitle>Offres au-dessus du seuil, pas encore retenues</SectionTitle>
@@ -5172,7 +7539,9 @@ function CriteriaHistory() {
 
 function PrivacyView() {
   const T = useT();
-  const { settings, setSettings, exportPayload, importPayload, resetAll, clearDemo, loadDemo, hasDemo, toast, offers, apps, contacts } = useApp();
+  const { settings, setSettings, exportPayload, importPayload, resetAll, clearDemo, loadDemo, hasDemo, toast, offers, apps, contacts, compactOffers, media } = useApp();
+  const [usage, setUsage] = useState(() => ({ ...USAGE }));
+  useEffect(() => { usageListeners.add(setUsage); return () => usageListeners.delete(setUsage); }, []);
   const [showJson, setShowJson] = useState(false);
   const [paste, setPaste] = useState("");
   const [resetOpen, setResetOpen] = useState(false);
@@ -5226,8 +7595,14 @@ function PrivacyView() {
   const testApi = async () => {
     setTest({ state: "loading" });
     try {
-      const r = await callClaude(settings, { system: "Réponds uniquement {\"ok\":true}.", prompt: "Test de connexion.", maxTokens: 50 });
-      setTest({ state: "ok", text: `API joignable · modèle ${r.model}` });
+      const tiers = ["deep", "balanced", "fast"];
+      const res = [];
+      for (const tier of tiers) {
+        const r = await callClaude(settings, { system: "Réponds uniquement {\"ok\":true}.", prompt: "Test de connexion.", maxTokens: 400, tier, effort: "low" });
+        res.push(`${TIER_LABEL[tier]} : ${r.model}`);
+        if (RT.mode === "published") break;
+      }
+      setTest({ state: "ok", text: `API joignable · ${res.join(" · ")}` });
     } catch (e) {
       setTest({ state: "error", text: e.message });
     }
@@ -5251,6 +7626,7 @@ function PrivacyView() {
               <li>• Vers la recherche web : des requêtes génériques (intitulés, zones) — jamais votre nom.</li>
               <li>• Vers Gmail : lecture des alertes emploi (à l'import) et création de brouillons (sur confirmation).</li>
               <li>• Vers Google Calendar : les événements que vous confirmez.</li>
+              <li>• Votre photo reste dans cet espace : elle n'est jamais envoyée à l'IA, seulement intégrée aux PDF et Word que vous exportez.</li>
               <li>• Rien n'est jamais envoyé à un recruteur ni publié.</li>
             </ul>
           </div>
@@ -5266,6 +7642,16 @@ function PrivacyView() {
             <Field label="Fraîcheur des annonces (jours)"><Input type="number" min={3} max={90} value={settings.lookbackDays} onChange={(e) => set("lookbackDays", clamp(Number(e.target.value) || 30, 3, 90))} /></Field>
             <Field label="Offres max par source"><Input type="number" min={3} max={20} value={settings.maxPerSource} onChange={(e) => set("maxPerSource", clamp(Number(e.target.value) || 10, 3, 20))} /></Field>
           </div>
+          <SectionTitle className="mt-6">Surveillance du pipeline</SectionTitle>
+          <Toggle checked={settings.autoReplies} onChange={(v) => set("autoReplies", v)} label="Vérifier Gmail à l'ouverture" description="Réponses, accusés ATS, invitations, refus et candidatures non suivies. Lecture seule, tout est soumis à validation." />
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <Field label="Intervalle minimum">
+              <Select value={settings.autoRepliesHours} onChange={(e) => set("autoRepliesHours", Number(e.target.value))} className="w-full">
+                {[6, 12, 24, 48].map((h) => <option key={h} value={h}>{h} h</option>)}
+              </Select>
+            </Field>
+            <Field label="Silence avant alerte (jours)"><Input type="number" min={7} max={60} value={settings.ghostDays} onChange={(e) => set("ghostDays", clamp(Number(e.target.value) || 21, 7, 60))} /></Field>
+          </div>
         </Card>
 
         <Card className="p-6">
@@ -5277,9 +7663,21 @@ function PrivacyView() {
           )}
           {test && test.state !== "loading" && <Notice tone={test.state === "ok" ? "ok" : "danger"} className="mb-4">{test.text}</Notice>}
           <div className="grid grid-cols-2 gap-3">
-            <Field label="Modèle"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
-            <Field label="Modèle de repli"><Input value={settings.fallbackModel} onChange={(e) => set("fallbackModel", e.target.value.trim())} /></Field>
+            <Field label="Profond (scoring, CV, web)"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
+            <Field label="Repli du profond"><Input value={settings.fallbackModel} onChange={(e) => set("fallbackModel", e.target.value.trim())} /></Field>
+            <Field label="Équilibré (traduction, Gmail)"><Input value={settings.modelBalanced} onChange={(e) => set("modelBalanced", e.target.value.trim())} /></Field>
+            <Field label="Rapide (tri, synonymes)"><Input value={settings.modelFast} onChange={(e) => set("modelFast", e.target.value.trim())} /></Field>
           </div>
+          <Toggle checked={settings.routing !== false} onChange={(v) => set("routing", v)} label="Routage par tâche" description="Chaque tâche va au modèle le moins cher qui la réussit. Désactivé : tout passe par le modèle profond." />
+          <Toggle checked={settings.promptCache !== false} onChange={(v) => set("promptCache", v)} label="Cache de prompt" description="Profil et critères relus en cache entre les lots de scoring (environ 5 % du prix)." />
+          <Toggle checked={settings.effortTuning !== false} onChange={(v) => set("effortTuning", v)} label="Effort adapté" description="Raisonnement court sur les tâches simples : plus rapide, moins de tokens." />
+          {usage.calls > 0 && (
+            <div className={`rounded-2xl p-4 text-xs mt-2 space-y-1 ${T.sub}`}>
+              <div className="font-medium text-sm">Consommation de la session</div>
+              <div>{usage.calls} appel(s) · {Math.round((usage.input + usage.cacheRead + usage.cacheWrite) / 1000)} k tokens en entrée (dont {Math.round((usage.cacheRead / Math.max(1, usage.input + usage.cacheRead + usage.cacheWrite)) * 100)} % lus en cache) · {Math.round(usage.output / 1000)} k en sortie</div>
+              <div className={T.muted}>{Object.entries(usage.byTier).map(([t, u]) => `${TIER_LABEL[t] || t} : ${u.calls} appel(s)`).join(" · ")}</div>
+            </div>
+          )}
           <Field label="URL MCP Gmail" className="mt-3"><Input value={settings.mcp.gmail} onChange={(e) => set("mcp", { ...settings.mcp, gmail: e.target.value.trim() })} /></Field>
           <Field label="URL MCP Google Calendar" className="mt-3"><Input value={settings.mcp.gcal} onChange={(e) => set("mcp", { ...settings.mcp, gcal: e.target.value.trim() })} /></Field>
           <Field label="Format de connexion MCP" className="mt-3" hint="« Auto » essaie le format des artefacts claude.ai puis le format API récent.">
@@ -5320,6 +7718,10 @@ function PrivacyView() {
           <Btn className="mt-2" size="sm" disabled={!paste.trim()} onClick={() => doImport(paste)}>Importer le JSON collé</Btn>
 
           <div className={`mt-6 pt-6 border-t ${T.line} flex flex-wrap gap-2`}>
+            <Btn variant="ghost" icon={Archive} onClick={() => compactOffers(90)}>Alléger les offres écartées (+ 90 j)</Btn>
+            {media.photo && <span className={`self-center text-xs ${T.faint}`}>Photo : ~{Math.round((media.photo.src.length + (media.photo.original || "").length) / 1370)} Ko</span>}
+          </div>
+          <div className={`mt-3 flex flex-wrap gap-2`}>
             {hasDemo ? <Btn icon={Trash2} onClick={clearDemo}>Supprimer les données d'exemple</Btn> : <Btn variant="ghost" onClick={loadDemo}>Recharger les exemples</Btn>}
             <Btn variant="danger" icon={RotateCcw} onClick={() => setResetOpen(true)}>Réinitialiser</Btn>
           </div>
