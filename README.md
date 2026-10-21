@@ -105,7 +105,13 @@ radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, r
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
 radar:briefs    { <entreprise-normalisée>: { company, summary, facts[{id,text,url,verified,source}], origin, createdAt, expiresAt } }
+radar:media     { photo: { src (JPEG recadré), original, crop{zoom,x,y,rot}, updatedAt } | null }   jamais envoyé à l'IA
+radar:inbox     { replies[{appId,threadId,date,from,subject,kind,summary,action,interviewAt,verified}], untracked[{company,title,threadId,…}] }   e-mails détectés à valider
 app.motivation? { factIds[], whyCompany, whyRole, personalLink, convictionId, storyId, employerNamed }
+app.design?     { template, page, font, headingFont, size, lineHeight, margin{t,r,b,l}, colors{…}, columns, side, sideWidth, header, headingStyle, rule, bullet, icons, photo{show,shape,size,border}, layout{side[],hidden[]} }
+app.emails?     [{ date, from, subject, kind, summary, threadId }] · app.practice? [{ question, answer, feedback{score,star,strengths,improvements,improved} }]
+version de document : language (fr|nl|en|de), translatedFrom?, origin « traduction »
+offer.score     + tldr, facts{contract,remoteDays,salaryMin,salaryMax,salaryPeriod,languages[],teamSize,reportsTo,seniority}, must[], nice[], missions[], reweightedAt?
 ```
 
 Les champs inconnus valent `null` et s'affichent « non communiqué ».
@@ -187,6 +193,33 @@ L'IA évalue **chaque critère** de la version active (identifiants M1, W1, X1, 
 - **Routine réécrite** : qualité avant quantité, filtre de pertinence avant dépôt, chaque candidate est ouverte (WebFetch) ou recherchée pour confirmer qu'elle est ouverte ; les annonces clôturées ne sont plus déposées.
 - **Vérification des offres suivies** : la page entretient `veille/verify_queue` (40 offres actives au plus) ; à chaque passage la Routine les vérifie et écrit `veille_verify/verify-*`. Les annonces clôturées passent en « Expirées ». Vérification à la demande depuis la sélection ou la fiche.
 - Limite : l'environnement de la Routine est en accès réseau « de confiance » ; WebFetch y est refusé pour les sites d'emploi et la vérification se replie sur la recherche web. Ajouter les domaines d'emploi aux domaines autorisés de l'environnement rend la vérification directe.
+
+## Version 4 — studio de design, multilingue, surveillance Gmail, offres claires
+
+Audit, benchmark (Enhancv, Rezi, Jobscan, Resume.io, Zety, Kickresume, Final Round AI) et arbitrage : [`docs/AUDIT-v3.md`](docs/AUDIT-v3.md).
+
+**Studio**
+- **Design en temps réel** : 7 modèles (Classique ATS, Moderne, Exécutif, Minimal, Compact, Créatif, Élégant), polices, tailles, interligne, marges par côté, bord à bord, espacements, couleurs (accent, texte, filets, fond de colonne, bandeau), style et épaisseur des traits, puces, icônes des coordonnées et des sections, dates à droite, compétences en étiquettes. Style enregistrable par défaut.
+- **Aperçu = PDF = Word** : un seul moteur calcule les positions en millimètres ; l'aperçu SVG, le PDF vectoriel (texte sélectionnable, signets) et le Word natif (styles Titre lus par les ATS) en découlent.
+- **Photo** : import, recadrage, zoom, rotation, formes cercle, arrondi, carré, hexagone, bordure. Stockée dans vos données privées, jamais envoyée à l'IA.
+- **Sections et colonnes** : glisser-déposer entre colonne principale et secondaire, ordre, masquage à l'export.
+- **Langues** : FR, NL, EN, DE. Une version par langue ; « Traduire en … » crée une version traduite (balisage, faits et chiffres conservés, formules belges).
+- **Exporter le dossier** : CV et/ou lettre, plusieurs langues, PDF, Word (fidèle ou ATS) ou les deux ; un fichier par langue, tout en un, ou séparés ; ZIP si plusieurs fichiers.
+
+**Pipeline et e-mails**
+- Vérification Gmail **incrémentale** (depuis la dernière fenêtre), automatique à l'ouverture toutes les 12 h (réglable), lecture seule, toujours validée.
+- Détecte les accusés des logiciels de recrutement (Workday, SmartRecruiters, Greenhouse, Lever, Teamtailor…) et de LinkedIn ou Indeed, les invitations, tests, refus, offres, et les **candidatures envoyées hors de Radar** (ajout au pipeline en un clic).
+- Onglet « E-mails » dans la fiche (lien vers le fil), signaux sur les cartes (dernier e-mail, « sans nouvelles · N j »), issue « Sans réponse ».
+
+**Offres**
+- Carte de décision : Postuler, À creuser ou Passer (calculé localement), résumé en français, faits clés normalisés (contrat, télétravail, salaire, équipe, rattachement, séniorité, langues exigées), annonce en clair (missions, exigences, atouts).
+- Comparateur de 2 à 4 offres ; résumé d'une phrase dans la liste.
+- Nouvelle version de critères qui ne change que des poids : scores recalculés sans IA.
+
+**IA**
+- Modèle selon la tâche (profond, équilibré, rapide) et effort adapté ; version publiée : niveaux quick, default et complex de claude.ai, complex pour la rédaction finale du CV et de la lettre ; une régénération ne rejoue jamais une réponse en cache.
+- Préfixe stable du scoring (profil, critères, grille) mis en cache côté API ; consommation par niveau dans « Confidentialité & données ».
+- Entraînement à l'entretien : réponse écrite notée (structure STAR, forces, améliorations, version améliorée sans fait inventé).
 
 ## Réalisé en version 2
 
