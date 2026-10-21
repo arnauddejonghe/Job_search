@@ -36,7 +36,9 @@ const KEYS = {
   ratings: "radar:ratings",
   briefs: "radar:briefs",
   media: "radar:media",
+  inbox: "radar:inbox",
 };
+const DEFAULT_INBOX = { replies: [], untracked: [] };
 const DEFAULT_MEDIA = { photo: null };
 
 const STAGES = [
@@ -55,6 +57,7 @@ const OUTCOMES = [
   { id: "refused", label: "Refus" },
   { id: "withdrawn", label: "Abandon" },
   { id: "accepted", label: "Acceptée" },
+  { id: "ghosted", label: "Sans réponse" },
 ];
 const OUTCOME_LABEL = Object.fromEntries(OUTCOMES.map((o) => [o.id, o.label]));
 const FU_KINDS = { relance1: "1re relance", relance2: "2e relance", merci: "Remerciement", custom: "Relance" };
@@ -67,7 +70,9 @@ const DOC_TYPES = [
 ];
 const DOC_LABEL = Object.fromEntries(DOC_TYPES.map((d) => [d.id, d.label]));
 const REPLY_KINDS = {
+  confirmation_candidature: "Candidature confirmée",
   accuse_reception: "Accusé de réception",
+  test_evaluation: "Test / évaluation",
   invitation_entretien: "Invitation à un entretien",
   refus: "Refus",
   demande_info: "Demande d'information",
@@ -75,6 +80,17 @@ const REPLY_KINDS = {
   autre: "Autre",
 };
 const CONTACT_TYPES = { recruiter: "Recruteur", agency: "Cabinet", hiring: "Hiring manager", network: "Réseau" };
+/* Expéditeurs des logiciels de recrutement (accusés de réception, invitations) et confirmations des job boards. */
+const ATS_SENDERS = ["myworkday.com", "workday.com", "smartrecruiters.com", "greenhouse.io", "lever.co", "teamtailor.com", "recruitee.com", "successfactors.com", "successfactors.eu", "taleo.net", "icims.com", "personio.de", "workablemail.com", "jobvite.com", "bamboohr.com", "softgarden.io", "join.com", "homerun.co", "cornerstoneondemand.com", "jobs-noreply@linkedin.com", "indeedapply.com", "indeed.com"];
+/* Silence d'une candidature envoyée : jours depuis le dernier signal (envoi, e-mail reçu, appel, entretien). */
+function silenceDays(a) {
+  if (!a || !["sent", "followup"].includes(a.stage) || !a.sentAt) return null;
+  const last = [a.sentAt, ...(a.emails || []).map((m) => m.date || m.at), ...(a.log || []).filter((l) => ["email", "call", "interview"].includes(l.type)).map((l) => l.at)]
+    .map((d) => new Date(d).getTime()).filter(Number.isFinite).reduce((m, x) => Math.max(m, x), 0);
+  return last ? Math.floor((Date.now() - last) / 864e5) : null;
+}
+const lastEmail = (a) => [...(a?.emails || [])].sort((x, y) => new Date(y.date || y.at) - new Date(x.date || x.at))[0] || null;
+const gmailLink = (m) => (m?.threadId ? `https://mail.google.com/mail/u/0/#all/${m.threadId}` : m?.subject ? `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(`subject:"${m.subject}"`)}` : null);
 
 const DEFAULT_SETTINGS = {
   theme: "system",
@@ -85,6 +101,13 @@ const DEFAULT_SETTINGS = {
   employerNames: ["FEB", "VBO", "Fédération des Entreprises de Belgique", "Verbond van Belgische Ondernemingen"],
   model: "claude-opus-5-5",
   fallbackModel: "claude-sonnet-5-5",
+  modelBalanced: "claude-sonnet-5-5",
+  modelFast: "claude-haiku-5-5",
+  routing: true,
+  effortTuning: true,
+  autoReplies: true,
+  autoRepliesHours: 12,
+  ghostDays: 21,
   mcpMode: "auto",
   mcp: { gmail: "https://gmail.mcp.claude.com/mcp", gcal: "https://gcal.mcp.claude.com/mcp" },
   restrictTools: true,
@@ -2400,6 +2423,44 @@ function collectBlocks(content, acc) {
   }
 }
 
+/* Niveaux de modèle : « deep » (rédaction du CV et de la lettre, analyse d'annonce, scoring, préparation d'entretien),
+   « balanced » (recherche, Gmail, traduction, corrections, relances), « fast » (doublons, synonymes, priorisation,
+   réparation JSON). Version publiée : rapide → quick, équilibré et profond → default, rédaction finale → complex. */
+const MODEL_IDX = {}; // modèle retenu par niveau après un éventuel repli
+const EFFORT_OFF = {}; // niveaux dont le modèle refuse le paramètre effort
+const TIER_LABEL = { deep: "profond", balanced: "équilibré", fast: "rapide" };
+const tierModels = (s, tier) => [...new Set((tier === "fast" ? [s.modelFast, s.modelBalanced, s.model] : tier === "balanced" ? [s.modelBalanced, s.model] : [s.model, s.fallbackModel]).filter(Boolean))];
+/* Consommation de la session (version « chat ») : affichée dans Confidentialité & données. */
+const USAGE = { calls: 0, input: 0, output: 0, cacheRead: 0, byTier: {} };
+const usageListeners = new Set();
+function addUsage(tier, model, u) {
+  if (!u) return;
+  USAGE.calls += 1;
+  USAGE.input += u.input_tokens || 0;
+  USAGE.output += u.output_tokens || 0;
+  USAGE.cacheRead += u.cache_read_input_tokens || 0;
+  const t = (USAGE.byTier[tier] = USAGE.byTier[tier] || { calls: 0, input: 0, output: 0, model });
+  t.calls += 1; t.input += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0); t.output += u.output_tokens || 0; t.model = model;
+  usageListeners.forEach((f) => f({ ...USAGE }));
+}
+/* Prix indicatifs (USD par million de jetons, entrée / sortie). */
+const MODEL_PRICE = { "claude-opus-5-5": [4, 20], "claude-sonnet-5-5": [2, 10], "claude-haiku-5-5": [0.1, 0.5] };
+function useUsage() {
+  const [u, setU] = useState(() => ({ ...USAGE }));
+  useEffect(() => { usageListeners.add(setU); return () => usageListeners.delete(setU); }, []);
+  return u;
+}
+
+/* Un prompt peut marquer la fin de son préfixe stable (profil, critères, grille) : ce préfixe est mis en cache
+   côté API (relecture à 0,05× entre les lots de scoring) ; ailleurs, le marqueur disparaît. */
+const CACHE_SPLIT = "\u241E";
+const promptText = (p) => String(p).replace(CACHE_SPLIT, "");
+const promptBlocks = (p, cache) => {
+  const parts = String(p).split(CACHE_SPLIT);
+  if (parts.length < 2 || !cache) return promptText(p);
+  return [{ type: "text", text: parts[0], cache_control: { type: "ephemeral" } }, { type: "text", text: parts.slice(1).join("") }];
+};
+
 async function runConversation(settings, v, o) {
   const model = o.models[Math.min(v.m, o.models.length - 1)];
   const mode = o.mcpModes[Math.min(v.p, o.mcpModes.length - 1)];
@@ -2427,10 +2488,11 @@ async function runConversation(settings, v, o) {
   const headers = { "Content-Type": "application/json" };
   if (servers.length && mode === "toolset") headers["anthropic-beta"] = "mcp-client-2025-11-20";
 
-  const messages = [{ role: "user", content: o.prompt }];
+  const messages = [{ role: "user", content: promptBlocks(o.prompt, v.cache !== false) }];
   const acc = { text: [], urls: new Set(), toolText: [], toolCalls: [], toolErrors: [] };
   for (let turn = 0; turn < 5; turn++) {
     const body = { model, max_tokens: o.maxTokens, system: o.system, messages };
+    if (o.effort && !EFFORT_OFF[o.tier]) body.output_config = { effort: o.effort };
     if (tools.length) body.tools = tools;
     if (servers.length) body.mcp_servers = servers;
     let r;
@@ -2449,6 +2511,7 @@ async function runConversation(settings, v, o) {
       throw err;
     }
     collectBlocks(data.content, acc);
+    addUsage(o.tier, model, data.usage);
     if (data.stop_reason === "refusal") throw new Error("Le modèle a décliné cette requête. Reformulez ou réessayez.");
     if (data.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: data.content });
@@ -2495,7 +2558,8 @@ const SAMPLE_ERRORS = {
   cancelled: "Demande annulée.",
 };
 
-async function callSample(settings, { system, prompt, web, mcp = [] }) {
+const SAMPLE_TIER = { fast: "quick", balanced: "default", deep: "default" };
+async function callSample(settings, { system, prompt, web, mcp = [], tier = "deep", best = false }) {
   if (!RT.sample) throw new Error("Claude n'est pas disponible dans cette vue : ouvrez la page connecté à claude.ai.");
   const acc = { toolText: [], toolCalls: [], toolErrors: [] };
   const tools = [];
@@ -2532,7 +2596,8 @@ async function callSample(settings, { system, prompt, web, mcp = [] }) {
   try {
     let r;
     for (let attempt = 0; ; attempt++) {
-      try { r = await RT.sample(`${system}\n\n${prompt}${note}`, tools.length ? { tools } : {}); break; }
+      const opts = { cache: false, ...(settings.routing === false ? {} : { modelTier: best ? "complex" : SAMPLE_TIER[tier] || "default" }) };
+      try { r = await RT.sample(`${system}\n\n${promptText(prompt)}${note}`, tools.length ? { ...opts, tools } : opts); break; }
       catch (e) { if (e?.code === "rate_limited" && attempt < 2) { await sleep(4000 * (attempt + 1)); continue; } throw e; }
     }
     const text = (r.text || "").trim();
@@ -2547,24 +2612,31 @@ async function callClaude(settings, opts) {
   return callClaudeApi(settings, opts);
 }
 
-async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000 }) {
+async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000, tier = "deep", effort }) {
+  // La recherche web passe par un modèle qui la prend en charge (pas le niveau rapide).
+  const t = settings.routing === false ? "deep" : web && tier === "fast" ? "balanced" : tier;
   const o = {
-    system, prompt, web, mcp, maxTokens,
-    models: [...new Set([settings.model, settings.fallbackModel].filter(Boolean))],
+    system, prompt, web, mcp, maxTokens, tier: t,
+    effort: settings.effortTuning === false ? null : effort,
+    models: tierModels(settings, t),
     webTypes: ["web_search_20260209", "web_search_20250305"],
     mcpModes: settings.mcpMode === "auto" ? ["legacy", "toolset"] : [settings.mcpMode],
   };
-  let v = WORKING_VARIANT ? { ...WORKING_VARIANT } : { m: 0, w: 0, p: 0 };
+  let v = { w: 0, p: 0, ...(WORKING_VARIANT || {}), m: MODEL_IDX[t] || 0 };
   let lastErr;
-  for (let attempt = 0; attempt < 7; attempt++) {
+  for (let attempt = 0; attempt < 9; attempt++) {
     try {
       const res = await runConversation(settings, v, o);
-      WORKING_VARIANT = v;
+      const { m, ...shared } = v;
+      WORKING_VARIANT = shared;
+      MODEL_IDX[t] = m;
       return res;
     } catch (e) {
       lastErr = e;
       const msg = (e.message || "").toLowerCase();
       if (e.status === 400 || e.status === 404) {
+        if (o.effort && !EFFORT_OFF[t] && /output_config|effort/.test(msg)) { EFFORT_OFF[t] = true; continue; }
+        if (v.cache !== false && String(prompt).includes(CACHE_SPLIT) && /cache_control|cache/.test(msg)) { v = { ...v, cache: false }; continue; }
         if (web && /web_search|20260209|tool.*type|tools\.\d/.test(msg) && v.w < o.webTypes.length - 1) { v = { ...v, w: v.w + 1 }; continue; }
         if (mcp.length && /mcp|toolset|beta|tool_configuration/.test(msg) && v.p < o.mcpModes.length - 1) { v = { ...v, p: v.p + 1 }; continue; }
         if (/model/.test(msg) && v.m < o.models.length - 1) { v = { ...v, m: v.m + 1 }; continue; }
@@ -2604,6 +2676,7 @@ async function askJSON(settings, opts) {
         system: SYSTEM_REPAIR,
         prompt: `Texte à convertir :\n<<<\n${res.text.slice(0, 40000)}\n>>>`,
         maxTokens: opts.maxTokens || 8000,
+        tier: "fast", effort: "low",
       });
       return { ...res, data: extractJSON(fix.text) };
     }
@@ -3016,9 +3089,6 @@ Domicile : Ohain (Brabant wallon). Trajet max souhaité : ${c.maxCommute} min. T
 CRITÈRES (version « ${versionLabel} ») — évalue CHACUN, pour CHAQUE offre, avec son identifiant :
 ${list}
 
-OFFRES
-${JSON.stringify(compact)}
-
 GRILLE (identique pour toutes les offres)
 - indispensable / souhaité : match = degré de satisfaction. 100 = explicitement satisfait ; 75 = très probable ; 50 = non précisé dans l'annonce ; 25 = peu probable ; 0 = explicitement contraire.
 - exclusion / alerte : match = degré de PRÉSENCE. 100 = explicitement présent ; 50 = non précisé ; 0 = explicitement absent.
@@ -3027,6 +3097,10 @@ GRILLE (identique pour toutes les offres)
 - fit : "fort" | "moyen" | "faible" — ton avis global en une lettre de lecture rapide.
 - confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre.
 - redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce.
+
+${CACHE_SPLIT}
+OFFRES
+${JSON.stringify(compact)}
 
 Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifiant de critère) :
 {"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
@@ -3566,23 +3640,26 @@ RÈGLES
 Réponds uniquement {"groups":[{"ids":["",""],"confidence":"haute|moyenne","reason":"20 mots max"}]}`;
   },
 
-  replies(items) {
+  replies(items, { after, query }) {
     return `Date du jour : ${todayStr()}.
-Mission : détecter dans Gmail les réponses reçues aux candidatures ci-dessous. LECTURE SEULE.
-CANDIDATURES
+Mission : surveiller la boîte Gmail pour le pipeline de candidatures ci-dessous. LECTURE SEULE.
+CANDIDATURES SUIVIES
 ${JSON.stringify(items)}
 
 MÉTHODE
-1. Pour chaque candidature, recherche les e-mails reçus depuis sa date d'envoi (champ since) venant de l'entreprise, du cabinet ou des contacts listés (nom, domaine, adresse). Ignore les alertes emploi automatiques, newsletters et e-mails envoyés par l'utilisateur.
-2. Ouvre les messages pertinents (25 au maximum au total).
-3. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
+1. Lance cette recherche Gmail (ajuste-la si elle ne renvoie rien) : ${query}
+   Ne regarde que les e-mails reçus après le ${after} (vérification incrémentale).
+2. Ouvre uniquement les fils pertinents (25 au maximum) : réponses d'entreprises ou de cabinets, accusés de réception de logiciels de recrutement (Workday, SmartRecruiters, Greenhouse, Lever, Teamtailor, Recruitee, SuccessFactors, Taleo, iCIMS, Personio, Workable…), confirmations « candidature envoyée » de LinkedIn ou Indeed, invitations, tests, refus, offres.
+3. Ignore les alertes emploi automatiques et les newsletters. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
 
 RÈGLES
-- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. Si le rattachement à une candidature est incertain, ne le rapporte pas.
-- kind : accuse_reception | invitation_entretien | refus | demande_info | offre | autre.
-- proposedStage : "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
-- interviewAt : date et heure proposées dans l'e-mail (YYYY-MM-DDTHH:mm), sinon null.
-Réponds uniquement {"replies":[{"appId":"","date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"messagesRead":0}`;
+- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. threadId = identifiant du fil tel que renvoyé par l'outil, sinon null.
+- Rattache un e-mail à une candidature (appId) seulement si l'entreprise, le cabinet, le poste ou le contact correspondent clairement.
+- kind : confirmation_candidature | accuse_reception | invitation_entretien | test_evaluation | demande_info | refus | offre | autre.
+- proposedStage : "sent" pour une confirmation de candidature envoyée, "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
+- interviewAt : date et heure proposées (YYYY-MM-DDTHH:mm), sinon null.
+- untracked : confirmations de candidature ou réponses de recruteurs qui ne correspondent à AUCUNE candidature suivie (candidature envoyée hors de l'outil).
+Réponds uniquement {"replies":[{"appId":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"untracked":[{"company":"","title":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"confirmation_candidature|invitation_entretien|refus|autre","summary":""}],"messagesRead":0}`;
   },
 
   verify(items) {
@@ -4226,6 +4303,8 @@ export default function RadarApp() {
   const [ratings, setRatings] = useState({});
   const [briefs, setBriefs] = useState({});
   const [media, setMedia] = useState(DEFAULT_MEDIA);
+  const [inbox, setInbox] = useState(DEFAULT_INBOX);
+  const [replyOpen, setReplyOpen] = useState(false);
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -4246,7 +4325,6 @@ export default function RadarApp() {
   const [dupePending, setDupePending] = useState(null);
   const [lastBulk, setLastBulk] = useState(null);
   const [visitPrev, setVisitPrev] = useState(null);
-  const [replyProposals, setReplyProposals] = useState(null);
   const [genStatus, setGenStatus] = useState({});
   const [studio, setStudio] = useState(null);
   const [spontOpen, setSpontOpen] = useState(false);
@@ -4260,7 +4338,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, briefs };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, briefs, inbox };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -4368,6 +4446,7 @@ export default function RadarApp() {
           if (out.ratings) setRatings(out.ratings);
           if (out.briefs) setBriefs(out.briefs);
           if (out.media) setMedia({ ...DEFAULT_MEDIA, ...out.media });
+          if (out.inbox) setInbox({ ...DEFAULT_INBOX, ...out.inbox });
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -4404,6 +4483,7 @@ export default function RadarApp() {
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
   usePersist(KEYS.briefs, briefs, persistOn, setSaveState);
   usePersist(KEYS.media, media, persistOn, setSaveState);
+  usePersist(KEYS.inbox, inbox, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -4493,7 +4573,7 @@ export default function RadarApp() {
     const rules = rulesOf(s);
     await pool(chunk(targets, 5), 2, async (batch) => {
       try {
-        const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.score(batch, p, ver, ver.label), maxTokens: 14000 });
+        const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.score(batch, p, ver, ver.label), maxTokens: 14000, tier: "deep", effort: "medium" });
         const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).filter((x) => x && x.id).map((x) => [x.id, x]));
         const got = batch.filter((o) => byId[o.id]).length;
         ok += got;
@@ -4537,7 +4617,7 @@ export default function RadarApp() {
       if (busyRef.current.score) return;
       const vid = activeVersion(R.current.criteria)?.id;
       const ids = R.current.offers
-        .filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && isStale(o, vid) && !a.failed.has(o.id))
+        .filter((o) => !o.demo && !o.spontaneous && !(o.detected && !o.fullText) && ["new", "pipeline"].includes(o.status) && isStale(o, vid) && !a.failed.has(o.id))
         .sort((x, y) => (x.status === "pipeline" ? -1 : 0) - (y.status === "pipeline" ? -1 : 0) || new Date(y.collectedAt) - new Date(x.collectedAt))
         .slice(0, settings.autoScoreMax || 60)
         .map((o) => o.id);
@@ -4598,6 +4678,7 @@ export default function RadarApp() {
           prompt: P.search(src, crit, s),
           web: { domains, maxUses: 6 },
           maxTokens: 10000,
+          tier: "balanced",
         });
         const raw = Array.isArray(res.data?.offers) ? res.data.offers : [];
         // Garde-fou anti-invention : une URL absente des résultats de recherche ET hors du domaine de la source est écartée.
@@ -4631,6 +4712,7 @@ export default function RadarApp() {
       prompt: P.gmail(days || s.gmailDays),
       mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }],
       maxTokens: 16000,
+      tier: "balanced",
     });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) {
       toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}). Vérifiez votre boîte.`, "danger");
@@ -4654,6 +4736,7 @@ export default function RadarApp() {
       prompt: P.structure({ text: str(text), url: cleanUrl }),
       web: cleanUrl && !str(text) ? { maxUses: 4 } : null,
       maxTokens: 6000,
+      tier: "balanced", effort: "low",
     });
     if (!res.data?.found || !res.data.offer) throw new Error(`Annonce non retrouvée${res.data?.reason ? ` (${res.data.reason})` : ""}. Collez plutôt le texte de l'annonce.`);
     const o = normalizeOffer(
@@ -4695,7 +4778,7 @@ export default function RadarApp() {
     const used = new Set();
     const groups = [];
     for (const batch of chunk(pool0, 60)) {
-      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000 });
+      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000, tier: "fast", effort: "low" });
       for (const g of Array.isArray(data?.groups) ? data.groups : []) {
         const ids = [...new Set((g.ids || []).filter((id) => known.has(id) && !used.has(id)))];
         if (ids.length < 2) continue;
@@ -4822,52 +4905,111 @@ export default function RadarApp() {
     toast(`Fusion annulée : ${last.absorbed.length} offre(s) restaurée(s)`, "ok");
   };
 
-  /* ── Réponses des recruteurs (Gmail, lecture seule) ──────────────── */
+  /* ── Surveillance Gmail du pipeline : lecture seule, incrémentale, toujours validée ── */
   const replyKey = (r) => `${r.date || ""}|${normText(r.from)}|${normText(r.subject)}`;
-  const checkReplies = () => withBusy("replies", async () => {
-    const { settings: s, apps: A, offers: O, contacts: C } = R.current;
-    const active = A.filter((a) => !a.demo && a.sentAt && a.stage !== "closed");
-    if (!active.length) { toast("Aucune candidature envoyée à surveiller.", "neutral"); return; }
+  const monitoredApps = () => R.current.apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage)));
+  const setInboxNow = (next) => { R.current.inbox = next; setInbox(next); };
+  const checkReplies = ({ auto = false } = {}) => withBusy("replies", async () => {
+    const { settings: s, offers: O, contacts: C } = R.current;
+    const active = monitoredApps();
+    if (!active.length) { if (!auto) toast("Aucune candidature à surveiller (préparation, envoyée ou au-delà).", "neutral"); return; }
+    // Fenêtre incrémentale : depuis la dernière vérification (1 jour de marge), sans remonter avant la plus ancienne candidature.
+    const oldest = active.reduce((m, a) => Math.min(m, new Date(a.sentAt || a.createdAt).getTime()), Date.now());
+    const last = s.lastReplyWindowAt ? new Date(s.lastReplyWindowAt).getTime() - 864e5 : 0;
+    const after = new Date(Math.max(oldest - 864e5, last, Date.now() - 120 * 864e5)).toISOString().slice(0, 10);
     const items = active.map((a) => {
       const o = O.find((x) => x.id === a.offerId);
       return {
-        appId: a.id, title: o?.title || null, company: o?.company || null,
+        appId: a.id, title: o?.title || null, company: o?.company || null, stage: a.stage, sentAt: a.sentAt ? a.sentAt.slice(0, 10) : null,
         sites: [...new Set((o?.sources || []).map((x) => hostOf(x.url)).filter(Boolean))],
         contacts: C.filter((c) => (a.contactIds || []).includes(c.id)).map((c) => ({ name: c.name, email: c.email || null, company: c.company || null })),
-        since: a.sentAt.slice(0, 10),
       };
     });
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000 });
+    const companies = [...new Set(items.map((i) => i.company).filter((c) => c && !/confidenti|non communiqu|anonyme/i.test(c)))].slice(0, 20);
+    const emails = [...new Set(items.flatMap((i) => i.contacts.map((c) => c.email)).filter(Boolean))].slice(0, 15);
+    const query = `after:${after.replace(/-/g, "/")} -category:promotions (${[
+      ...companies.map((c) => `"${c.replace(/"/g, "")}"`),
+      ...emails.map((e) => `from:${e}`),
+      `from:(${ATS_SENDERS.join(" OR ")})`,
+      "subject:(candidature OR application OR sollicitatie OR bewerbung OR entretien OR interview OR gesprek OR sollicitatiegesprek)",
+    ].join(" OR ")})`;
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items, { after, query }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000, tier: "balanced" });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}).`, "danger");
     if (!res.toolCalls.length) throw new Error("Gmail n'a pas été consulté : vérifiez que le connecteur Gmail est activé pour cet artefact.");
-    setSettings((x) => ({ ...x, lastReplyCheckAt: nowISO() }));
+    const now = nowISO();
+    setSettings((x) => ({ ...x, lastReplyCheckAt: now, lastReplyWindowAt: now }));
     const hay = normText(res.toolText);
+    const thread = (t) => (str(t) && hay.includes(normText(t)) ? str(t) : null);
+    const day = (d) => (str(d) && !isNaN(new Date(d).getTime()) ? String(d).slice(0, 10) : null);
+    const seen = new Set([...R.current.apps.flatMap((a) => a.seenReplies || []), ...R.current.inbox.replies.map(replyKey)]);
     const found = (Array.isArray(res.data?.replies) ? res.data.replies : [])
       .filter((r) => r && active.some((a) => a.id === r.appId) && str(r.subject))
       .map((r) => ({
-        id: uid("rep"), appId: r.appId, date: str(r.date), from: str(r.from), subject: str(r.subject),
+        id: uid("rep"), appId: r.appId, threadId: thread(r.threadId), date: day(r.date), from: str(r.from), subject: str(r.subject),
         kind: REPLY_KINDS[r.kind] ? r.kind : "autre", summary: str(r.summary),
         interviewAt: str(r.interviewAt) && !isNaN(new Date(r.interviewAt).getTime()) ? new Date(r.interviewAt).toISOString() : null,
-        action: ["interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
-        verified: hay.includes(normText(r.subject)),
+        action: ["sent", "interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
+        verified: hay.includes(normText(r.subject)), at: now,
       }))
-      .filter((r) => !(active.find((a) => a.id === r.appId)?.seenReplies || []).includes(replyKey(r)));
-    if (!found.length) { toast(`Aucune nouvelle réponse (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok"); return; }
-    setReplyProposals(found);
+      .filter((r) => !seen.has(replyKey(r)));
+    const seenU = new Set([...(s.seenUntracked || []), ...R.current.inbox.untracked.map(replyKey)]);
+    const untracked = (Array.isArray(res.data?.untracked) ? res.data.untracked : [])
+      .filter((u) => u && str(u.subject) && str(u.company))
+      .map((u) => ({ id: uid("unt"), company: str(u.company), title: str(u.title), threadId: thread(u.threadId), date: day(u.date), from: str(u.from), subject: str(u.subject), kind: REPLY_KINDS[u.kind] ? u.kind : "autre", summary: str(u.summary), verified: hay.includes(normText(u.subject)), at: now }))
+      .filter((u) => !seenU.has(replyKey(u)));
+    setInboxNow({ replies: [...R.current.inbox.replies, ...found], untracked: [...R.current.inbox.untracked, ...untracked] });
+    if (found.length || untracked.length) {
+      toast(`Gmail : ${found.length} réponse(s)${untracked.length ? ` et ${untracked.length} candidature(s) non suivie(s)` : ""} à valider.`, "ok");
+      if (!auto) setReplyOpen(true);
+    } else if (!auto) toast(`Aucune nouvelle réponse depuis le ${fmtDate(after)} (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok");
   });
   const resolveReply = (r, apply) => {
     patchApp(r.appId, (a) => {
       const n = { ...a, seenReplies: [...(a.seenReplies || []), replyKey(r)] };
-      return apply ? addLogEntry(n, "email", `Réponse reçue (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`) : n;
+      if (!apply) return n;
+      const mail = { id: uid("mail"), date: r.date, from: r.from, subject: r.subject, kind: r.kind, summary: r.summary, threadId: r.threadId, at: nowISO() };
+      return addLogEntry({ ...n, emails: [...(n.emails || []), mail] }, "email", `E-mail reçu (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`);
     });
     if (apply) {
-      if (r.action === "interview") {
+      const cur = R.current.apps.find((a) => a.id === r.appId);
+      if (r.action === "sent") {
+        const sentAt = r.date ? new Date(`${r.date}T09:00:00`).toISOString() : undefined;
+        if (cur && STAGE_INDEX[cur.stage] < STAGE_INDEX.sent) moveApp(r.appId, "sent", { sentAt });
+        else if (cur && !cur.sentAt && sentAt) patchApp(r.appId, (a) => ({ ...a, sentAt }));
+      } else if (r.action === "interview") {
         if (r.interviewAt) addInterview(r.appId, { at: r.interviewAt, type: "À préciser", location: "", notes: `Selon l'e-mail « ${r.subject} »` });
         else moveApp(r.appId, "interview");
       } else if (r.action === "closed") moveApp(r.appId, "closed", { outcome: "refused", reason: r.summary || "Réponse négative reçue par e-mail" });
       else if (r.action === "offer") moveApp(r.appId, "offer");
     }
-    setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
+    setInboxNow({ ...R.current.inbox, replies: R.current.inbox.replies.filter((x) => x.id !== r.id) });
+  };
+  const resolveUntracked = (u, create) => {
+    if (create) {
+      const t = nowISO();
+      const sentAt = u.date ? new Date(`${u.date}T09:00:00`).toISOString() : t;
+      const stage = u.kind === "invitation_entretien" ? "interview" : u.kind === "refus" ? "closed" : "sent";
+      const off = {
+        id: uid("off"), title: u.title || "Candidature détectée dans Gmail", company: u.company, location: null, commute: null, contract: null, seniority: null, salary: null, remote: null,
+        language: null, publishedAt: null, description: u.summary || null, collectedAt: t, lastSeenAt: t, status: stage === "closed" ? "closed" : "pipeline", score: null, demo: false, detected: "gmail",
+        sources: [{ name: "Gmail", url: null, collectedAt: t, via: "surveillance Gmail", verified: null, emailSubject: u.subject }],
+      };
+      const rules = R.current.settings.followUp;
+      const app = {
+        id: uid("app"), offerId: off.id, stage, reached: STAGE_INDEX[stage === "closed" ? "sent" : stage], createdAt: t, updatedAt: t, sentAt,
+        closed: stage === "closed" ? { outcome: "refused", reason: u.summary, at: t } : null, docs: {}, prep: null, contactIds: [], interviews: [], demo: false,
+        followUps: stage === "sent" ? rules.afterSend.map((d, i) => ({ id: uid("fu"), kind: i === 0 ? "relance1" : i === 1 ? "relance2" : "custom", due: addDays(sentAt, d), status: "pending", draft: null })) : [],
+        emails: [{ id: uid("mail"), date: u.date, from: u.from, subject: u.subject, kind: u.kind, summary: u.summary, threadId: u.threadId, at: t }],
+        log: [{ id: uid("log"), at: t, type: "email", text: `Candidature détectée dans Gmail : « ${u.subject} »` }],
+      };
+      R.current.offers = [off, ...R.current.offers];
+      setOffers((l) => [off, ...l]);
+      R.current.apps = [app, ...R.current.apps];
+      setApps((l) => [app, ...l]);
+      toast(`Ajoutée au pipeline : ${u.company} (${STAGE_LABEL[stage]})`, "ok");
+    }
+    setSettings((x) => ({ ...x, seenUntracked: [...(x.seenUntracked || []), replyKey(u)].slice(-300) }));
+    setInboxNow({ ...R.current.inbox, untracked: R.current.inbox.untracked.filter((x) => x.id !== u.id) });
   };
 
   /* ── Fiches entreprise (pourquoi eux) : web_search (API), Routine (page publiée) ou source collée. ── */
@@ -4882,7 +5024,7 @@ export default function RadarApp() {
       toast(`Fiche demandée pour ${name} : elle s'affichera d'ici quelques minutes.`, "ok");
       return null;
     }
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.companyBrief(name, context), web: { maxUses: 6 }, maxTokens: 5000 });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.companyBrief(name, context), web: { maxUses: 6 }, maxTokens: 5000, tier: "balanced" });
     const b = makeBrief({ company: name, summary: res.data?.summary, facts: res.data?.facts, origin: "web", verifiedUrls: res.urls });
     const dropped = (res.data?.facts || []).length - b.facts.length;
     setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
@@ -4894,7 +5036,7 @@ export default function RadarApp() {
     if (!name) throw new Error("Entreprise non identifiée.");
     if (!isHttp(url)) throw new Error("Indiquez l'URL de la source : un fait sans source vérifiable est exclu.");
     if (String(text || "").trim().length < 80) throw new Error("Collez le texte de la source (au moins quelques phrases).");
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.briefFromText(name, url, text), maxTokens: 3000 });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.briefFromText(name, url, text), maxTokens: 3000, tier: "balanced", effort: "low" });
     const b = makeBrief({ company: name, summary: res.data?.summary, facts: (res.data?.facts || []).map((f) => ({ text: f?.text, url })), origin: "manuel" });
     setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
     toast(`${b.facts.length} fait(s) ajouté(s) à la fiche ${name}`, b.facts.length ? "ok" : "warn");
@@ -4919,7 +5061,7 @@ export default function RadarApp() {
       toast(`Notes demandées pour ${list.length} entreprise(s) : elles s'afficheront d'ici quelques minutes.`, "ok");
       return;
     }
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000 });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000, tier: "balanced", effort: "low" });
     const next = {};
     (res.data?.ratings || []).forEach((r) => {
       if (!r?.company) return;
@@ -4977,7 +5119,7 @@ export default function RadarApp() {
       toast(`Vérification demandée pour ${items.length} offre(s) : résultats d'ici 5 à 15 minutes. Les annonces clôturées passeront en « Expirées ».`, "ok");
       return;
     }
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.verify(items), web: { maxUses: Math.min(20, items.length * 2) }, maxTokens: 8000 });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.verify(items), web: { maxUses: Math.min(20, items.length * 2) }, maxTokens: 8000, tier: "balanced" });
     const r = applyVerifyResults(res.data?.results, nowISO(), "recherche web");
     setSettings((x) => ({ ...x, lastVerifyAt: nowISO() }));
     toast(`Vérification : ${r.closed} clôturée(s), ${r.open} ouverte(s), le reste indéterminé.`, "ok");
@@ -5065,7 +5207,7 @@ export default function RadarApp() {
     saveCriteriaVersion(`Restauration de « ${label} »`);
   };
   const generateKeywords = () => withBusy("keywords", async () => {
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000 });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000, tier: "fast", effort: "low" });
     setCriteria((c) => {
       const kw = { ...c.draft.keywords };
       ["fr", "nl", "en"].forEach((l) => {
@@ -5169,7 +5311,7 @@ export default function RadarApp() {
         toast("Brouillon créé dans Gmail — non envoyé", "ok");
         return;
       }
-      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000 });
+      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000, tier: "balanced", effort: "low" });
       if (res.toolCalls.some((n) => /send/i.test(n))) toast("Alerte : un outil d'envoi a été appelé. Vérifiez vos e-mails envoyés.", "danger");
       if (!res.toolCalls.length) throw new Error("Le connecteur Gmail n'a pas été appelé : aucun brouillon créé. Vérifiez l'activation du connecteur.");
       if (!res.data?.created) throw new Error(`Brouillon non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -5200,6 +5342,7 @@ export default function RadarApp() {
         prompt: P.calendarEvent({ title, start: toLocalInput(start) + ":00", end: toLocalInput(end) + ":00", description, reminder }),
         mcp: [{ server: "gcal", allow: s.mcpTools.gcal }],
         maxTokens: 3000,
+        tier: "balanced", effort: "low",
       });
       if (!res.toolCalls.length) throw new Error("Le connecteur Google Calendar n'a pas été appelé : aucun événement créé.");
       if (!res.data?.created) throw new Error(`Événement non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -5228,7 +5371,7 @@ export default function RadarApp() {
     if (offer.spontaneous ? !str(offer.title) : adText.length < 40) throw new Error(offer.spontaneous ? "Indiquez le rôle visé." : "Annonce trop courte pour être analysée : collez son texte complet.");
     const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify({ ...p, motivation: undefined, motivationAnswers: undefined, writingRules: undefined })}`);
     if (!force && app.analysis?.sig === sig) return app.analysis;
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000, tier: "deep", effort: "medium" });
     const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.spontaneous && !offer.fullText, adChars: adText.length, spontaneous: offer.spontaneous || null };
     if (!analysis.keywords.length) throw new Error("L'analyse n'a renvoyé aucun mot-clé.");
     R.current.apps = R.current.apps.map((a) => (a.id === appId ? { ...a, analysis } : a));
@@ -5266,7 +5409,7 @@ export default function RadarApp() {
         const issues = autoFixList(analyzeDoc(d.text, t, qaCtx(extra)));
         if (!issues.length) return;
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000, tier: "balanced" });
           let txt = d.text;
           for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
             if (touchesLocked(e?.before, lockedOf(p))) continue;
@@ -5277,14 +5420,14 @@ export default function RadarApp() {
         } catch { /* passe facultative : le document reste utilisable */ }
       };
       const restJob = other.length
-        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis, extra), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
+        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis, extra), p), maxTokens: 8000, tier: "balanced" }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
         : Promise.resolve();
       /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
       if (pro.includes("cv")) {
         const master = masterOf(p, lang);
         setGen(appId, { step: 2, label: master ? "Adaptation du CV maître…" : "Rédaction du CV…" });
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, { ...extra, master: master?.text, masterLang: lang }), p), maxTokens: 9000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, { ...extra, master: master?.text, masterLang: lang }), p), maxTokens: 9000, tier: "deep", best: true });
           const raw = r.data?.cv;
           if (typeof raw === "string" && raw.trim()) {
             const accent = cleanHex(r.data?.accent, null);
@@ -5299,7 +5442,7 @@ export default function RadarApp() {
         const cvText = drafts.cv?.text || app.drafts?.cv?.text || app.docs?.cv?.slice(-1)[0]?.text || "";
         setGen(appId, { step: 2, label: cvText ? "Rédaction de la lettre à partir du CV (sans le répéter)…" : "Rédaction de la lettre…" });
         try {
-          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText, extra), p), maxTokens: 9000 });
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText, extra), p), maxTokens: 9000, tier: "deep", best: true });
           const raw = r.data?.letter;
           if (typeof raw === "string" && raw.trim()) {
             drafts.letter = { text: normalizeDoc(raw, "letter", lang), accent: null, accentSource: null, tips: [], used: normalizeUsed(r.data?.used), cvText };
@@ -5349,7 +5492,7 @@ export default function RadarApp() {
     const args = { cvText, facts, employer: employerRule(app, p), appBlock: appMotivationBlock(app, offer, p, facts), ...payload, analysis, profile: p, offer };
     const prompt = { review: P.review, fix: P.fixDoc, section: P.improveSection, headlines: P.headlines }[action];
     if (!prompt) throw new Error("Action inconnue.");
-    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000 });
+    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000, tier: action === "review" ? "deep" : "balanced", effort: action === "headlines" ? "low" : undefined });
     return data || {};
   });
 
@@ -5361,7 +5504,7 @@ export default function RadarApp() {
     const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
     const edits = l.edits.filter((e) => new Date(e.at).getTime() > since);
     if (new Set(edits.map((e) => `${e.appId}:${e.type}`)).size < 3) throw new Error("Corrigez et enregistrez au moins 3 documents générés avant l'apprentissage.");
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.learnRules(edits, writingRulesOf(p)), maxTokens: 3000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.learnRules(edits, writingRulesOf(p)), maxTokens: 3000, tier: "balanced" });
     const found = (Array.isArray(data?.rules) ? data.rules : []).map((r) => ({ text: str(r?.text), evidence: str(r?.evidence) })).filter((r) => r.text).slice(0, 5);
     setProfile((pp) => {
       const cur = writingRulesOf(pp);
@@ -5386,7 +5529,7 @@ export default function RadarApp() {
     const { settings: s, profile: p } = R.current;
     const filled = answers.filter((x) => str(x.a));
     if (filled.length < 3) throw new Error("Répondez à au moins 3 questions.");
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.motivationDraft(filled, motivOf(p)), maxTokens: 6000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.motivationDraft(filled, motivOf(p)), maxTokens: 6000, tier: "balanced" });
     const d = data && typeof data === "object" ? data : {};
     const t = (x) => (typeof x === "string" ? x.trim() : "");
     const proposal = {
@@ -5458,7 +5601,7 @@ export default function RadarApp() {
     const fu = app?.followUps.find((f) => f.id === fuId);
     const offer = O.find((o) => o.id === app?.offerId);
     const contact = C.find((c) => app?.contactIds?.includes(c.id));
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.followUp(app, offer, fu, p, contact), p), maxTokens: 3000 });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.followUp(app, offer, fu, p, contact), p), maxTokens: 3000, tier: "balanced", effort: "low" });
     if (!data?.body) throw new Error("Aucun texte reçu.");
     setFollowUp(appId, fuId, { draft: { subject: data.subject || "", body: data.body, createdAt: nowISO() } });
     toast("Relance rédigée — à relire", "ok");
@@ -5478,7 +5621,7 @@ export default function RadarApp() {
     const offer = O.find((o) => o.id === app?.offerId);
     const brief = offer?.company ? R.current.briefs[briefKey(offer.company)] : null;
     const facts = selectedFacts(app, offer, R.current.briefs);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p, { facts: briefFresh(brief) ? brief.facts : [], appBlock: appMotivationBlock(app, offer, p, facts) }), p), web: { maxUses: briefFresh(brief) ? 3 : 6 }, maxTokens: 14000 });
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p, { facts: briefFresh(brief) ? brief.facts : [], appBlock: appMotivationBlock(app, offer, p, facts) }), p), web: { maxUses: briefFresh(brief) ? 3 : 6 }, maxTokens: 14000, tier: "deep" });
     const d = res.data || {};
     const seen = (u) => !!u && (res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u)) || (briefFresh(brief) && brief.facts.some((f) => canonicalUrl(f.url) === canonicalUrl(u))));
     /* Les faits vérifiés de la préparation enrichissent la fiche entreprise (réutilisée par la lettre). */
@@ -5541,17 +5684,23 @@ export default function RadarApp() {
     const unreadAll = offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length;
     if (unreadAll > unreadGood.length) items.push({ id: "tri-all", label: `Trier ${unreadAll} offre(s) non lue(s)`, detail: "Sélection multiple et actions de masse disponibles", weight: 2, go: () => setView("offers") || setOfferPreset({ tab: "unread" }) });
     if (staleIds.length) items.push({ id: "stale", label: `Recalculer ${staleIds.length} score(s) obsolète(s)`, detail: "Les critères ont changé", weight: 3, go: () => rescoreStale() });
-    if (apps.some((a) => !a.demo && a.sentAt && a.stage !== "closed") && (!settings.lastReplyCheckAt || (Date.now() - new Date(settings.lastReplyCheckAt)) / 36e5 > 48)) items.push({ id: "replies", label: "Vérifier les réponses des recruteurs", detail: `Dernière vérification : ${relTime(settings.lastReplyCheckAt)}`, weight: 2, go: () => checkReplies() });
+    apps.filter((a) => !a.demo).forEach((a) => {
+      const silent = silenceDays(a);
+      if (silent !== null && silent >= (settings.ghostDays || 21)) items.push({ id: `ghost:${a.id}`, label: `Sans nouvelles depuis ${silent} j : relancer ou clôturer`, detail: offers.find((o) => o.id === a.offerId)?.company || NC, weight: 2, go: () => openApp(a.id, "emails") });
+    });
+    const pendingMail = inbox.replies.length + inbox.untracked.length;
+    if (pendingMail) items.push({ id: "inbox", label: `${pendingMail} e-mail(s) détecté(s) à valider`, detail: "Réponses et candidatures trouvées dans Gmail", weight: 1, go: () => setReplyOpen(true) });
+    if (monitoredApps().length && (!settings.lastReplyCheckAt || (Date.now() - new Date(settings.lastReplyCheckAt)) / 36e5 > 48)) items.push({ id: "replies", label: "Vérifier les réponses des recruteurs", detail: `Dernière vérification : ${relTime(settings.lastReplyCheckAt)}`, weight: 2, go: () => checkReplies() });
     if (!settings.lastWatchAt || (Date.now() - new Date(settings.lastWatchAt)) / 36e5 > 24) items.push({ id: "watch", label: "Lancer la veille", detail: `Dernière collecte : ${relTime(settings.lastWatchAt)}`, weight: 3, go: () => runWatch() });
     const order = todayAI?.order || {};
     return items
       .map((it) => ({ ...it, ai: order[it.id] }))
       .sort((a, b) => (a.ai?.priority ?? a.weight) - (b.ai?.priority ?? b.weight) || new Date(a.due || 8.64e15) - new Date(b.due || 8.64e15));
-  }, [apps, offers, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [apps, offers, inbox, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, settings.ghostDays, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const prioritizeToday = () => withBusy("today", async () => {
     if (!todayItems.length) return;
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000 });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000, tier: "fast", effort: "low" });
     const order = {};
     (data?.ordered || []).forEach((x) => { if (x?.id) order[x.id] = { priority: clamp(Number(x.priority) || 2, 1, 3), reason: str(x.reason) }; });
     setTodayAI({ order, at: nowISO() });
@@ -5559,7 +5708,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs, ratings, media });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs, ratings, media, inbox });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -5572,6 +5721,7 @@ export default function RadarApp() {
     if (obj.briefs && typeof obj.briefs === "object") setBriefs(obj.briefs);
     if (obj.ratings && typeof obj.ratings === "object") setRatings(obj.ratings);
     if (obj.media && typeof obj.media === "object") setMedia({ ...DEFAULT_MEDIA, ...obj.media });
+    setInbox({ ...DEFAULT_INBOX, ...(obj.inbox || {}) });
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -5588,6 +5738,7 @@ export default function RadarApp() {
     setBriefs({});
     setRatings({});
     setMedia(DEFAULT_MEDIA);
+    setInbox(DEFAULT_INBOX);
     setTodayAI(null);
     toast("Plateforme réinitialisée", "ok");
   };
@@ -5699,6 +5850,9 @@ export default function RadarApp() {
     const stale = (iso) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= (s.autoWatchHours || 24);
     const t = setTimeout(async () => {
       if (s.autoGmail && stale(s.lastGmailImportAt)) await importGmail(s.gmailDays);
+      // Surveillance des réponses : seulement s'il y a des candidatures à suivre ; rien n'est appliqué sans validation.
+      const dueReplies = !s.lastReplyCheckAt || (Date.now() - new Date(s.lastReplyCheckAt).getTime()) / 36e5 >= (s.autoRepliesHours || 12);
+      if (s.autoReplies && dueReplies && monitoredApps().length && (RT.mode !== "published" || RT.mcp)) await checkReplies({ auto: true });
       if (s.autoWatch && RT.mode !== "published" && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
     }, 1500);
     return () => clearTimeout(t);
@@ -5708,6 +5862,7 @@ export default function RadarApp() {
 
   const pApps = useMemo(() => apps.filter((a) => a.kind !== "base"), [apps]);
   const dueCount = useMemo(() => apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0), [apps]);
+  const monitoredCount = useMemo(() => apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage))).length, [apps]);
   const unreadCount = useMemo(() => offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length, [offers]);
 
   const ctx = {
@@ -5720,7 +5875,7 @@ export default function RadarApp() {
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
-    media, setMedia, translateDoc,
+    media, setMedia, translateDoc, inbox, setReplyOpen, resolveUntracked, monitoredCount,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
@@ -5791,7 +5946,7 @@ export default function RadarApp() {
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
           <SpontaneousModal open={spontOpen} onClose={() => setSpontOpen(false)} />
           <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
-          <ReplyReviewModal replies={replyProposals} setReplies={setReplyProposals} onResolve={resolveReply} apps={apps} offers={offers} />
+          <ReplyReviewModal open={replyOpen} onClose={() => setReplyOpen(false)} inbox={inbox} setInbox={setInbox} onResolve={resolveReply} onResolveUntracked={resolveUntracked} apps={apps} offers={offers} />
           <StageDialog dialog={stageDialog} onClose={() => setStageDialog(null)} />
           <ConfirmExternalModal confirm={confirm} onClose={() => setConfirm(null)} />
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
@@ -7019,8 +7174,9 @@ function nextStep(a) {
 
 function PipelineView() {
   const T = useT();
-  const { apps, offers, settings, requestMove, openApp, go, setSpontOpen } = useApp();
+  const { apps, offers, settings, setSettings, requestMove, openApp, go, setSpontOpen, checkReplies, busy, inbox, setReplyOpen, monitoredCount } = useApp();
   const [over, setOver] = useState(null);
+  const pendingMail = inbox.replies.length + inbox.untracked.length;
   const [showClosed, setShowClosed] = useState(true);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
   const cols = STAGES.filter((s) => showClosed || s.id !== "closed");
@@ -7031,6 +7187,18 @@ function PipelineView() {
         subtitle="Glissez une carte pour changer d'étape, ou ouvrez-la pour la déplacer au clavier."
         actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
       />
+      <Card className="p-4 mb-6 flex flex-wrap items-center gap-3">
+        <span className={`w-9 h-9 rounded-xl flex items-center justify-center ${T.sub}`}><MailCheck className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /></span>
+        <div className="flex-1 min-w-48">
+          <div className="text-sm font-medium">Surveillance Gmail</div>
+          <div className={`text-xs ${T.muted}`}>
+            {monitoredCount} candidature(s) suivie(s) · vérifié {relTime(settings.lastReplyCheckAt)} · {settings.autoReplies ? `automatique à l'ouverture, toutes les ${settings.autoRepliesHours} h` : "vérification manuelle"} · accusés ATS, réponses, invitations, refus, candidatures non suivies · lecture seule
+          </div>
+        </div>
+        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={!!settings.autoReplies} onChange={(e) => setSettings((x) => ({ ...x, autoReplies: e.target.checked }))} />Auto</label>
+        {pendingMail > 0 && <Btn variant="primary" icon={Inbox} onClick={() => setReplyOpen(true)}>{pendingMail} à valider</Btn>}
+        <Btn icon={RefreshCw} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
+      </Card>
       {apps.length === 0 ? (
         <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre ou lancez une candidature spontanée." action={<div className="flex flex-wrap justify-center gap-2"><Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn></div>} /></Card>
       ) : (
@@ -7055,6 +7223,9 @@ function PipelineView() {
                   {list.map((a) => {
                     const o = offerOf(a);
                     const ns = nextStep(a);
+                    const le = lastEmail(a);
+                    const sil = silenceDays(a);
+                    const waiting = inbox.replies.some((r) => r.appId === a.id);
                     return (
                       <li key={a.id}>
                         <button
@@ -7079,6 +7250,9 @@ function PipelineView() {
                             {a.closed && <Chip tone={a.closed.outcome === "accepted" ? "ok" : "neutral"}>{OUTCOME_LABEL[a.closed.outcome]}</Chip>}
                             {Object.keys(a.docs || {}).length > 0 && <Chip><FileText className="w-3 h-3" aria-hidden="true" />{Object.keys(a.docs).length} doc.</Chip>}
                             {ns && <Chip tone={ns.urgent ? "danger" : "neutral"}><Clock className="w-3 h-3" aria-hidden="true" />{ns.text}</Chip>}
+                            {waiting && <Chip tone="accent"><Inbox className="w-3 h-3" aria-hidden="true" />e-mail à valider</Chip>}
+                            {le && <Chip tone={le.kind === "refus" ? "danger" : ["invitation_entretien", "offre"].includes(le.kind) ? "ok" : "neutral"}><Mail className="w-3 h-3" aria-hidden="true" />{(REPLY_KINDS[le.kind] || "E-mail").toLowerCase()} · {relDay(le.date || le.at)}</Chip>}
+                            {sil !== null && sil >= (settings.ghostDays || 21) && <Chip tone="warn">sans nouvelles · {sil} j</Chip>}
                           </div>
                         </button>
                       </li>
@@ -7210,39 +7384,73 @@ function DupeReviewModal({ groups, setGroups, onApply, offers, apps }) {
   );
 }
 
-function ReplyReviewModal({ replies, setReplies, onResolve, apps, offers }) {
+function ReplyReviewModal({ open, onClose, inbox, setInbox, onResolve, onResolveUntracked, apps, offers }) {
   const T = useT();
-  if (!replies) return null;
-  const ACTIONS = { log: "Journaliser seulement", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
+  if (!open) return null;
+  const replies = inbox.replies || [];
+  const untracked = inbox.untracked || [];
+  const ACTIONS = { log: "Journaliser seulement", sent: "Marquer « Envoyée » (date de l'e-mail)", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
+  const setAction = (id, action) => setInbox((ib) => ({ ...ib, replies: ib.replies.map((x) => (x.id === id ? { ...x, action } : x)) }));
   return (
-    <Modal open wide onClose={() => setReplies(null)} title={`Réponses détectées (${replies.length})`}>
-      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Validez chaque réponse : elle sera ajoutée au journal et l'étape n'avancera que si vous le choisissez. Les relances en attente sont annulées en cas d'entretien, d'offre ou de refus.</p>
-      <ul className="space-y-3">
-        {replies.map((r) => {
-          const app = apps.find((a) => a.id === r.appId);
-          const o = offers.find((x) => x.id === app?.offerId);
-          return (
-            <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
-                <Chip tone={r.kind === "refus" ? "danger" : r.kind === "invitation_entretien" || r.kind === "offre" ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
-                {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
-              </div>
-              <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
-              <div className="text-sm mt-2">« {r.subject} »</div>
-              {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
-              {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
-              <div className="flex flex-wrap items-center gap-2 mt-3">
-                <Select value={r.action} onChange={(e) => setReplies(replies.map((x) => (x.id === r.id ? { ...x, action: e.target.value } : x)))} aria-label="Action" className="h-8 text-xs">
-                  {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                </Select>
-                <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
-                <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
+    <Modal open wide onClose={onClose} title={`E-mails détectés (${replies.length + untracked.length})`}>
+      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Rien n'est appliqué sans votre validation ; les relances en attente sont annulées en cas d'entretien, d'offre ou de refus. Les e-mails non traités restent ici jusqu'à votre décision.</p>
+      {!replies.length && !untracked.length && <Empty icon={MailCheck} title="Tout est traité" text="Aucun e-mail en attente de validation." />}
+      {replies.length > 0 && (
+        <>
+          <SectionTitle>Réponses aux candidatures suivies</SectionTitle>
+          <ul className="space-y-3 mb-6">
+            {replies.map((r) => {
+              const app = apps.find((a) => a.id === r.appId);
+              const o = offers.find((x) => x.id === app?.offerId);
+              return (
+                <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
+                    <Chip tone={r.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(r.kind) ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
+                    {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
+                  </div>
+                  <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
+                  <div className="text-sm mt-2">« {r.subject} »</div>
+                  {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
+                  {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
+                  <div className="flex flex-wrap items-center gap-2 mt-3">
+                    <Select value={r.action} onChange={(e) => setAction(r.id, e.target.value)} aria-label="Action" className="h-8 text-xs">
+                      {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                    </Select>
+                    <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
+                    <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
+                    {gmailLink(r) && <ExtLink href={gmailLink(r)} className="text-xs">Gmail</ExtLink>}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      {untracked.length > 0 && (
+        <>
+          <SectionTitle>Candidatures envoyées hors de Radar</SectionTitle>
+          <ul className="space-y-3">
+            {untracked.map((u) => (
+              <li key={u.id} className={`rounded-2xl p-4 ${T.sub}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{u.title || "Poste non précisé"} · {u.company}</span>
+                  <Chip tone={u.kind === "refus" ? "danger" : "accent"}>{REPLY_KINDS[u.kind] || "E-mail"}</Chip>
+                  {!u.verified && <Chip tone="warn">à vérifier</Chip>}
+                </div>
+                <div className={`text-xs mt-1 ${T.muted}`}>{show(u.from)} · {u.date ? fmtDate(u.date) : NC}</div>
+                <div className="text-sm mt-2">« {u.subject} »</div>
+                {u.summary && <div className={`text-sm mt-1 ${T.muted}`}>{u.summary}</div>}
+                <div className="flex flex-wrap items-center gap-2 mt-3">
+                  <Btn size="sm" variant="primary" icon={Plus} onClick={() => onResolveUntracked(u, true)}>Ajouter au pipeline</Btn>
+                  <Btn size="sm" variant="ghost" onClick={() => onResolveUntracked(u, false)}>Ignorer</Btn>
+                  {gmailLink(u) && <ExtLink href={gmailLink(u)} className="text-xs">Gmail</ExtLink>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </Modal>
   );
 }
@@ -7318,6 +7526,7 @@ function AppDrawer({ id, tab, setTab, onClose }) {
             { id: "track", label: "Suivi" },
             { id: "docs", label: "Dossier", count: Object.keys(app.docs || {}).length || undefined },
             { id: "followups", label: "Relances", count: fuPending || undefined },
+            { id: "emails", label: "E-mails", count: (app.emails || []).length || undefined },
             { id: "prep", label: "Entretien" },
             { id: "contacts", label: "Contacts", count: (app.contactIds || []).length || undefined },
           ]}
@@ -7326,9 +7535,42 @@ function AppDrawer({ id, tab, setTab, onClose }) {
       {tab === "track" && <TrackPanel app={app} offer={offer} />}
       {tab === "docs" && <DossierPanel app={app} offer={offer} />}
       {tab === "followups" && <AppFollowUps app={app} offer={offer} />}
+      {tab === "emails" && <EmailsPanel app={app} />}
       {tab === "prep" && <PrepPanel app={app} offer={offer} />}
       {tab === "contacts" && <AppContacts app={app} />}
     </Drawer>
+  );
+}
+
+/* E-mails rattachés à la candidature (validés depuis la surveillance Gmail), avec lien vers le fil. */
+function EmailsPanel({ app }) {
+  const T = useT();
+  const { checkReplies, busy, settings } = useApp();
+  const list = [...(app.emails || [])].sort((a, b) => new Date(b.date || b.at) - new Date(a.date || a.at));
+  const silent = silenceDays(app);
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={`text-xs ${T.faint}`}>Gmail vérifié {relTime(settings.lastReplyCheckAt)} · lecture seule</span>
+        <Btn size="sm" icon={MailCheck} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
+      </div>
+      {silent !== null && silent >= (settings.ghostDays || 21) && <Notice tone="warn" icon={Clock}>Sans nouvelles depuis {silent} jours. Relancez une dernière fois ou clôturez avec l'issue « Sans réponse ».</Notice>}
+      {!list.length ? <Empty icon={Mail} title="Aucun e-mail rattaché" text="Les réponses validées depuis la surveillance Gmail apparaissent ici, avec un lien vers le fil." /> : (
+        <ul className="space-y-2">
+          {list.map((m) => (
+            <li key={m.id} className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Chip tone={m.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(m.kind) ? "ok" : "neutral"}>{REPLY_KINDS[m.kind] || "E-mail"}</Chip>
+                <span className={`text-xs ${T.muted}`}>{m.date ? fmtDate(m.date) : NC} · {show(m.from)}</span>
+              </div>
+              <div className="text-sm mt-2">« {m.subject} »</div>
+              {m.summary && <div className={`text-sm mt-1 ${T.muted}`}>{m.summary}</div>}
+              {gmailLink(m) && <div className="mt-2"><ExtLink href={gmailLink(m)}>Ouvrir dans Gmail</ExtLink></div>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -8105,6 +8347,26 @@ function ExportModal({ app, offer, onClose, current }) {
         </div>
       </div>
     </Modal>
+  );
+}
+
+/* Consommation de la session : appels, jetons et coût indicatif par niveau de modèle (version « chat »). */
+function UsageMeter() {
+  const T = useT();
+  const u = useUsage();
+  if (RT.mode === "published" || !u.calls) return null;
+  const rows = Object.entries(u.byTier);
+  const cost = rows.reduce((n, [, t]) => { const pr = MODEL_PRICE[t.model]; return pr ? n + (t.input * pr[0] + t.output * pr[1]) / 1e6 : n; }, 0);
+  const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1).replace(".", ",")} M` : n >= 1e3 ? `${Math.round(n / 1e3)} k` : String(n));
+  return (
+    <div className={`mt-4 rounded-2xl p-4 text-xs ${T.sub}`}>
+      <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2"><span className="font-medium text-sm">Consommation de la session</span><span className={T.muted}>{u.calls} appel(s) · ≈ {cost.toFixed(2).replace(".", ",")} $</span></div>
+      <table className="w-full tabular-nums">
+        <thead><tr className={T.faint}><th className="text-left font-normal">Niveau</th><th className="text-left font-normal">Modèle</th><th className="text-right font-normal">Appels</th><th className="text-right font-normal">Entrée</th><th className="text-right font-normal">Sortie</th></tr></thead>
+        <tbody>{rows.map(([k, t]) => <tr key={k}><td>{TIER_LABEL[k] || k}</td><td className={T.muted}>{t.model}</td><td className="text-right">{t.calls}</td><td className="text-right">{fmt(t.input)}</td><td className="text-right">{fmt(t.output)}</td></tr>)}</tbody>
+      </table>
+      {u.cacheRead > 0 && <div className={`mt-2 ${T.faint}`}>{fmt(u.cacheRead)} jetons relus depuis le cache de prompt.</div>}
+    </div>
   );
 }
 
@@ -9983,7 +10245,7 @@ function FollowupsView() {
       <PageHeader
         title="Relances & agenda"
         subtitle={`L'IA rédige chaque relance en brouillon ; vous relisez, puis créez le brouillon Gmail et le rappel d'agenda. Réponses vérifiées ${relTime(settings.lastReplyCheckAt)}.`}
-        actions={<Btn icon={MailCheck} loading={busy.replies} onClick={checkReplies}>Vérifier les réponses (Gmail)</Btn>}
+        actions={<Btn icon={MailCheck} loading={busy.replies} onClick={() => checkReplies()}>Vérifier les réponses (Gmail)</Btn>}
       />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-8">
@@ -10812,10 +11074,15 @@ function PrivacyView() {
             </Notice>
           )}
           {test && test.state !== "loading" && <Notice tone={test.state === "ok" ? "ok" : "danger"} className="mb-4">{test.text}</Notice>}
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Modèle"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
+          <Toggle checked={settings.routing !== false} onChange={(v) => set("routing", v)} label="Choisir le modèle selon la tâche (recommandé)" description="Rédaction du CV et de la lettre, scoring, analyse d'annonce : modèle profond. Recherche, Gmail, traduction, relances : équilibré. Doublons, synonymes, priorisation : rapide. Version publiée : niveaux quick / default / complex de claude.ai." />
+          <Toggle checked={settings.effortTuning !== false} onChange={(v) => set("effortTuning", v)} label="Effort adapté à la tâche" description="Effort bas sur les tâches simples : réponses plus rapides, moins de jetons (version « chat »)." />
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <Field label="Profond (CV, lettre, scoring)"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
             <Field label="Modèle de repli"><Input value={settings.fallbackModel} onChange={(e) => set("fallbackModel", e.target.value.trim())} /></Field>
+            <Field label="Équilibré (recherche, Gmail, traduction)"><Input value={settings.modelBalanced} onChange={(e) => set("modelBalanced", e.target.value.trim())} /></Field>
+            <Field label="Rapide (tri, synonymes)"><Input value={settings.modelFast} onChange={(e) => set("modelFast", e.target.value.trim())} /></Field>
           </div>
+          <UsageMeter />
           <Field label="URL MCP Gmail" className="mt-3"><Input value={settings.mcp.gmail} onChange={(e) => set("mcp", { ...settings.mcp, gmail: e.target.value.trim() })} /></Field>
           <Field label="URL MCP Google Calendar" className="mt-3"><Input value={settings.mcp.gcal} onChange={(e) => set("mcp", { ...settings.mcp, gcal: e.target.value.trim() })} /></Field>
           <Field label="Format de connexion MCP" className="mt-3" hint="« Auto » essaie le format des artefacts claude.ai puis le format API récent.">
