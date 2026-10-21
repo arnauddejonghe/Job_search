@@ -3,30 +3,11 @@
 Artefact React en un seul fichier : [`radar-emploi.jsx`](radar-emploi.jsx).
 L'IA collecte, score et prépare ; vous validez tout ce qui sort en votre nom.
 
-Audit, benchmark, solutions et arbitrages de la version 3 : [`docs/AUDIT-v3.md`](docs/AUDIT-v3.md).
-
-## Nouveautés v3
-
-| Domaine | Ce qui change |
-|---|---|
-| **Studio CV & lettre** | Éditeur plein écran : contenu, structure et qualité à gauche, pages A4 au centre, design à droite. 7 modèles (Classique ATS, Moderne, Exécutif, Minimal, Compact, Créatif, Élégant) réglables en direct : polices des titres et du texte, taille, interligne, taille du nom et des titres, casse et espacement des lettres, marges par côté, fond de colonne et bandeau **bord à bord**, espacements, couleurs (accent, texte, filets, colonne, bandeau), style et **épaisseur des traits**, puces, **icônes** des coordonnées et des sections, dates à droite, compétences en étiquettes, une ou deux colonnes, format A4 ou Letter. |
-| **Édition directe** | Clic sur un bloc de l'aperçu pour l'éditer sur place (déplacer, dupliquer, supprimer). Survol d'une section : monter, descendre, **changer de colonne**, masquer. Glisser-déposer des sections dans l'onglet Structure. Annuler / rétablir (Ctrl+Z, Ctrl+Maj+Z), Ctrl+S. |
-| **Photo** | Import, recadrage (glisser, zoom, rotation), formes cercle, arrondi, carré et hexagone, bordure (épaisseur, couleur), taille, position (en-tête ou colonne). Stockée localement, jamais envoyée à l'IA. |
-| **Ce que l'on voit est ce qui part** | Un seul moteur de mise en page (positions en mm) produit l'aperçu SVG, le **PDF vectoriel** (texte sélectionnable, lisible par les ATS) et le **Word .docx natif** (styles Titre 1 / Titre 2, colonnes en tableau, photo dans sa forme). |
-| **Multilingue** | Traduction des CV et lettres en **FR / NL / EN / DE** (structure, faits et chiffres conservés, formules belges). Une version par langue, éditable dans le Studio. |
-| **Export** | Documents × langues × formats (PDF, Word, ou les deux). Regroupement : un fichier par langue (CV + lettre), **tout fusionné** en un seul fichier (signets PDF), ou fichiers séparés livrés en **ZIP**. Word « fidèle au design » ou « ATS 1 colonne ». Les traductions manquantes sont générées à la demande. |
-| **Qualité** | Score local, sans token : coordonnées, accroche, quantification, verbes d'action, clichés FR/NL/EN/DE, première personne, longueur, dates, sections, éléments à compléter, lisibilité, photo et anglais, correspondance aux mots-clés de l'annonce (mots entiers). |
-| **Pipeline et Gmail** | Vérification **automatique à l'ouverture** (intervalle réglable) et bouton « Vérifier maintenant » dans le pipeline. Recherche **incrémentale** depuis la dernière vérification, requête Gmail construite par l'application (entreprises suivies, contacts, expéditeurs ATS). Détecte réponses, **accusés de réception des ATS** et de LinkedIn ou Indeed (la candidature passe en « Envoyée » à la vraie date), invitations, tests, offres, refus, et les **candidatures envoyées hors de Radar** (ajout au pipeline en un clic). Les e-mails en attente restent dans une boîte à valider. Onglet « E-mails » par candidature avec lien vers le fil Gmail, badges sur les cartes, alerte **« sans nouvelles depuis N jours »** et issue « Sans réponse ». |
-| **Clarté des offres** | Fiche « décision d'abord » : verdict calculé (Postuler, À creuser, Passer), résumé en français quelle que soit la langue de l'annonce, faits normalisés (contrat, jours de télétravail, fourchette salariale, langues exigées, équipe, rattachement, séniorité), ce qui n'est pas précisé, principales forces, écarts et alertes. Onglets Analyse, Annonce (missions, exigences, atouts) et Sources. Filtre par verdict, résumé dans la liste, **comparateur** de 2 à 4 offres. |
-| **Entretien** | Entraînement : réponse écrite à une question probable, note sur 5, structure STAR, forces, améliorations, réponse améliorée sans faits inventés. |
-| **IA plus sobre** | Routage par tâche : profond (Opus 5.5 : scoring, CV, recherche web), équilibré (Sonnet 5.5 : traduction, Gmail, relances, entraînement), rapide (Haiku 5.5 : priorisation, synonymes, doublons, réparation JSON). Effort bas sur les tâches simples. **Cache de prompt** du profil et des critères entre les lots de scoring (premier lot seul, les suivants relisent le cache). **Re-pondération locale** : si seuls les poids des souhaits changent, aucun appel IA. Consommation de la session affichée. |
-| **Correctifs** | Notes employeur incluses dans l'export, l'import et la réinitialisation ; chargement des données en parallèle ; allègement des offres écartées anciennes ; domicile du profil utilisé dans les prompts ; caractères hors Windows-1252 translittérés dans le PDF (Dvořák → Dvorak). |
-
 ## Utilisation
 
 1. Dans claude.ai, créez un artefact React et collez le contenu de `radar-emploi.jsx`.
-2. Activez les connecteurs **Gmail** et **Google Calendar** pour l'artefact (import des alertes, surveillance des réponses, brouillons, rappels).
-3. Au premier lancement, des données **« exemple »** sont affichées, dont un CV et une lettre ouvrables dans le Studio. Supprimez-les dans *Confidentialité & données*.
+2. Activez les connecteurs **Gmail** et **Google Calendar** pour l'artefact (import des alertes, brouillons, rappels).
+3. Au premier lancement, des données **« exemple »** sont affichées. Supprimez-les dans *Confidentialité & données*.
 4. Renseignez *Profil & critères* (CV collé, réalisations chiffrées), puis cliquez sur **Lancer la veille** ou utilisez `⌘K` / `Ctrl+K`.
 
 ### Deux façons de l'utiliser
@@ -34,9 +15,8 @@ Audit, benchmark, solutions et arbitrages de la version 3 : [`docs/AUDIT-v3.md`]
 | | Page publiée (lien claude.ai/artifact) | Artefact dans une conversation claude.ai |
 |---|---|---|
 | Sauvegarde | Espace privé de la page (capacité `db`, visible de vous seul) | `window.storage` |
-| IA | Votre compte claude.ai (capacité `sample`, autorisation au premier appel ; claude.ai choisit le modèle) | API Claude depuis l'artefact, avec routage des modèles |
+| IA | Votre compte claude.ai (capacité `sample`, autorisation au premier appel) | API Claude depuis l'artefact |
 | Gmail / Agenda | Vos connecteurs claude.ai (capacité `mcp` : lecture Gmail, brouillons, création d'événements) | Serveurs MCP dans l'appel API |
-| Téléchargements (PDF, Word, ZIP) | Capacité `downloads` | Lien de téléchargement du navigateur |
 | Veille web | Par la **Routine « Radar – veille emploi »** : du lundi au vendredi à 7 h 47 et à chaque clic sur « Lancer la veille » (connecteur Claude Code Remote). Un assistant Claude cherche sur le web avec vos critères et vos sources (jamais votre profil), puis dépose les offres dans `veille_inbox` ; la page les importe et les dédoublonne | Disponible (`web_search`) |
 
 Le même fichier détecte l'environnement au chargement.
@@ -47,108 +27,175 @@ Dans la page publiée, la base partagée contient `veille/config` (critères et 
 
 | Module | Rôle |
 |---|---|
-| Profil & critères | Profil, CV texte, critères à 3 niveaux (indispensables, souhaités pondérés 1-5, exclusions), signaux d'alerte, mots-clés FR/NL/EN. Critères **versionnés** : diff entre versions, restauration, veille relancée avec une ancienne version. Un changement de poids seul est recalculé localement. |
-| Sources & collecte | 15 sources pré-configurées (jobs boards, services publics, cabinets) et 44 grands employeurs belges, entreprises cibles, import des alertes Gmail, import manuel (URL ou texte), import d'offres JSON. Normalisation, dédoublonnage local et **détection IA des doublons** avec fusion validée et annulable, horodatage par source. |
-| Scoring IA | Score 0-100, décomposition par critère, points forts, écarts, questions, drapeaux rouges avec preuve textuelle, niveau de confiance, résumé en français, faits normalisés, exigences et missions. Plafonds appliqués côté client (indispensable manquant ≤ 45, exclusion ≤ 20). Verdict calculé localement. |
-| Vue d'ensemble | KPIs, « À faire aujourd'hui » (relances dues, entretiens, e-mails à valider, candidatures sans nouvelles ; repriorisable par l'IA), meilleures offres, entonnoir, volume par source, score moyen par semaine. |
-| Offres | Liste filtrable (verdict, score, trajet, source, statut), tri rapide au clavier, fiche « décision d'abord » à onglets, notes employeur, comparateur. |
-| Pipeline | Kanban en 8 colonnes, glisser-déposer, clôture avec issue (dont « Sans réponse ») et motif, journal horodaté, **surveillance Gmail** et signaux e-mail sur les cartes. |
-| Assistant candidature & **Studio** | CV et lettre mis en page (Studio), message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable avec consigne, versionné par langue, traduisible et exportable. |
-| Relances & agenda | Règles J+7 / J+14 après envoi et J+2 après entretien (paramétrables). Rédaction IA, brouillon Gmail, rappel dans l'agenda. Fiche de préparation d'entretien sourcée (web_search), STAR, questions, négociation, **entraînement**. |
-| Contacts | Recruteurs, cabinets, hiring managers et réseau, liés aux candidatures (destinataires des brouillons, signaux pour la surveillance Gmail). |
-| Confidentialité & données | Mode discret (aperçu + confirmation avant toute écriture Google), alerte si l'employeur actuel est cité, titres d'agenda neutres, écran masquable, routage des modèles, cache, effort, consommation, export/import JSON, allègement, réinitialisation. |
+| Profil & critères | Profil, CV texte, critères à 3 niveaux (indispensables, souhaités pondérés 1-5, exclusions), signaux d'alerte, mots-clés FR/NL/EN. Critères **versionnés** : diff entre versions, restauration, veille relancée avec une ancienne version. |
+| Sources & collecte | 15 sources pré-configurées (jobs boards, services publics, cabinets), entreprises cibles, import des alertes Gmail, import manuel (URL ou texte), **import d'offres JSON** (veille produite ailleurs). Normalisation, dédoublonnage local (URL canonique ou entreprise + intitulé proches), **détection IA des doublons** (employeur anonymisé, intitulé traduit ou reformulé) avec fusion validée et **annulable**, horodatage par source. Option de **veille automatique à l'ouverture** si la dernière collecte est ancienne (désactivée par défaut). |
+| Scoring IA | Score 0-100, décomposition par critère, points forts, écarts, questions, drapeaux rouges avec preuve textuelle, niveau de confiance. Plafonds appliqués côté client (indispensable manquant ≤ 45, exclusion ≤ 20). Recalcul automatique quand une nouvelle version de critères est enregistrée. |
+| Vue d'ensemble | KPIs, « À faire aujourd'hui » (repriorisable par l'IA), meilleures offres, entonnoir, volume par source, score moyen par semaine. |
+| Pipeline | Kanban en 8 colonnes, glisser-déposer (ou sélecteur d'étape au clavier), clôture avec issue et motif, journal horodaté. |
+| Assistant candidature | **Studio CV & lettre plein écran** (voir ci-dessous), message LinkedIn (≤ 300 caractères), réponses au formulaire, e-mail → brouillon Gmail. Chaque document est éditable, régénérable (avec consigne) et versionné. |
+| Relances & agenda | Règles J+7 / J+14 après envoi et J+2 après entretien (paramétrables). Rédaction IA, brouillon Gmail, rappel dans l'agenda. **Détection des réponses des recruteurs dans Gmail** (lecture seule) : chaque réponse est proposée avec une action (journal, entretien, offre, refus) à valider ; les relances devenues inutiles sont annulées. Fiche de préparation d'entretien sourcée (web_search), STAR, questions, négociation. |
+| Contacts | Recruteurs, cabinets, hiring managers et réseau, liés aux candidatures (destinataires des brouillons). |
+| Confidentialité & données | Mode discret (aperçu + confirmation avant toute écriture Google), alerte si l'employeur actuel est cité, titres d'agenda neutres, écran masquable, export/import JSON, réinitialisation. |
 
-### Moteur de documents
+### Studio CV & lettre
 
-```
-balisage léger ──parseDoc──▶ blocs (lignes sources l0..l1) ──docModel──▶ en-tête + sections (clés canoniques FR/NL/EN/DE)
-                                                                        │
-                                       design (gabarit + réglages + ordre/colonnes/masquage)
-                                                                        ▼
-                                                     layoutDocument : pages, opérations en mm, zones cliquables
-                                                      ├─ PageSvg  → aperçu et vignettes
-                                                      ├─ buildPdf → jsPDF (Helvetica / Times / Courier, photo découpée en vectoriel, signets)
-                                                      └─ buildDocx → OOXML natif (indépendant de la mise en page, même design)
-```
+Ouvert depuis la fiche candidature (onglet *Dossier*), l'Assistant, la palette `⌘K` ou « À faire aujourd'hui ». Il occupe tout l'écran.
 
-La mesure du texte utilise le canvas avec des polices métriquement compatibles (Arial ≈ Helvetica, Times New Roman ≈ Times), ce qui fait coïncider coupures de ligne et de page entre l'aperçu et le PDF. Le .docx et le ZIP sont écrits sans bibliothèque (ZIP « stocké »).
+| Zone | Rôle |
+|---|---|
+| Éditeur structuré | En-tête (nom, **ligne de positionnement** sous le nom, coordonnées ; destinataire, lieu et date pour la lettre), puis une carte par section : paragraphes, puces, postes (Fonction · Organisation · Lieu · Période + puces), libellés (« Compétences : … »). Entrée crée la puce suivante, un collage multiligne est découpé, outils flottants pour monter / descendre / supprimer. Sections ajoutables (Profil, Réalisations clés, Certifications…). |
+| Aperçu A4 | Mêmes métriques que le PDF (Helvetica, tailles en points, marges en mm, pagination par blocs sans titre orphelin). Nombre de pages en direct, zoom, couleur d'accent. Un clic sur un passage ouvre la section correspondante dans l'éditeur. Les « [à compléter] » sont surlignés. |
+| Optimisation | Score /100 (mots-clés ATS, impact ou pertinence, lisibilité) et statut « prêt à envoyer ». **Contrôles** instantanés et sans IA : titre sous le nom qui annonce le poste visé, profil rédigé comme si le poste était déjà occupé, intitulé exact absent, pronoms, clichés, affirmations non prouvées, puces sans chiffre ou à formule faible, répétitions, longueur, pages, sections manquantes, coordonnées, employeur actuel cité ; pour la lettre : objet, entreprise citée, demande d'entretien, phrases en « Je ». **Mots-clés** : couverture pondérée par importance, variantes tolérées (pluriel, accents, tirets, acronymes), section où chaque terme apparaît, « Intégrer » ou « Je l'ai » (ajout au profil). **IA** : relecture recruteur et corrections ciblées présentées en avant / après, appliquées une à une ou toutes. **Annonce** : texte complet modifiable et analyse (exigences, preuves, écarts). |
+| Versions | Brouillon enregistré automatiquement (rien n'est perdu en fermant), annuler / rétablir, `⌘S` pour enregistrer une version, régénération avec réglages (langue, ton, profil avec ou sans « je », 1 ou 2 pages, consigne). |
+
+Mise en page : *Édition*, *Côte à côte* ou *Aperçu* ; le panneau d'optimisation s'ouvre depuis le score dans la barre. Sur mobile, trois onglets (Éditer, Aperçu, Optimiser).
+
+**Sans offre : candidature spontanée ou CV de base**
+
+Bouton « CV ou lettre sans offre » (Assistant), « Candidature spontanée » (Pipeline) ou `⌘K`. On part d'un **rôle visé** :
+- *Candidature spontanée* : entreprise ciblée, site, interlocuteur et contexte facultatifs (« pourquoi cette entreprise », seule source de faits sur elle). Elle entre dans le pipeline (étape « En préparation », badge « spontanée ») avec relances et contacts. Documents par défaut : CV, lettre, message LinkedIn, e-mail.
+- *CV de base* : aucun employeur cité, document réutilisable (cabinet, LinkedIn, point de départ). Rangé dans l'Assistant, hors pipeline.
+
+L'analyse (`targetAnalysis`) déduit l'intitulé courant du rôle, 20 à 30 mots-clés habituels des annonces belges et les attentes du rôle, confrontés au profil. La lettre spontanée est plus courte (200 à 300 mots), ne mentionne jamais d'annonce et demande un échange de 20 à 30 minutes ; en mode CV de base, elle devient un modèle avec emplacements « [à compléter] ». Ces cibles sont exclues de la veille, du scoring, du dédoublonnage et des statistiques d'offres.
+
+**Génération en trois étapes**
+
+1. **Analyse de l'annonce** (`adAnalysis`), sur le texte complet collé ou importé (`offer.fullText`, à défaut le résumé) : intitulé exact et équivalents, 20 à 35 mots-clés ATS classés (catégorie, importance 1-3, variantes) et confrontés au profil (prouvé, transférable, absent, avec la preuve), exigences clés, angle de l'employeur, ligne de positionnement proposée, écarts. Mise en cache tant que l'annonce et le profil ne changent pas.
+2. **Rédaction du CV** (`cvWrite`) à partir de cette matrice : sous le nom, la fonction **réelle** et 2-3 expertises (jamais l'intitulé visé comme s'il était occupé) ; profil en trois temps (qui je suis aujourd'hui, preuves, le poste visé cité comme **objectif**) ; poste actuel au présent, postes passés au passé ; chaque mot-clé prouvé ou transférable d'importance 2-3 placé dans une phrase où il est démontré ; aucun mot-clé « absent ». Contrôle qualité et corrections ciblées.
+3. **Rédaction de la lettre ensuite, avec le CV en entrée** (`letterCore`) : voir « Lettre ≠ CV » ci-dessous. Contrôle qualité et corrections ciblées (`fixDoc`) : remplacements courts dont le texte d'origine doit exister à l'identique, sinon ignorés.
+
+**Lettre ≠ CV** — règle d'or : le CV prouve, la lettre explique.
+
+- **Trame** (250 à 320 mots ; 220 à 300 en spontanée) : appel · pourquoi vous (un fait propre à l'entreprise relié à une conviction) · pourquoi ce rôle, maintenant · une preuve **racontée** (une histoire de la banque) · méthode · demande d'échange. Au plus 2 chiffres, au plus 1 réalisation commune avec le CV (reformulée), 2 à 4 mots-clés, jamais deux phrases consécutives en « Je ». Test de substitution : toute phrase encore vraie pour un concurrent est réécrite. La sortie `used{}` (faits F1…, conviction, histoire, mots-clés, chiffres, réalisation commune) est conservée sur la version.
+- **Contrôle sans IA** : recouvrement de 4-grammes avec le CV (alerte > 15 %, blocage > 30 %), chiffres repris du CV (> 1 = alerte), plus de 2 chiffres, « pourquoi eux » absent ou non étayé, conviction absente, histoire absente, flatterie, enchaînements en « Je ». Plus de pénalité « lettre sans chiffre », plus d'injection de mots-clés dans la lettre.
+- **Score de la lettre** : spécificité 35 · complémentarité 25 · impact 20 · lisibilité 20. Deux jauges dans le studio : recouvrement avec le CV et spécificité. La relecture IA reçoit le CV et applique le test de substitution.
+
+**Motivations** (Profil & critères → *Motivations*, champ facultatif `profile.motivation`) : raison d'être, convictions, banque d'histoires, management, méthode, pourquoi maintenant, ce que vous cherchez, secteurs. **Entretien IA** de 10 questions (réponses conservées dans `profile.motivationAnswers`), puis `motivationDraft` range les réponses en **reformulant seulement** (tout chiffre absent des réponses est signalé) et propose 0 à 3 relances. Injecté dans la lettre, les messages (`dossier`), la réponse « Pourquoi nous ? » et la préparation d'entretien. **Jamais dans le CV.**
+
+**Règles d'écriture** (Profil & critères → *Règles d'écriture*, champ facultatif `profile.writingRules`) : injectées dans toutes les rédactions (CV, lettre, messages, corrections, relecture, réécriture de section, lignes de positionnement, relances, préparation d'entretien), prioritaires sur les consignes de style, jamais sur la vérité. Règles de départ à valider : généraliste de la transformation digitale (jamais « responsable CRM »), trilinguisme dans le Profil, master discret, preuves prioritaires, ton humble.
+
+**Pourquoi cette candidature** (carte du studio, avant génération ; champ facultatif `app.motivation`) : faits retenus (`factIds`), pourquoi eux (`whyCompany`), pourquoi ce rôle maintenant (`whyRole`), lien personnel, conviction et histoire choisies dans la banque, et **`employerNamed`** : réglage unique pour le CV et la lettre (nommé par son libellé exact, ou jamais nommé ; dans ce cas toute mention est bloquée au contrôle). Un choix vide s'écrit [à compléter] dans la lettre, ce qui bloque l'envoi.
+
+**Fiches entreprise** (`companyBriefs`, clé `radar:briefs`, une fiche par entreprise, valable **60 jours**) : faits d'une phrase, chacun avec son URL. Trois sources : `web_search` dans l'artefact (`companyBrief` ; un fait dont l'URL n'apparaît pas dans les résultats est écarté), la Routine dans la page publiée (tâche `{"task":"brief"}` à la demande, et file `veille/brief_queue` des candidatures actives à chaque passage → collection `veille_briefs`, même modèle que les notes employeur), ou une source collée avec son URL obligatoire (`briefFromText`). Les faits de l'annonce sont repris avec l'URL de l'annonce. **Un fait sans URL vérifiée est exclu.** La lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien utilisent la fiche ; la préparation réutilise ses faits et l'enrichit de ses propres faits vérifiés. La Routine cherche avec le nom de l'entreprise, jamais celui du candidat.
+
+**Apprentissage des corrections (6b)** : à chaque version enregistrée à la main, l'écart mot à mot avec la dernière version IA (`editDelta`, à partir de `wordDiff`) est mémorisé dans `profile.ruleLearning` (40 dernières corrections, hors données d'exemple). Après au moins 3 documents corrigés, *Règles d'écriture → Proposer des règles* (`learnRules`) propose 0 à 5 règles observées dans au moins 2 documents, avec leurs exemples. Elles arrivent **inactives** : une règle apprise n'est jamais activée seule.
+
+**CV maître par langue (6c)** et **puces verrouillées (6d)** : studio → panneau d'optimisation → onglet *Maître*. Le CV maître (`profile.masterCv.fr|nl|en`) sert de base : l'IA reçoit la consigne de ne modifier que la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences, et la page le **garantit** (`enforceMaster` : en-tête, postes, texte des puces, langues et formation repris du maître ; puces inventées écartées). Écarts avec le maître affichés en diff. Une puce verrouillée (`profile.lockedBullets`) est recopiée mot pour mot : restaurée si l'IA la reformule, et toute correction proposée qui la touche est écartée.
+
+**Mesures (7)** : carte *Mesures des dossiers* dans l'Assistant : date de génération, corrections manuelles du CV et de la lettre (part des mots modifiés, doit baisser ; tendance première moitié → seconde moitié), recouvrement lettre / CV, nombre de chiffres, ce que la lettre utilise (`used` : faits, conviction, histoire), étape atteinte.
+
+**Routine** : le prompt de la Routine « Radar – veille emploi » est versionné dans [`routines/radar-veille-emploi.md`](routines/radar-veille-emploi.md).
 
 ### Modèle de données (`window.storage`, une clé par collection)
 
 ```
-radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, fallbackModel, modelBalanced, modelFast, routing, promptCache, effortTuning,
-                  mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, autoReplies, autoRepliesHours, ghostDays,
-                  lastWatchAt, lastReplyCheckAt, lastReplyWindowAt, seenUntracked[], designDefault, … }
-radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], education[], certifications[], cvText }
+radar:settings  { theme, threshold, autoRescore, discreet, employerNames[], model, mcp{gmail,gcal}, restrictTools, mcpTools{…}, followUp{afterSend[], afterInterview}, lastWatchAt, … }
+radar:profile   { name, headline, home, summary, skills[], experiences[{role,org,period,highlights}], achievements[], languages[], cvText,
+                  motivation?{purpose, convictions[{id,text}], stories[{id,title,situation,action,result,lesson}], management, method, whyNow, lookingFor, sectors[]},
+                  motivationAnswers?{q1…}, writingRules?[{id,text,active,origin,evidence}], ruleLearning?{edits[], lastLearnAt},
+                  masterCv?{fr|nl|en: {text, at, sourceAppId}}, lockedBullets?[] }
 radar:criteria  { draft{…}, versions[{id,label,createdAt, roles[], zones[], maxCommute, remote, mustHave[], wishes[{label,weight}], exclusions[], redFlags[], keywords{fr,nl,en}}] }
 radar:sources   [{ id, name, kind, domains[], careersUrl, enabled, lastRunAt, lastCount, lastError }]
-radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, description, collectedAt,
-                   sources[{name,url,collectedAt,via,verified}], status,
-                   score{value,confidence,breakdown[],tldr,facts{contract,remoteDays,salaryMin,salaryMax,salaryPeriod,languages[],teamSize,reportsTo,seniority},
-                         must[],nice[],missions[],local,…,criteriaVersionId}, demo }]
-radar:apps      [{ id, offerId, stage, reached, sentAt, closed{outcome,reason}, docLanguage,
-                   docs{cv|letter|linkedin|answers|email: [versions{text,lang,format,origin,accent,keywords[],tips[],…}]},
-                   design{template, font, size, margin{t,r,b,l}, colors{…}, photo{show,shape,size,border,borderColor}, layout{order[],side[],hidden[]}, …},
-                   emails[{date,from,subject,kind,summary,threadId}], seenReplies[], practice[{question,answer,feedback}],
+radar:offers    [{ id, title, company, location, commute{minutes,basis}, contract, seniority, salary, remote, language, publishedAt, publishedApprox, deadline,
+                   description, fullText, spontaneous ("company" | "base" | absent), contactName, collectedAt, seenAt, link{state,evidence,at,method}, autoReason, autoRule, dismissedBy, userKept,
+                   sources[{name,url,collectedAt,via,verified}], status, score{method:2,value,wishAvg,mustAvg,fit,confidence,breakdown[{id,…}],caps,criteriaVersionId}, demo }]
+radar:apps      [{ id, offerId, kind ("spontaneous" | "base" | absent), stage, reached, sentAt, closed{outcome,reason}, docs{cv|letter|linkedin|answers|email: [versions]},
+                   analysis{jobTitle, titleVariants[], keywords[{term,category,importance,variants[],status,evidence}], requirements[], angle, positioning{…}, gaps[], sig},
+                   drafts{cv|letter: {text, accent, baseId, at}}, docPrefs{language,tone,voice,cvLength},
                    interviews[], followUps[{kind,due,status,draft}], prep{…}, contactIds[], log[{at,type,text}], demo }]
 radar:contacts  [{ id, name, role, company, type, email, linkedin, phone, notes, demo }]
-radar:ratings   { <entreprise>: { rating, reviews, source, url, note, seenAt } }
-radar:media     { photo: { src (JPEG recadré), original, crop{zoom,x,y,rot}, updatedAt } }
-radar:inbox     { replies[…], untracked[…] }   // e-mails détectés en attente de validation
+radar:briefs    { <entreprise-normalisée>: { company, summary, facts[{id,text,url,verified,source}], origin, createdAt, expiresAt } }
+app.motivation? { factIds[], whyCompany, whyRole, personalLink, convictionId, storyId, employerNamed }
 ```
 
 Les champs inconnus valent `null` et s'affichent « non communiqué ».
 
 ### Prompts internes (objet `P` dans le fichier)
 
-Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si besoin (un second appel rapide sans outil convertit le texte en JSON).
+Tous imposent une réponse **JSON stricte**, parsée puis réparée une fois si besoin (un second appel sans outil convertit le texte en JSON).
 
-| Prompt | Niveau | Outils | Sortie |
-|---|---|---|---|
-| `search` | profond | `web_search` restreint aux domaines de la source | `{offers[], notes}` |
-| `gmail` | équilibré | MCP Gmail, lecture | `{offers[], messagesRead}` |
-| `structure` | équilibré | `web_search` si seule une URL est fournie | `{found, offer}` |
-| `scoreContext` + `score` | profond, effort moyen, **contexte en cache** | aucun (lots de 5 offres) | `{scores[{id, score, confidence, tldr, facts, must, nice, missions, breakdown[], strengths, gaps, questions, redFlags}]}` |
-| `cvPro` | profond | aucun | `{language, accent, keywords, cv, letter, tips}` |
-| `dossier` | équilibré | aucun | `{linkedin, answers, email}` |
-| `translate` | équilibré, effort bas | aucun | `{text}` (même balisage) |
-| `followUp` | équilibré, effort bas | aucun | `{subject, body}` |
-| `prep` | profond | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
-| `practice` | équilibré | aucun | `{score, star, strengths, improvements, improved, seconds}` |
-| `replies` | équilibré | MCP Gmail, lecture | `{replies[{appId, threadId, kind, proposedStage, interviewAt…}], untracked[…]}` |
-| `gmailDraft`, `calendarEvent` | équilibré, effort bas | MCP (brouillon, événement) | `{created, …}` |
-| `dedupe`, `keywords`, `today` | rapide, effort bas | aucun | groupes de doublons ; synonymes FR/NL/EN ; ordre de priorité |
+| Prompt | Outils | Sortie |
+|---|---|---|
+| `search` | `web_search` restreint aux domaines de la source (`allowed_domains`) | `{offers[], notes}` |
+| `gmail` | MCP Gmail, outils de lecture uniquement | `{offers[], messagesRead}` |
+| `structure` | `web_search` si seule une URL est fournie | `{found, offer}` |
+| `score` | aucun (lots de 4 offres) | `{scores[{id, score, confidence, breakdown[], strengths, gaps, questions, redFlags}]}` |
+| `adAnalysis`, `targetAnalysis` (sans offre) | aucun | `{jobTitle, titleVariants, language, keywords[], requirements[], angle, companyFacts, positioning, gaps}` |
+| `cvWrite`, puis `letterWrite` → `letterCore` (CV en entrée, offre ou spontanée) | aucun | `{cv, accent, accentSource, tips}` ; `{letter, used{companyFacts, convictionId, storyId, keywords, numbers, sharedWithCv}}` |
+| `companyBrief` / `briefFromText` | `web_search` / aucun | `{summary, facts[{text, url}]}` |
+| `learnRules` | aucun | `{rules[{text, evidence, docs}]}` |
+| `motivationDraft` | aucun | `{purpose, convictions[], stories[], management, method, whyNow, lookingFor, sectors[], followUps[]}` |
+| `fixDoc`, `review` | aucun | `{edits[{before, after, reason}]}` ; `{verdict, score, strengths, edits[]}` |
+| `improveSection`, `headlines` | aucun | `{body, note}` ; `{options[{headline, angle}]}` |
+| `dossier` | aucun | `{language, linkedin, answers, email}` |
+| `followUp` | aucun | `{subject, body}` |
+| `prep` | `web_search` | `{company{facts[{text,sourceUrl}]}, likelyQuestions, star, questionsToAsk, negotiation, salaryBenchmark}` |
+| `gmailDraft` | MCP Gmail, `create_draft` uniquement | `{created, draftId}` |
+| `calendarEvent` | MCP Calendar, `create_event` / `list_calendars` | `{created, eventId}` |
+| `dedupe` | aucun (lots de 60 offres) | `{groups[{ids, confidence, reason}]}` |
+| `replies` | MCP Gmail, outils de lecture uniquement | `{replies[{appId, date, from, subject, kind, summary, proposedStage, interviewAt}]}` |
+| `keywords`, `today` | aucun | synonymes FR/NL/EN ; ordre de priorité |
 
-Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du domaine de la source est écartée. Un brouillon ou un événement n'est déclaré créé que si l'outil MCP a réellement été appelé. Les sources des faits d'entreprise sont vérifiées contre les résultats web. Un e-mail dont l'objet n'apparaît pas dans les e-mails réellement lus est marqué « à vérifier » ; un identifiant de fil absent des résultats est ignoré ; un e-mail déjà traité n'est jamais reproposé. Deux offres déjà présentes dans le pipeline ne sont jamais fusionnées. Si le proxy des artefacts refuse `cache_control` ou `output_config`, ces champs sont retirés pour la session, sans erreur visible.
+Garde-fous : une URL d'offre absente des résultats de recherche **et** hors du domaine de la source est écartée ; les autres sont marquées « URL vérifiée » ou « à vérifier ». Un brouillon ou un événement n'est déclaré créé que si l'outil MCP a réellement été appelé. Les sources des faits d'entreprise sont vérifiées contre les résultats web. Une réponse de recruteur dont l'objet n'apparaît pas dans les e-mails réellement lus est marquée « à vérifier » ; une réponse déjà traitée n'est jamais reproposée. Deux offres déjà présentes dans le pipeline ne sont jamais fusionnées.
 
 ## Automatisé, manuel, et pourquoi
 
 **Automatisé**
-- Recherche multi-sources via `web_search`, normalisation, estimation du trajet depuis le domicile, dédoublonnage et fusion des sources.
+- Recherche multi-sources via `web_search`, normalisation, estimation du trajet depuis Ohain, dédoublonnage et fusion des sources.
 - Extraction des offres depuis les alertes e-mail Gmail.
-- Scoring expliqué, faits normalisés, verdict, recalcul quand les critères changent (local si seuls les poids changent), priorisation du jour.
-- Surveillance Gmail du pipeline à l'ouverture (lecture seule, incrémentale).
-- Rédaction de tout le dossier, des traductions, des relances, de la fiche d'entretien et de l'évaluation des réponses d'entraînement.
-- Mise en page, contrôle qualité et export PDF / Word / ZIP.
+- Scoring expliqué, recalcul quand les critères changent, priorisation du jour.
+- Analyse de l'annonce, rédaction du dossier en trois étapes, contrôle qualité continu, relances et fiche d'entretien.
 - Création de brouillons Gmail et d'événements Google Calendar, **après votre clic** (et confirmation en mode discret).
+- Planification des relances selon les règles.
 
 **Manuel, par conception ou par contrainte**
 - **Envoi** des e-mails et des messages LinkedIn : jamais automatique. Les outils MCP exposés sont restreints à la lecture et à la création de brouillons.
-- **Soumission des formulaires** sur les sites employeurs et job boards : impossible depuis l'artefact (sites tiers, authentification). L'interface fournit le lien direct et le dossier exporté.
-- **Effet des e-mails détectés** : chaque réponse ou candidature non suivie est proposée avec une action (envoyée, entretien, offre, refus, ajout au pipeline) appliquée seulement après validation : une mauvaise interprétation ne doit pas clôturer une candidature.
+- **Soumission des formulaires** sur les sites employeurs et job boards : impossible depuis l'artefact (sites tiers, authentification). L'interface fournit le lien direct et le dossier prêt à copier.
 - **LinkedIn** : pas de collecte directe (scraping interdit). Les offres arrivent par les alertes e-mail ou par import manuel du texte.
-- **Accès direct aux sites d'emploi** : bloqué depuis l'artefact. La collecte dépend de l'indexation du moteur de recherche, d'où un décalage de quelques jours possible.
-- **Veille planifiée** : un artefact ne tourne pas en arrière-plan. En page publiée, la Routine planifiée s'en charge ; dans une conversation, la veille se lance à la main ou à l'ouverture.
+- **Accès direct aux sites d'emploi** : bloqué depuis l'artefact. La collecte dépend de l'indexation du moteur de recherche, donc un décalage de quelques jours est possible. Le texte collé reste la voie la plus fiable.
+- **Veille planifiée** : un artefact ne tourne pas en arrière-plan. La veille se lance à la main, ou automatiquement à l'ouverture si l'option est activée. Une veille produite ailleurs (tâche planifiée) peut être importée en JSON.
+- **Réponses des recruteurs** : détectées automatiquement, mais appliquées seulement après votre validation (une mauvaise interprétation ne doit pas clôturer une candidature).
 - **Temps de trajet** : ordre de grandeur (table locale ou estimation IA), pas un calcul d'itinéraire.
 
-## Historique
+## Version 3 — fiabilité, tri et qualité de la veille
 
-**Version 2** : veille sans intervention (lancement à l'ouverture, import JSON), déduplication sémantique assistée par l'IA, suivi des réponses dans Gmail.
+### Données : fin du blocage « Lecture des données impossible »
+- **Cause** : en v1, chaque collection était découpée en tranches de 180 000 caractères réécrites sur place. Une écriture interrompue (onglet fermé, quota, deux onglets ouverts) laissait une tranche neuve à côté d'anciennes, d'où `Expected ',' or ']' … position 180000` et l'enregistrement suspendu.
+- **Offres** : un document par offre (`data/users/<id>/radar_offers_v2/items/<offerId>`). Seules les offres modifiées sont réécrites (synchronisation par différence).
+- **Autres collections** : écriture atomique par génération (`<clé>__<gen>_<i>`), puis bascule du `__meta` avec somme de contrôle, puis suppression de l'ancienne génération.
+- **Réparation automatique** : une collection illisible est récupérée élément par élément (197 offres sur 197 récupérées sur les données réelles), une copie brute est conservée et l'enregistrement reprend. Un incident réseau ne bloque plus que le temps de « Réessayer ».
 
-**Version 3** : Studio CV & lettre, photo, export PDF / Word multilingue et fusionné, score qualité, surveillance Gmail automatique et incrémentale, clarté des offres et comparateur, entraînement à l'entretien, routage des modèles, cache et re-pondération locale (détail dans [`docs/AUDIT-v3.md`](docs/AUDIT-v3.md)).
+### Tri
+- Onglets **À traiter · Non lues · Arrivées (depuis la dernière visite, groupées par jour) · Échéances · Pipeline · Écartées · Expirées · Toutes**, avec compteurs.
+- Statut **lu / non lu** (pastille), bandeau « Depuis votre dernière visite » sur la vue d'ensemble.
+- **Actions de masse** : sélection multiple (Maj+clic pour une plage, « tout sélectionner » sur le filtre), puis écarter, expirées, remettre à traiter, lues, pipeline, scorer, vérifier les liens, fusionner, supprimer. Chaque action est **annulable**.
+- Actions rapides par ligne (retenir, écarter, expirée) et bouton « Lien mort (404) » dans la fiche.
 
-## Prochaines améliorations envisagées
+### Règles de tri automatique (modifiables, avec aperçu)
+Appliquées à chaque arrivée et à chaque ouverture, aux seules offres « à traiter » (jamais au pipeline ni aux offres restaurées) :
+intitulé exclu (junior, stage…), pas de poste de management, hors périmètre (digital / IT / CRM / transformation, complété par les postes visés), date limite dépassée, annonce clôturée, publiée depuis plus de 30 jours, date inconnue et collectée depuis plus de 21 jours, trajet trop long, score < 40. La raison est affichée sur l'offre, qui reste restaurable.
 
-1. **Calibration du scoring** à partir de vos décisions (offres retenues ou écartées) : proposition d'ajustement des poids, versionnée.
-2. **Statistiques par source et par critère** : taux de réponse, score moyen et délai de réponse par source, pour concentrer la veille sur ce qui rapporte.
-3. **Polices intégrées au PDF** (Inter, Roboto…) si l'environnement autorise leur téléchargement, et interface multilingue si l'outil est partagé.
+### Scoring systématique
+L'IA évalue **chaque critère** de la version active (identifiants M1, W1, X1, A1…) sur une grille fixe ; le score est **calculé par la page**, toujours avec la même formule : 55 % souhaités pondérés + 45 % indispensables, −5 par signal d'alerte (max −15), plafond 45 si un indispensable n'est pas rempli, plafond 20 si une exclusion est présente. Toute offre à traiter est scorée automatiquement dès son arrivée.
+
+### Doublons systématiques
+- Local, à chaque ouverture et arrivée : même URL, même identifiant d'annonce (LinkedIn, Indeed, StepStone, Glassdoor, Jobat), ou même entreprise + intitulé nettoyé (sans « (m/f/x) », lieu…). Fusion automatique, annulable.
+- IA, après chaque arrivée : confiance haute fusionnée directement (annulable), confiance moyenne à valider.
+
+### Offres mortes, dates de publication et dates limites
+- Champs `publishedAt` (date réelle, ou date de l'alerte e-mail marquée « ≈ ») et `deadline` (date limite de candidature) extraits partout ; colonnes, tri, onglet « Échéances » et carte « Dates limites proches ».
+- **Routine réécrite** : qualité avant quantité, filtre de pertinence avant dépôt, chaque candidate est ouverte (WebFetch) ou recherchée pour confirmer qu'elle est ouverte ; les annonces clôturées ne sont plus déposées.
+- **Vérification des offres suivies** : la page entretient `veille/verify_queue` (40 offres actives au plus) ; à chaque passage la Routine les vérifie et écrit `veille_verify/verify-*`. Les annonces clôturées passent en « Expirées ». Vérification à la demande depuis la sélection ou la fiche.
+- Limite : l'environnement de la Routine est en accès réseau « de confiance » ; WebFetch y est refusé pour les sites d'emploi et la vérification se replie sur la recherche web. Ajouter les domaines d'emploi aux domaines autorisés de l'environnement rend la vérification directe.
+
+## Réalisé en version 2
+
+1. **Veille sans intervention** : lancement automatique à l'ouverture (option) et import d'offres JSON produites par une tâche planifiée externe.
+2. **Déduplication sémantique assistée par l'IA** : propositions de fusion avec niveau de confiance, validation groupe par groupe, historique et annulation depuis la fiche de l'offre.
+3. **Suivi des réponses dans Gmail** : lecture seule, rattachement à la candidature, action proposée (entretien avec date extraite, offre, refus) appliquée après validation, relances annulées.
+
+## Trois améliorations prioritaires pour la version suivante
+
+1. **Routine quotidienne hors artefact** qui produit le fichier JSON de veille (et le dépose dans Drive ou Gmail) pour une collecte réellement autonome.
+2. **Calibration du scoring** à partir de vos décisions (offres retenues ou écartées) : proposition d'ajustement des poids des critères, versionnée comme le reste.
+3. **Statistiques par source et par critère** : taux de réponse et score moyen par source, critères les plus discriminants, pour concentrer la veille sur ce qui rapporte.

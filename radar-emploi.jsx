@@ -5,14 +5,14 @@
  * IA : API Claude appelée depuis l'artefact (web_search + serveurs MCP Gmail / Google Calendar).
  * Principe : l'IA prépare, l'utilisateur valide. Rien n'est envoyé sans action explicite.
  */
-import React, { useState, useEffect, useMemo, useRef, useCallback, useContext, createContext, useDeferredValue } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, useContext, createContext } from "react";
 import {
   LayoutDashboard, Briefcase, Columns, Sparkles, BellRing, Users, Radio, User, ShieldCheck, Search,
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
   CalendarPlus, Copy, Check, Trash2, Download, Upload, RotateCcw, Moon, Sun, Monitor, AlertTriangle,
-  Info, MapPin, Clock, List, LayoutList, Menu, History, FileText, RefreshCw, Building2, Inbox,
-  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Star, Palette, ChevronLeft,
-  RotateCw, Crop, GripVertical, ArrowUp, ArrowDown, ArrowLeftRight, Languages, FileDown, Redo2, ZoomIn, ZoomOut, Archive,
+  Info, Clock, Menu, History, FileText, RefreshCw, Building2, Inbox,
+  Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Palette, ChevronLeft, Filter, Link2, CalendarClock, CalendarDays, Unlink,
+  Maximize2, Minimize2, Redo2, ArrowUp, ArrowDown, Lightbulb, SlidersHorizontal, Circle, Minus,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -33,8 +33,7 @@ const KEYS = {
   apps: "radar:apps",
   contacts: "radar:contacts",
   ratings: "radar:ratings",
-  media: "radar:media",
-  inbox: "radar:inbox",
+  briefs: "radar:briefs",
 };
 
 const STAGES = [
@@ -53,7 +52,6 @@ const OUTCOMES = [
   { id: "refused", label: "Refus" },
   { id: "withdrawn", label: "Abandon" },
   { id: "accepted", label: "Acceptée" },
-  { id: "noresponse", label: "Sans réponse" },
 ];
 const OUTCOME_LABEL = Object.fromEntries(OUTCOMES.map((o) => [o.id, o.label]));
 const FU_KINDS = { relance1: "1re relance", relance2: "2e relance", merci: "Remerciement", custom: "Relance" };
@@ -66,9 +64,7 @@ const DOC_TYPES = [
 ];
 const DOC_LABEL = Object.fromEntries(DOC_TYPES.map((d) => [d.id, d.label]));
 const REPLY_KINDS = {
-  confirmation_candidature: "Candidature confirmée",
   accuse_reception: "Accusé de réception",
-  test_evaluation: "Test / évaluation",
   invitation_entretien: "Invitation à un entretien",
   refus: "Refus",
   demande_info: "Demande d'information",
@@ -76,17 +72,6 @@ const REPLY_KINDS = {
   autre: "Autre",
 };
 const CONTACT_TYPES = { recruiter: "Recruteur", agency: "Cabinet", hiring: "Hiring manager", network: "Réseau" };
-/* Expéditeurs des logiciels de recrutement (accusés de réception, invitations) et confirmations des job boards. */
-const ATS_SENDERS = ["myworkday.com", "workday.com", "smartrecruiters.com", "greenhouse.io", "lever.co", "teamtailor.com", "recruitee.com", "successfactors.com", "successfactors.eu", "taleo.net", "icims.com", "personio.de", "workablemail.com", "jobvite.com", "bamboohr.com", "softgarden.io", "join.com", "homerun.co", "cornerstoneondemand.com", "jobs-noreply@linkedin.com", "indeedapply.com", "indeed.com"];
-/* Silence d'une candidature envoyée : jours depuis le dernier signal (envoi, e-mail reçu, appel, entretien). */
-function silenceDays(a) {
-  if (!a || !["sent", "followup"].includes(a.stage) || !a.sentAt) return null;
-  const last = [a.sentAt, ...(a.emails || []).map((m) => m.date || m.at), ...(a.log || []).filter((l) => ["email", "call", "interview"].includes(l.type)).map((l) => l.at)]
-    .map((d) => new Date(d).getTime()).filter(Number.isFinite).reduce((m, x) => Math.max(m, x), 0);
-  return last ? Math.floor((Date.now() - last) / 864e5) : null;
-}
-const lastEmail = (a) => [...(a?.emails || [])].sort((x, y) => new Date(y.date || y.at) - new Date(x.date || x.at))[0] || null;
-const gmailLink = (m) => (m?.threadId ? `https://mail.google.com/mail/u/0/#all/${m.threadId}` : m?.subject ? `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(`subject:"${m.subject}"`)}` : null);
 
 const DEFAULT_SETTINGS = {
   theme: "system",
@@ -97,16 +82,6 @@ const DEFAULT_SETTINGS = {
   employerNames: ["FEB", "VBO", "Fédération des Entreprises de Belgique", "Verbond van Belgische Ondernemingen"],
   model: "claude-opus-5-5",
   fallbackModel: "claude-sonnet-5-5",
-  modelBalanced: "claude-sonnet-5-5",
-  modelFast: "claude-haiku-5-5",
-  routing: true,
-  effortTuning: true,
-  promptCache: true,
-  designDefault: null,
-  autoReplies: true,
-  autoRepliesHours: 12,
-  ghostDays: 21,
-  seenUntracked: [],
   mcpMode: "auto",
   mcp: { gmail: "https://gmail.mcp.claude.com/mcp", gcal: "https://gcal.mcp.claude.com/mcp" },
   restrictTools: true,
@@ -122,7 +97,6 @@ const DEFAULT_SETTINGS = {
   lastWatchAt: null,
   lastGmailImportAt: null,
   lastReplyCheckAt: null,
-  lastReplyWindowAt: null,
   autoWatch: false,
   autoWatchHours: 24,
   autoGmail: false,
@@ -131,6 +105,18 @@ const DEFAULT_SETTINGS = {
   autoNext: true,
   hideOlderThan: 45,
   sidebarCollapsed: false,
+  // v3 : tri automatique, scoring et dédoublonnage systématiques, vérification des liens
+  rules: null, // null = DEFAULT_RULES
+  autoScore: true,
+  autoScoreMax: 60,
+  autoDedupe: true,
+  autoDedupeAI: true,
+  lastAiDedupeAt: null,
+  autoVerify: true,
+  lastVerifyAt: null,
+  importedVerify: [],
+  lastVisitAt: null,
+  rulesAppliedV3: false,
 };
 
 const DEFAULT_PROFILE = {
@@ -366,27 +352,65 @@ function estimateCommute(location, aiMinutes) {
 }
 const commuteLabel = (c) => (c ? `~${c.minutes} min` : NC);
 
-/* Déduplication : même URL canonique, ou même entreprise + intitulés très proches. */
-function sameOffer(a, b) {
-  const ua = (a.sources || []).map((s) => canonicalUrl(s.url)).filter(Boolean);
-  const ub = (b.sources || []).map((s) => canonicalUrl(s.url)).filter(Boolean);
-  if (ua.some((u) => ub.includes(u))) return true;
-  const ca = companyKey(a.company), cb = companyKey(b.company);
-  if (!ca || !cb) return false;
-  const sameCo = ca === cb || (ca.length > 3 && cb.length > 3 && (ca.includes(cb) || cb.includes(ca)));
-  return sameCo && jaccard(tokens(a.title), tokens(b.title)) >= 0.6;
+/* Identifiant stable d'une annonce sur les grands sites (LinkedIn, Indeed, StepStone, Jobat…), quel que soit le format d'URL. */
+function jobKey(u) {
+  if (!u) return null;
+  let m;
+  const s = String(u).toLowerCase();
+  if ((m = s.match(/linkedin\.com\/(?:comm\/)?jobs\/view\/(?:[^/?#]*?-)?(\d{6,})/))) return `li:${m[1]}`;
+  if ((m = s.match(/linkedin\.com\/jobs\/.*[?&]currentjobid=(\d{6,})/))) return `li:${m[1]}`;
+  if ((m = s.match(/indeed\.[a-z.]+\/.*[?&](?:jk|vjk)=([0-9a-f]{12,})/))) return `in:${m[1]}`;
+  if ((m = s.match(/stepstone\.be\/.*?--(\d{6,})/))) return `st:${m[1]}`;
+  if ((m = s.match(/glassdoor\.[a-z.]+\/.*?jl=?(\d{6,})/))) return `gd:${m[1]}`;
+  if ((m = s.match(/jobat\.be\/.*?\/(\d{6,})/))) return `jb:${m[1]}`;
+  return null;
 }
-const FILLABLE = ["company", "location", "commute", "contract", "seniority", "salary", "remote", "language", "publishedAt"];
+/* Intitulé nettoyé pour comparer : sans (m/f/x), h/f, lieu ou référence en suffixe. */
+function cleanTitle(t) {
+  return normText(String(t || "")
+    .replace(/\((?:[mhfvwxd]\s*[/|,]\s*)+[mhfvwxd]\)|\b[mhfv]\s*\/\s*[mhfvwx](?:\s*\/\s*[xd])?\b/gi, " ")
+    .replace(/\s[-–|·]\s.*$/, " ")
+    .replace(/\b(ref|réf|job id)\b.*$/i, " "));
+}
+const realCompany = (c) => !!str(c) && !/confidenti|anonym|non communiqu|undisclosed|our client|notre client|onze klant|client final/i.test(c);
+const offerKeys = (o) => (o.sources || []).flatMap((s) => [canonicalUrl(s.url), jobKey(s.url)]).filter(Boolean);
+
+/* Déduplication : même URL ou même identifiant d'annonce ; ou même entreprise + intitulés proches ;
+   ou, employeur masqué (cabinet), intitulé identique et même lieu. */
+const FEAT = new WeakMap();
+function offerFeat(o) {
+  let f = FEAT.get(o);
+  if (!f) {
+    f = { keys: new Set(offerKeys(o)), toks: tokens(cleanTitle(o.title)), co: realCompany(o.company) ? companyKey(o.company) : "", loc: normText(o.location) };
+    FEAT.set(o, f);
+  }
+  return f;
+}
+function sameOffer(a, b) {
+  const fa = offerFeat(a), fb = offerFeat(b);
+  for (const k of fa.keys) if (fb.keys.has(k)) return true;
+  const sim = jaccard(fa.toks, fb.toks);
+  if (fa.co && fb.co) {
+    const sameCo = fa.co === fb.co || (fa.co.length > 3 && fb.co.length > 3 && (fa.co.includes(fb.co) || fb.co.includes(fa.co)));
+    return sameCo && sim >= 0.6;
+  }
+  return sim >= 0.85 && !!fa.loc && fa.loc === fb.loc;
+}
+const FILLABLE = ["company", "location", "commute", "contract", "seniority", "salary", "remote", "language", "publishedAt", "deadline"];
 function mergeOffers(existing, incoming) {
-  const list = existing.map((o) => ({ ...o }));
+  const list = [...existing]; // seules les offres touchées deviennent de nouveaux objets (sauvegarde différentielle)
   const added = [], merged = [];
   for (const inc of incoming) {
-    const hit = list.find((o) => sameOffer(o, inc));
-    if (hit) {
+    const hi = list.findIndex((o) => !o.spontaneous && sameOffer(o, inc));
+    if (hi >= 0) {
+      const hit = { ...list[hi] };
+      list[hi] = hit;
       const srcs = [...(hit.sources || [])];
       for (const s of inc.sources) if (!srcs.some((x) => canonicalUrl(x.url) === canonicalUrl(s.url) && x.name === s.name)) srcs.push(s);
       for (const k of FILLABLE) if ((hit[k] === null || hit[k] === undefined || hit[k] === "") && inc[k]) hit[k] = inc[k];
+      if (hit.publishedApprox && inc.publishedAt && !inc.publishedApprox) { hit.publishedAt = inc.publishedAt; delete hit.publishedApprox; }
       if (inc.description && (!hit.description || inc.description.length > hit.description.length)) hit.description = inc.description;
+      if (inc.fullText && !hit.fullText) hit.fullText = inc.fullText;
       hit.sources = srcs;
       hit.lastSeenAt = nowISO();
       if (!merged.includes(hit.id) && !added.includes(hit.id)) merged.push(hit.id);
@@ -398,6 +422,83 @@ function mergeOffers(existing, incoming) {
   return { list, added, merged };
 }
 
+/* Fusion d'un groupe d'offres identiques dans une offre principale (annulable via mergeHistory). */
+function pickPrimary(members, pipeIds) {
+  return members.find((o) => pipeIds.has(o.id))
+    || members.find((o) => o.dismissedBy === "user" || o.expiredBy === "user")
+    || [...members].sort((a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || new Date(a.collectedAt) - new Date(b.collectedAt))[0];
+}
+function mergeMembers(primary, absorbed, reason, origin) {
+  const before = { sources: primary.sources, description: primary.description, ...Object.fromEntries(FILLABLE.map((k) => [k, primary[k]])) };
+  const merged = { ...primary, sources: [...(primary.sources || [])] };
+  for (const o of absorbed) {
+    for (const src of o.sources || []) if (!merged.sources.some((x) => canonicalUrl(x.url) === canonicalUrl(src.url) && x.name === src.name)) merged.sources.push(src);
+    for (const k of FILLABLE) if ((merged[k] === null || merged[k] === undefined || merged[k] === "") && o[k]) merged[k] = o[k];
+    if (o.description && (!merged.description || o.description.length > merged.description.length)) merged.description = o.description;
+    if (!merged.seenAt && o.seenAt) merged.seenAt = o.seenAt;
+  }
+  const slim = absorbed.map(({ mergeHistory: _m, ...rest }) => rest);
+  merged.mergeHistory = [...(primary.mergeHistory || []), { id: uid("merge"), at: nowISO(), reason: str(reason), origin, before, absorbed: slim }];
+  return merged;
+}
+/* Dédoublonnage local systématique (URL, identifiant d'annonce, entreprise + intitulé) sur tout le stock. */
+function dedupeLocal(list, apps) {
+  const pipeIds = new Set((apps || []).map((a) => a.offerId));
+  const n = list.length;
+  const parent = list.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const members = (r) => list.filter((_, k) => find(k) === r);
+  for (let i = 0; i < n; i++) {
+    if (list[i].demo || list[i].spontaneous) continue;
+    for (let j = i + 1; j < n; j++) {
+      if (list[j].demo || list[j].spontaneous || find(i) === find(j) || !sameOffer(list[i], list[j])) continue;
+      const ri = find(i), rj = find(j);
+      const pipes = [...members(ri), ...members(rj)].filter((o) => pipeIds.has(o.id)).length;
+      if (pipes > 1) continue; // deux candidatures distinctes : jamais fusionnées
+      parent[rj] = ri;
+    }
+  }
+  const groups = {};
+  list.forEach((o, i) => { const r = find(i); (groups[r] = groups[r] || []).push(o); });
+  const multi = Object.values(groups).filter((g) => g.length > 1);
+  if (!multi.length) return { list, merged: 0 };
+  const drop = new Set();
+  const repl = new Map();
+  for (const g of multi) {
+    const p = pickPrimary(g, pipeIds);
+    const abs = g.filter((o) => o !== p);
+    abs.forEach((o) => drop.add(o.id));
+    repl.set(p.id, mergeMembers(p, abs, "même annonce (URL, identifiant ou entreprise + intitulé)", "automatique"));
+  }
+  return { list: list.filter((o) => !drop.has(o.id)).map((o) => repl.get(o.id) || o), merged: drop.size };
+}
+/* Applique les règles à une liste : renvoie la nouvelle liste et les offres modifiées (pour annuler). */
+function applyRules(list, ver, rules, onlyIds) {
+  const prev = [];
+  const counts = {};
+  const at = nowISO();
+  const next = list.map((o) => {
+    if (onlyIds && !onlyIds.has(o.id)) return o;
+    const v = ruleVerdict(o, ver, rules);
+    if (!v) return o;
+    prev.push(o);
+    counts[v.rule] = (counts[v.rule] || 0) + 1;
+    return applyVerdict(o, v, at);
+  });
+  return { list: next, prev, counts };
+}
+const RULE_LABEL = { title: "intitulé exclu", seniority: "pas de management", domain: "hors périmètre", deadline: "date limite dépassée", link: "annonce clôturée", age: "trop ancienne", commute: "trajet trop long", score: "score trop bas" };
+const rulesOf = (settings) => ({ ...DEFAULT_RULES, ...(settings?.rules || {}) });
+
+/* Date « YYYY-MM-DD » valide et plausible (pas dans plus d'un an), sinon null. */
+function isoDay(v) {
+  const s = str(v);
+  if (!s) return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const d = m ? new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00`) : new Date(s);
+  if (isNaN(d.getTime()) || Math.abs(d.getTime() - Date.now()) > 400 * 864e5) return null;
+  return d.toISOString().slice(0, 10);
+}
 function normalizeOffer(raw, { sourceName, via, verifiedUrls, toolText, allowNoUrl }) {
   if (!raw || typeof raw !== "object") return null;
   const urlRaw = str(raw.url);
@@ -420,7 +521,9 @@ function normalizeOffer(raw, { sourceName, via, verifiedUrls, toolText, allowNoU
     salary: str(raw.salary),
     remote: str(raw.remote),
     language: lang && /^(fr|nl|en)$/i.test(lang) ? lang.toLowerCase() : null,
-    publishedAt: str(raw.publishedAt),
+    publishedAt: isoDay(raw.publishedAt),
+    publishedApprox: raw.publishedApprox === true || undefined,
+    deadline: isoDay(raw.deadline),
     description: (str(raw.description) || "").slice(0, 4000) || null,
     collectedAt: t,
     lastSeenAt: t,
@@ -459,45 +562,124 @@ function veilleConfig(version, sources, settings, sourceIds) {
     roles: c.roles || [], zones: c.zones || [], maxCommute: c.maxCommute ?? 60, remote: c.remote || null,
     mustHave: c.mustHave || [], exclusions: c.exclusions || [], keywords: c.keywords || { fr: [], nl: [], en: [] },
     sources: src, lookbackDays: settings.lookbackDays, maxPerSource: settings.maxPerSource, home: "Ohain (Brabant wallon)",
+    filters: (() => { const r = rulesOf(settings); return { maxAgeDays: r.maxAgeDays, titleExclude: r.titleExclude, managementOnly: r.requireSeniority, seniorityWords: r.seniorityTokens.slice(0, 25) }; })(),
   };
   return { ...body, sig: JSON.stringify(body) };
 }
 
 /* Une offre « active » : ni écartée, ni expirée, ni liée à une candidature clôturée. */
 const INACTIVE = ["dismissed", "expired", "closed"];
-const isActiveOffer = (o) => !INACTIVE.includes(o.status);
-const isOldOffer = (o, days) => {
-  if (!days || o.status === "pipeline") return false;
-  const ref = o.publishedAt && !isNaN(new Date(o.publishedAt)) ? o.publishedAt : o.lastSeenAt || o.collectedAt;
-  return Date.now() - new Date(ref).getTime() > days * 864e5;
-};
+const isActiveOffer = (o) => !o.spontaneous && !INACTIVE.includes(o.status);
 const ratingKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
 const fmtRating = (r) => (r && typeof r.rating === "number" ? r.rating.toFixed(1).replace(".", ",") : null);
 
-/* ── Documents « prêts à envoyer » : balisage léger → modèle → mise en page ──
+/* ── Fraîcheur, règles de tri automatique, score systématique ─────────── */
+const DAY = 864e5;
+const validDate = (d) => !!d && !isNaN(new Date(d).getTime());
+const ageDays = (iso) => (validDate(iso) ? Math.floor((Date.now() - new Date(iso).getTime()) / DAY) : null);
+const deadlineIn = (o) => (validDate(o.deadline) ? daysFromToday(o.deadline) : null);
+const pubRef = (o) => (validDate(o.publishedAt) ? o.publishedAt : null);
+
+/* Étiquette de fraîcheur affichée partout : publiée il y a X j (ou « date inconnue »). */
+function freshness(o) {
+  const a = ageDays(pubRef(o));
+  if (a === null) return { label: "date inconnue", tone: "warn", days: null };
+  const label = a <= 0 ? "aujourd'hui" : a === 1 ? "hier" : `il y a ${a} j`;
+  return { label: o.publishedApprox ? `≈ ${label}` : label, tone: a <= 7 ? "ok" : a <= 21 ? "neutral" : "warn", days: a };
+}
+
+const DEFAULT_RULES = {
+  enabled: true,
+  titleExclude: ["junior", "stage", "stagiaire", "stagiair", "intern", "internship", "trainee", "student", "etudiant", "jobstudent", "alternance", "apprenti", "apprentice", "graduate", "starter", "vrijwilliger", "benevole"],
+  requireSeniority: true,
+  seniorityTokens: ["manager", "head", "lead", "leader", "director", "directeur", "directrice", "direction", "responsable", "responsible", "mgr", "chef", "hoofd", "diensthoofd", "verantwoordelijke", "teamleader", "teamlead", "chief", "cio", "cdo", "cto", "dsi", "vp", "president"],
+  requireDomain: true,
+  domainTokens: ["digital", "digitale", "digitalisation", "digitalisering", "it", "ict", "informatique", "informatica", "crm", "transformation", "transformatie", "process", "processus", "processen", "excellence", "excellentie", "operations", "operational", "operationnel", "operationele", "amelioration", "improvement", "verbetering", "data", "information", "informatie", "systems", "systemes", "business", "innovation", "erp", "dynamics", "automation", "automatisation", "technology", "technologie", "applications", "programme", "program", "pmo", "projects", "projets", "change", "cio", "cdo", "cto", "dsi", "digitalization", "digitization", "application", "solution", "solutions", "workplace", "web", "iam", "security", "cyber", "architecture", "platform", "dt", "delivery", "service desk", "servicedesk", "quality"],
+  maxAgeDays: 30,
+  unknownDateMaxDays: 21,
+  commuteSlack: 20,
+  dismissBelow: 40,
+};
+
+/* Verdict des règles pour une offre active non protégée : null (garder) ou { status, reason }. */
+function ruleVerdict(o, crit, rules) {
+  if (!rules?.enabled || !o || o.demo || o.spontaneous || o.userKept || !["new"].includes(o.status)) return null;
+  const tt = ` ${normText(o.title)} `;
+  const hit = (rules.titleExclude || []).find((w) => w && tt.includes(` ${normText(w)} `));
+  if (hit) return { status: "dismissed", rule: "title", reason: `intitulé exclu (« ${hit} »)` };
+  if (rules.requireSeniority && !(rules.seniorityTokens || []).some((w) => tt.includes(` ${normText(w)} `)))
+    return { status: "dismissed", rule: "seniority", reason: "pas un poste de management (intitulé)" };
+  if (rules.requireDomain) {
+    const roleTokens = (crit?.roles || []).flatMap((r) => tokens(r)).filter((w) => !(rules.seniorityTokens || []).includes(w));
+    const dom = [...new Set([...(rules.domainTokens || []), ...roleTokens].map(normText).filter(Boolean))];
+    if (!dom.some((w) => tt.includes(` ${w} `))) return { status: "dismissed", rule: "domain", reason: "hors périmètre digital / IT / CRM / transformation (intitulé)" };
+  }
+  const dl = deadlineIn(o);
+  if (dl !== null && dl < 0) return { status: "expired", rule: "deadline", reason: `date limite dépassée (${fmtDate(o.deadline)})` };
+  if (o.link?.state === "closed") return { status: "expired", rule: "link", reason: o.link.evidence ? `annonce clôturée : ${o.link.evidence}` : "annonce clôturée (vérifiée)" };
+  const age = ageDays(pubRef(o));
+  if (age !== null && rules.maxAgeDays && age > rules.maxAgeDays) return { status: "expired", rule: "age", reason: `publiée il y a ${age} j (probablement pourvue)` };
+  if (age === null && rules.unknownDateMaxDays && o.link?.state !== "open") {
+    const seen = ageDays(o.collectedAt);
+    if (seen !== null && seen > rules.unknownDateMaxDays) return { status: "expired", rule: "age", reason: `date inconnue, collectée il y a ${seen} j` };
+  }
+  const max = Number(crit?.maxCommute) || 0;
+  if (max && o.commute?.minutes && o.commute.minutes > max + (rules.commuteSlack || 0)) return { status: "dismissed", rule: "commute", reason: `trajet ~${o.commute.minutes} min (max ${max})` };
+  if (rules.dismissBelow && o.score?.method === 2 && o.score.value < rules.dismissBelow) return { status: "dismissed", rule: "score", reason: `score ${o.score.value} < ${rules.dismissBelow}` };
+  return null;
+}
+const applyVerdict = (o, v, at = nowISO()) => ({ ...o, status: v.status, autoReason: v.reason, autoRule: v.rule, dismissedBy: "auto", ...(v.status === "expired" ? { expiredAt: at } : { dismissedAt: at }) });
+
+/* Liste figée des critères d'une version, avec identifiants stables pour le scoring. */
+function criteriaList(ver) {
+  return [
+    ...(ver?.mustHave || []).map((label, i) => ({ id: `M${i + 1}`, kind: "indispensable", label, weight: null })),
+    ...(ver?.wishes || []).map((w, i) => ({ id: `W${i + 1}`, kind: "souhaité", label: w.label, weight: clamp(Number(w.weight) || 1, 1, 5) })),
+    ...(ver?.exclusions || []).map((label, i) => ({ id: `X${i + 1}`, kind: "exclusion", label, weight: null })),
+    ...(ver?.redFlags || []).map((label, i) => ({ id: `A${i + 1}`, kind: "alerte", label, weight: null })),
+  ];
+}
+
+/* Score systématique : calculé ici, à partir des taux de correspondance renvoyés par l'IA, toujours avec la même formule.
+   55 % souhaités (moyenne pondérée) + 45 % indispensables (moyenne) ; plafonds et pénalités ci-dessous. */
+function computeScore(rows) {
+  const avg = (l) => (l.length ? l.reduce((a, b) => a + b, 0) / l.length : null);
+  const must = rows.filter((r) => r.kind === "indispensable");
+  const wish = rows.filter((r) => r.kind === "souhaité");
+  const wSum = wish.reduce((a, r) => a + (r.weight || 1), 0);
+  const wishAvg = wSum ? wish.reduce((a, r) => a + r.match * (r.weight || 1), 0) / wSum : null;
+  const mustAvg = avg(must.map((r) => r.match));
+  let score = wishAvg === null ? mustAvg ?? 50 : mustAvg === null ? wishAvg : 0.55 * wishAvg + 0.45 * mustAvg;
+  const caps = [];
+  const alerts = rows.filter((r) => r.kind === "alerte" && r.match >= 70).length;
+  if (alerts) { score -= Math.min(15, alerts * 5); caps.push(`${alerts} signal(aux) d'alerte : −${Math.min(15, alerts * 5)}`); }
+  if (must.some((r) => r.match < 30)) { score = Math.min(score, 45); caps.push("indispensable non rempli : plafond 45"); }
+  if (rows.some((r) => r.kind === "exclusion" && r.match >= 70)) { score = Math.min(score, 20); caps.push("exclusion touchée : plafond 20"); }
+  return { value: clamp(Math.round(score), 0, 100), caps, wishAvg: wishAvg === null ? null : Math.round(wishAvg), mustAvg: mustAvg === null ? null : Math.round(mustAvg) };
+}
+
+/* ── Documents « prêts à envoyer » : balisage léger → aperçu, texte ATS et PDF ──
    # Nom · > accroche (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section / objet
-   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe
-   Chaque bloc garde ses lignes sources (l0, l1) : un clic dans l'aperçu édite exactement ces lignes. */
+   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe */
 function parseDoc(text) {
   const blocks = [];
-  let para = null;
-  const flush = () => { if (para) { blocks.push({ t: "para", text: para.lines.join(" "), l0: para.l0, l1: para.l1 }); para = null; } };
-  const push = (b, i) => { flush(); blocks.push({ ...b, l0: i, l1: i }); };
-  String(text || "").split("\n").forEach((raw, i) => {
+  let para = [];
+  const flush = () => { if (para.length) { blocks.push({ t: "para", text: para.join(" ") }); para = []; } };
+  for (const raw of String(text || "").split("\n")) {
     const l = raw.trim();
     let m;
-    if (!l) { flush(); return; }
-    if (l.startsWith("### ")) push({ t: "h3", text: l.slice(4) }, i);
-    else if (l.startsWith("## ")) push({ t: "h2", text: l.slice(3) }, i);
-    else if (l.startsWith("# ")) push({ t: "name", text: l.slice(2) }, i);
-    else if (/^[-•*] /.test(l)) push({ t: "bullet", text: l.slice(2) }, i);
-    else if (l.startsWith("> ")) push({ t: "quote", text: l.slice(2) }, i);
-    else if (l.startsWith("@ ")) push({ t: "contact", text: l.slice(2) }, i);
-    else if (l.startsWith("= ")) push({ t: "date", text: l.slice(2) }, i);
-    else if (l.startsWith("~ ")) push({ t: "sign", text: l.slice(2) }, i);
-    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) push({ t: "kv", label: m[1], text: m[2] }, i);
-    else { if (!para) para = { lines: [], l0: i, l1: i }; para.lines.push(l); para.l1 = i; }
-  });
+    if (!l) { flush(); continue; }
+    if (l.startsWith("### ")) { flush(); blocks.push({ t: "h3", text: l.slice(4) }); }
+    else if (l.startsWith("## ")) { flush(); blocks.push({ t: "h2", text: l.slice(3) }); }
+    else if (l.startsWith("# ")) { flush(); blocks.push({ t: "name", text: l.slice(2) }); }
+    else if (/^[-•*] /.test(l)) { flush(); blocks.push({ t: "bullet", text: l.slice(2) }); }
+    else if (l.startsWith("> ")) { flush(); blocks.push({ t: "quote", text: l.slice(2) }); }
+    else if (l.startsWith("@ ")) { flush(); blocks.push({ t: "contact", text: l.slice(2) }); }
+    else if (l.startsWith("= ")) { flush(); blocks.push({ t: "date", text: l.slice(2) }); }
+    else if (l.startsWith("~ ")) { flush(); blocks.push({ t: "sign", text: l.slice(2) }); }
+    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) { flush(); blocks.push({ t: "kv", label: m[1], text: m[2] }); }
+    else para.push(l);
+  }
   flush();
   return blocks.map((b) => ({ ...b, text: String(b.text || "").replace(/\*\*/g, ""), label: b.label && b.label.replace(/\*\*/g, "") }));
 }
@@ -514,15 +696,584 @@ function docPlainText(text) {
 const HEX = /^#?([0-9a-f]{6})$/i;
 const cleanHex = (h, fallback = "#3f3d56") => (HEX.test(String(h || "").trim()) ? `#${String(h).trim().replace("#", "").toLowerCase()}` : fallback);
 const hexRgb = (h) => { const x = cleanHex(h).slice(1); return [0, 2, 4].map((i) => parseInt(x.slice(i, i + 2), 16)); };
-const rgbHex = (r) => `#${r.map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("")}`;
-const mixHex = (a, b, t) => { const A = hexRgb(a), B = hexRgb(b); return rgbHex(A.map((v, i) => v + (B[i] - v) * t)); };
-const luminance = (h) => { const [r, g, b] = hexRgb(h).map((v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
-function keywordCoverage(text, terms) {
-  const hay = ` ${normText(text)} `;
-  const list = (terms || []).filter(Boolean);
-  // Correspondance sur mots entiers : « IT » n'est plus compté présent dans « digital ».
-  const covered = list.filter((t) => { const n = normText(t); return n && hay.includes(` ${n} `); });
-  return { covered, missing: list.filter((t) => !covered.includes(t)), pct: list.length ? Math.round((covered.length / list.length) * 100) : null };
+/* ── Document structuré : découpage du balisage, modèle d'édition, ordre de rendu ──
+   Le texte balisé reste la source enregistrée (versions, PDF, copie ATS) ; l'éditeur travaille sur un modèle
+   (en-tête + sections typées) reconverti en balisage à chaque frappe. */
+const PERIOD_RE = /\b(19|20)\d{2}\b|aujourd|pr[ée]sent|heden|today|now\b|actuel|current|en cours|depuis|sinds|since/i;
+const SEC = {
+  profile: /^(profil|profile|profiel|r[ée]sum[ée]|summary|samenvatting|about|à propos)/i,
+  achievements: /(r[ée]alisations|achievements|realisaties|accomplishments|r[ée]sultats cl|key results|verwezenlijkingen)/i,
+  experience: /(exp[ée]rience|werkervaring|ervaring|parcours|loopbaan|employment)/i,
+  skills: /(comp[ée]tences|skills|vaardigheden|competenties|expertise|outils)/i,
+  languages: /^(langues|languages|talen)/i,
+  education: /(formation|education|opleiding|dipl[oô]mes|[ée]tudes|studies)/i,
+};
+const oneLine = (s) => String(s || "").replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+const stripColon = (s) => String(s || "").replace(/\s*:\s*$/, "").trim();
+const mkItem = (text = "") => ({ id: uid("i"), text });
+
+function splitH3(text) {
+  const p = String(text || "").split("|").map((x) => x.trim());
+  while (p.length > 1 && !p[p.length - 1]) p.pop();
+  if (p.length >= 4) return { role: p[0], org: p[1], place: p[2], period: p.slice(3).filter(Boolean).join(" · ") };
+  if (p.length === 3) return PERIOD_RE.test(p[2]) ? { role: p[0], org: p[1], place: "", period: p[2] } : { role: p[0], org: p[1], place: p[2], period: "" };
+  if (p.length === 2) return PERIOD_RE.test(p[1]) ? { role: p[0], org: "", place: "", period: p[1] } : { role: p[0], org: p[1], place: "", period: "" };
+  return { role: p[0] || "", org: "", place: "", period: "" };
+}
+function joinH3(e) {
+  const p = [e.role, e.org, e.place, e.period].map((x) => oneLine(x).replace(/\|/g, "/"));
+  while (p.length > 1 && !p[p.length - 1]) p.pop();
+  return p.join(" | ");
+}
+
+function docOutline(text, kind) {
+  const head = [], sections = [];
+  let cur = null, sign = "";
+  for (const raw of String(text || "").split("\n")) {
+    const l = raw.trim();
+    if (l.startsWith("## ")) { cur = { title: l.slice(3).replace(/\*\*/g, "").trim(), lines: [] }; sections.push(cur); continue; }
+    if (l.startsWith("~ ")) { sign = l.slice(2).trim(); continue; }
+    (cur ? cur.lines : head).push(raw);
+  }
+  const o = { name: "", headline: "", contact: "", date: "", recipients: [], sign, sections };
+  for (const b of parseDoc(head.join("\n"))) {
+    if (b.t === "name" && !o.name) o.name = b.text;
+    else if (b.t === "contact") o.contact = o.contact ? `${o.contact} | ${b.text}` : b.text;
+    else if (b.t === "date" && !o.date) o.date = b.text;
+    else if (b.t === "quote") { if (kind === "cv") o.headline = o.headline ? `${o.headline} ${b.text}` : b.text; else o.recipients.push(b.text); }
+  }
+  const pre = head.filter((l) => !/^(# |> |@ |= )/.test(l.trim()));
+  if (pre.some((l) => l.trim())) sections.unshift({ title: "", lines: pre });
+  return o;
+}
+
+function sectionFromLines(title, lines) {
+  const blocks = parseDoc(lines.join("\n"));
+  const s = { id: uid("sec"), title, kind: "raw" };
+  const ts = blocks.map((b) => b.t);
+  const only = (...k) => ts.every((t) => k.includes(t));
+  if (!blocks.length || only("para")) return { ...s, kind: "text", paras: blocks.length ? blocks.map((b) => mkItem(b.text)) : [mkItem()] };
+  if (only("bullet")) return { ...s, kind: "bullets", items: blocks.map((b) => mkItem(b.text)) };
+  if (only("kv")) return { ...s, kind: "kv", rows: blocks.map((b) => ({ id: uid("r"), label: stripColon(b.label), value: b.text })) };
+  if (ts[0] === "h3" && only("h3", "para", "bullet")) {
+    const entries = [];
+    let ok = true;
+    for (const b of blocks) {
+      if (b.t === "h3") { entries.push({ id: uid("e"), ...splitH3(b.text), paras: [], bullets: [] }); continue; }
+      const e = entries[entries.length - 1];
+      if (b.t === "bullet") e.bullets.push(mkItem(b.text));
+      else if (e.bullets.length) { ok = false; break; } else e.paras.push(mkItem(b.text));
+    }
+    if (ok) return { ...s, kind: "entries", entries };
+  }
+  return { ...s, raw: lines.join("\n").trim() };
+}
+
+function docToModel(text, kind) {
+  const o = docOutline(text, kind);
+  return {
+    name: o.name, headline: o.headline, contact: o.contact, date: o.date, recipients: o.recipients.join("\n"), sign: o.sign,
+    sections: o.sections.map((s) => sectionFromLines(s.title, s.lines)),
+  };
+}
+
+function sectionToLines(s, lang) {
+  const L = [];
+  const colon = lang === "fr" ? " :" : ":";
+  if (s.kind === "text") for (const p of s.paras || []) { const t = oneLine(p.text); if (t) L.push(t, ""); }
+  else if (s.kind === "bullets") for (const it of s.items || []) { const t = oneLine(it.text); if (t) L.push(`- ${t}`); }
+  else if (s.kind === "kv") {
+    for (const r of s.rows || []) {
+      const lab = oneLine(stripColon(r.label)).replace(/\*\*/g, ""), val = oneLine(r.value);
+      if (lab) L.push(`**${lab}${colon}** ${val}`); else if (val) L.push(`**${val}**`);
+    }
+  } else if (s.kind === "entries") {
+    for (const e of s.entries || []) {
+      const h = joinH3(e);
+      const paras = (e.paras || []).map((p) => oneLine(p.text)).filter(Boolean);
+      const bullets = (e.bullets || []).map((b) => oneLine(b.text)).filter(Boolean);
+      if (!h && !paras.length && !bullets.length) continue;
+      L.push(`### ${h || "[à compléter : intitulé]"}`);
+      paras.forEach((p) => L.push(p, ""));
+      bullets.forEach((b) => L.push(`- ${b}`));
+      L.push("");
+    }
+  } else L.push(String(s.raw || "").trim());
+  return L;
+}
+
+function modelToDoc(m, kind, lang) {
+  const L = [];
+  if (oneLine(m.name)) L.push(`# ${oneLine(m.name)}`);
+  if (kind === "cv" && oneLine(m.headline)) L.push(`> ${oneLine(m.headline)}`);
+  if (oneLine(m.contact)) L.push(`@ ${oneLine(m.contact)}`);
+  if (oneLine(m.date)) L.push(`= ${oneLine(m.date)}`);
+  if (kind !== "cv") String(m.recipients || "").split("\n").map(oneLine).filter(Boolean).forEach((r) => L.push(`> ${r}`));
+  m.sections.forEach((s, i) => {
+    const body = sectionToLines(s, lang);
+    const title = oneLine(s.title) || (i > 0 ? "Section" : "");
+    if (!title && !body.some(Boolean)) return;
+    L.push("");
+    if (title) L.push(`## ${title}`);
+    L.push(...body);
+  });
+  if (oneLine(m.sign)) L.push("", `~ ${oneLine(m.sign)}`);
+  return L.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+const normalizeDoc = (text, kind, lang) => modelToDoc(docToModel(String(text || "").replace(/^```\w*\n?|```\s*$/g, ""), kind), kind, lang);
+
+/* Ordre de rendu commun à l'aperçu et au PDF ; sec = index de section (« head », « sign » pour l'en-tête et la signature). */
+function layoutBlocks(text, kind) {
+  const o = docOutline(text, kind);
+  const out = [];
+  if (o.name) out.push({ t: "name", text: o.name, sec: "head" });
+  if (kind === "cv" && o.headline) out.push({ t: "quote", text: o.headline, sec: "head" });
+  if (o.contact) out.push({ t: "contact", text: o.contact, sec: "head" });
+  if (o.date) out.push({ t: "date", text: o.date, sec: "head" });
+  if (kind !== "cv") o.recipients.forEach((r) => out.push({ t: "quote", text: r, sec: "head" }));
+  o.sections.forEach((s, i) => {
+    if (s.title) out.push({ t: "h2", text: s.title, sec: i });
+    parseDoc(s.lines.join("\n")).forEach((b) => out.push({ ...b, sec: i }));
+  });
+  if (o.sign) out.push({ t: "sign", text: o.sign, sec: "sign" });
+  return out;
+}
+
+/* Diff mot à mot (propositions de l'IA : ajouts / suppressions). */
+function wordDiff(a, b) {
+  const A = String(a || "").split(/\s+/).filter(Boolean), B = String(b || "").split(/\s+/).filter(Boolean);
+  if (A.length * B.length > 250000) return [{ t: "del", w: A.join(" ") }, { t: "add", w: B.join(" ") }];
+  const dp = Array.from({ length: A.length + 1 }, () => new Uint16Array(B.length + 1));
+  for (let i = A.length - 1; i >= 0; i--) for (let j = B.length - 1; j >= 0; j--) dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  const push = (t, w) => { const l = out[out.length - 1]; if (l && l.t === t) l.w += ` ${w}`; else out.push({ t, w }); };
+  let i = 0, j = 0;
+  while (i < A.length && j < B.length) {
+    if (A[i] === B[j]) { push("same", A[i]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) push("del", A[i++]);
+    else push("add", B[j++]);
+  }
+  while (i < A.length) push("del", A[i++]);
+  while (j < B.length) push("add", B[j++]);
+  return out;
+}
+
+/* ── 6b · Ce que vous corrigez à la main : écart mot à mot entre la version IA et votre version ── */
+function editDelta(base, edited) {
+  const rows = lineDiff(base || "", edited || "");
+  const wc = (s) => String(s || "").split(/\s+/).filter(Boolean).length;
+  let del = 0, add = 0;
+  const hunks = [];
+  for (const r of rows) {
+    if (r.t === "del") { del += wc(r.text); hunks.push({ del: r.text, add: "" }); }
+    else if (r.t === "add") { add += wc(r.text); hunks.push({ del: "", add: r.text }); }
+    else if (r.t === "chg") {
+      const d = r.segs.filter((x) => x.t === "del").map((x) => x.w).join(" … ");
+      const a = r.segs.filter((x) => x.t === "add").map((x) => x.w).join(" … ");
+      del += wc(d); add += wc(a);
+      if (d || a) hunks.push({ del: d, add: a });
+    }
+  }
+  const total = wc(displayMarkup(base)) + wc(displayMarkup(edited));
+  return { pct: total ? Math.round(((del + add) / total) * 100) : 0, changed: del + add, hunks: hunks.slice(0, 20).map((h) => ({ del: h.del.slice(0, 220), add: h.add.slice(0, 220) })) };
+}
+const learningOf = (p) => (p?.ruleLearning && typeof p.ruleLearning === "object" ? p.ruleLearning : { edits: [], lastLearnAt: null });
+const pendingLearnDocs = (p) => {
+  const l = learningOf(p);
+  const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+  return new Set(l.edits.filter((e) => new Date(e.at).getTime() > since).map((e) => `${e.appId}:${e.type}`)).size;
+};
+
+/* ── 6c · CV maître par langue : seuls la ligne de positionnement, le Profil, les Réalisations, l'ordre des puces et les Compétences changent ── */
+const masterOf = (p, lang) => (p?.masterCv && p.masterCv[lang]?.text ? p.masterCv[lang] : null);
+const ADAPTABLE = ["profile", "achievements", "skills"];
+const secKindOf = (title) => Object.keys(SEC).find((k) => SEC[k].test(String(title || ""))) || null;
+const bulletKey = (s) => normText(String(s || "").replace(/^[-•*]\s*/, ""));
+const similar = (a, b) => { const A = tokens(a), B = tokens(b); return A.length && B.length && jaccard(A, B) >= 0.6; };
+/* 6d · puces verrouillées : recopiées mot pour mot, jamais réécrites. */
+const lockedOf = (p) => (Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => str(x)) : []);
+const touchesLocked = (before, locked) => {
+  const b = normText(before);
+  return !!b && locked.some((l) => { const k = normText(l); return k && (b.includes(k) || (k.includes(b) && b.length > 25)); });
+};
+function restoreLocked(lines, locked) {
+  if (!locked.length) return lines;
+  return lines.map((l) => {
+    const m = l.match(/^(\s*[-•*]\s+)(.*)$/);
+    if (!m) return l;
+    const hit = locked.find((x) => bulletKey(x) !== bulletKey(m[2]) && similar(x, m[2]));
+    return hit ? `${m[1]}${hit.replace(/^[-•*]\s*/, "")}` : l;
+  });
+}
+/* Fusion : tout vient du maître, sauf les sections adaptables et l'ordre des puces de chaque poste. */
+function enforceMaster(genText, masterText, locked = []) {
+  const G = docOutline(genText, "cv"), M = docOutline(masterText, "cv");
+  const gBy = (k) => G.sections.find((s) => secKindOf(s.title) === k);
+  const out = [];
+  let insertedMissing = false;
+  const missingAdaptable = ADAPTABLE.filter((k) => !M.sections.some((s) => secKindOf(s.title) === k) && gBy(k));
+  for (const ms of M.sections) {
+    const k = secKindOf(ms.title);
+    if (ADAPTABLE.includes(k) && gBy(k)) out.push({ title: ms.title, lines: restoreLocked(gBy(k).lines, locked) });
+    else if (k === "experience") {
+      const gs = gBy("experience");
+      const gEntries = [];
+      (gs?.lines || []).forEach((l) => { const t = l.trim(); if (t.startsWith("### ")) gEntries.push({ h: t.slice(4), bullets: [] }); else if (/^[-•*]\s/.test(t) && gEntries.length) gEntries[gEntries.length - 1].bullets.push(t.replace(/^[-•*]\s*/, "")); });
+      const lines = [];
+      let entry = null;
+      const flush = () => {
+        if (!entry) return;
+        const g = gEntries.find((e) => similar(e.h.split("|").slice(0, 2).join(" "), entry.h.split("|").slice(0, 2).join(" ")));
+        let ordered = entry.bullets;
+        if (g) {
+          const used = new Set();
+          const seq = [];
+          g.bullets.forEach((gb) => { const i = entry.bullets.findIndex((mb, j) => !used.has(j) && (bulletKey(mb) === bulletKey(gb) || similar(mb, gb))); if (i >= 0) { used.add(i); seq.push(entry.bullets[i]); } });
+          ordered = [...seq, ...entry.bullets.filter((_, j) => !used.has(j))];
+        }
+        lines.push(`### ${entry.h}`, ...entry.pre, ...ordered.map((b) => `- ${b}`), "");
+        entry = null;
+      };
+      for (const l of ms.lines) {
+        const t = l.trim();
+        if (t.startsWith("### ")) { flush(); entry = { h: t.slice(4), pre: [], bullets: [] }; }
+        else if (entry && /^[-•*]\s/.test(t)) entry.bullets.push(t.replace(/^[-•*]\s*/, ""));
+        else if (entry && t) entry.pre.push(l);
+        else if (!entry) lines.push(l);
+      }
+      flush();
+      out.push({ title: ms.title, lines });
+    } else out.push(ms);
+    if (k === "profile" && !insertedMissing) { missingAdaptable.forEach((mk) => out.push({ title: gBy(mk).title, lines: restoreLocked(gBy(mk).lines, locked) })); insertedMissing = true; }
+  }
+  if (!insertedMissing) missingAdaptable.forEach((mk) => out.unshift({ title: gBy(mk).title, lines: gBy(mk).lines }));
+  const head = [`# ${M.name || G.name}`, (G.headline || M.headline) ? `> ${G.headline || M.headline}` : "", `@ ${M.contact || G.contact}`].filter((x) => x && x !== "@ ");
+  return [...head, "", ...out.flatMap((s) => [s.title ? `## ${s.title}` : "", ...s.lines.map((l) => l.trimEnd()), ""])].join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/* Remplacement ciblé proposé par l'IA : « before » doit exister dans le texte (tolérance typographique). */
+const typoNorm = (s) => String(s || "").replace(/[‘’′]/g, "'").replace(/[“”]/g, '"').replace(/[  ]/g, " ").replace(/[ \t]+/g, " ");
+function applyEdit(text, before, after) {
+  const b = String(before || "");
+  if (!b.trim() || typeof after !== "string") return null;
+  if (text.includes(b)) return text.replace(b, after);
+  const tn = typoNorm(text), bn = typoNorm(b).trim();
+  const i = tn.indexOf(bn);
+  if (i < 0) return null;
+  return tn.slice(0, i) + after + tn.slice(i + bn.length);
+}
+
+/* ── Mots-clés ATS : variantes tolérées (pluriel, accents, tirets, casse) ── */
+const KW_CATS = { titre: "Intitulé", competence: "Compétences métier", outil: "Outils & plateformes", methode: "Méthodes & cadres", soft: "Savoir-être", langue: "Langues", secteur: "Secteur", diplome: "Formation" };
+const KW_STATUS = ["prouvé", "transférable", "absent"];
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const kwReCache = new Map();
+function kwPattern(form) {
+  if (kwReCache.has(form)) return kwReCache.get(form);
+  const toks = normText(form).split(" ").filter(Boolean);
+  const re = toks.length ? new RegExp(`(?:^| )${toks.map((t) => {
+    if (t.length <= 3 || /\d/.test(t)) return escRe(t);
+    const stem = /[^s]s$/.test(t) || /x$/.test(t) ? t.slice(0, -1) : t;
+    return `${escRe(stem)}(?:s|x|es|en|e|n)?`;
+  }).join(" ")}(?= |$)`, "g") : null;
+  kwReCache.set(form, re);
+  return re;
+}
+const kwObj = (k) => (typeof k === "string" ? { term: k, variants: [], category: "competence", importance: 2, status: "prouvé", evidence: null } : k);
+function kwCount(hay, k) {
+  let n = 0;
+  for (const f of [k.term, ...(k.variants || [])]) { const re = kwPattern(f); if (re) n = Math.max(n, (hay.match(re) || []).length); }
+  return n;
+}
+const hayOf = (s) => ` ${normText(s)} `;
+
+/* ── Contrôle qualité local (instantané, sans IA) ── */
+const CLICHES = {
+  fr: ["passionné", "passionnée", "dynamique", "force de proposition", "je me permets", "n'hésitez pas", "fort de", "forte de", "motivé", "motivée", "challenge", "challenges", "polyvalent", "polyvalente", "proactif", "proactive", "esprit d'équipe", "vif intérêt", "grand intérêt", "véritable", "parfaitement", "atout majeur", "synergie", "synergies", "touche-à-tout", "nouveaux défis", "nouveau défi", "c'est avec enthousiasme", "je suis convaincu", "je suis persuadé", "suite à votre annonce"],
+  nl: ["gedreven", "gepassioneerd", "gemotiveerd", "dynamisch", "teamplayer", "teamspeler", "hierbij solliciteer ik", "met veel interesse", "stressbestendig", "nieuwe uitdaging", "proactief"],
+  en: ["passionate", "dynamic", "motivated", "results-driven", "hard-working", "hardworking", "team player", "self-starter", "go-getter", "think outside the box", "synergy", "synergies", "proven track record", "i am writing to", "leverage", "new challenge"],
+};
+const CLAIMS = {
+  fr: ["orienté résultats", "orientée résultats", "rigoureux", "rigoureuse", "organisé", "organisée", "autonome", "sens de l'organisation", "sens des responsabilités", "excellent relationnel", "esprit d'analyse", "esprit de synthèse", "leadership naturel", "excellente communication"],
+  nl: ["resultaatgericht", "nauwkeurig", "zelfstandig", "communicatief sterk", "analytisch sterk", "natuurlijk leiderschap"],
+  en: ["results-oriented", "detail-oriented", "strong communication skills", "excellent communication", "highly organized", "self-motivated", "natural leader"],
+};
+const WEAK_OPENERS = {
+  fr: /^(responsable (de|du|des|d')|en charge (de|du|des|d')|charg[ée]e? (de|du|des|d')|participation (à|au|aux)|particip[ée] (à|au|aux)|aide (à|au)|travail sur|impliqu[ée]e? dans|contribution (à|au))/i,
+  nl: /^(verantwoordelijk voor|meegewerkt|deelgenomen|hulp bij|betrokken bij)/i,
+  en: /^(responsible for|in charge of|worked on|helped|assisted|participated|involved in|duties included)/i,
+};
+const PRONOUNS = { fr: /(^|[\s(])(je|j'|j’|mon|ma|mes|moi)(?=[\s,.;:!?)]|$)/i, nl: /\b(ik|mijn|mij)\b/i, en: /\b(I|my|me|My)\b/ };
+const REP_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden ensuite egalement notamment".split(" "));
+const LEVEL_ORDER = { block: 0, warn: 1, info: 2 };
+/* ── Lettre ≠ CV : mesures de complémentarité (sans IA) ── */
+const LETTER_FORMULAS = /(madame|monsieur|geachte|mevrouw|heer|dear|hiring manager|agr[ée]er|salutations distingu|met vriendelijke groet|hoogachtend|yours sincerely|kind regards)/i;
+/* Corps de la lettre : paragraphes, sans en-tête, objet, formules d'appel et de politesse ni signature. */
+function letterBody(text) {
+  return parseDoc(text).filter((b) => b.t === "para" && !(LETTER_FORMULAS.test(b.text) && b.text.split(/\s+/).length < 18)).map((b) => b.text).join("\n");
+}
+const ngrams = (s, n = 4) => {
+  const t = normText(s).split(" ").filter(Boolean);
+  const out = [];
+  for (let i = 0; i + n <= t.length; i++) out.push(t.slice(i, i + n).join(" "));
+  return out;
+};
+/* Part des 4-grammes de la lettre déjà présents dans le CV. */
+function overlapPct(letterText, cvText) {
+  const L = ngrams(letterBody(letterText));
+  if (!L.length || !String(cvText || "").trim()) return null;
+  const C = new Set(ngrams(docPlainText(cvText)));
+  return Math.round((L.filter((g) => C.has(g)).length / L.length) * 100);
+}
+/* Chiffres significatifs (années exclues ; 1 200 = 1200 ; 40 % = 40). */
+function sigNumbers(text) {
+  const out = new Set();
+  for (const m of String(text || "").matchAll(/[−-]?\d[\d\s  .,]*\d|\d/g)) {
+    const n = m[0].replace(/[\s  ]/g, "").replace(/^[−-]/, "").replace(/[.,](?=\d{3}\b)/g, "").replace(",", ".");
+    if (/^(19|20)\d\d$/.test(n)) continue;
+    if (n.replace(/\D/g, "").length >= 8) continue;
+    out.add(n);
+  }
+  return [...out];
+}
+function letterMetrics(letterText, cvText) {
+  const body = letterBody(letterText);
+  const nums = sigNumbers(body);
+  const cvNums = new Set(sigNumbers(docPlainText(cvText || "")));
+  return { overlap: overlapPct(letterText, cvText), numbers: nums.length, sharedNumbers: nums.filter((n) => cvNums.has(n)).length, words: body.split(/\s+/).filter(Boolean).length };
+}
+function normalizeUsed(u) {
+  u = u && typeof u === "object" ? u : {};
+  const list = (x) => (Array.isArray(x) ? x.map((y) => str(y)).filter(Boolean) : []);
+  return { companyFacts: list(u.companyFacts), convictionId: str(u.convictionId), storyId: str(u.storyId), keywords: list(u.keywords), numbers: list(u.numbers), sharedWithCv: str(u.sharedWithCv) };
+}
+const SIG_STOP = new Set("avec dans pour plus leurs notre votre cette entre depuis ainsi afin selon aupres travers chaque toutes plusieurs about their which would these other where there while worden zijn binnen tussen onder waarbij hebben werden comme leur sont etre avoir fait faire tout tous mais donc alors aussi tres bien".split(" "));
+const sigTokens = (s) => new Set(normText(s).split(" ").filter((w) => w.length >= 5 && !SIG_STOP.has(w)));
+/* Une source (fait, conviction, histoire) est « présente » si la lettre en reprend au moins 3 mots significatifs (ou 40 % de ses mots). */
+function echoes(hayTokens, source) {
+  const t = [...sigTokens(source)];
+  if (!t.length) return false;
+  const hit = t.filter((w) => hayTokens.has(w)).length;
+  return hit >= Math.min(3, t.length) || hit / t.length >= 0.4;
+}
+const FLATTERY = {
+  fr: ["leader", "leader incontesté", "acteur majeur", "acteur incontournable", "référence", "renommée", "prestigieuse", "prestigieux", "réputation", "j'admire", "entreprise innovante", "excellence reconnue", "fleuron", "rayonnement"],
+  nl: ["marktleider", "toonaangevend", "gerenommeerd", "prestigieus", "bewonder", "innovatieve organisatie", "vooraanstaand"],
+  en: ["industry leader", "market leader", "renowned", "prestigious", "world-class", "i admire", "leading company", "innovative company", "reputation"],
+};
+
+
+function analyzeDoc(text, kind, ctx = {}) {
+  const lang = ctx.lang || "fr";
+  const o = docOutline(text, kind);
+  const blocks = layoutBlocks(text, kind);
+  const plain = docPlainText(text);
+  const words = plain.split(/\s+/).filter(Boolean).length;
+  const issues = [];
+  const add = (level, cat, key, title, detail, extra = {}) => issues.push({ id: `${cat}:${key}`, level, cat, title, detail, ...extra });
+  const secText = o.sections.map((s) => docPlainText(s.lines.join("\n")));
+  const secHay = secText.map(hayOf);
+  const findSec = (pred) => { const i = secHay.findIndex(pred); return i >= 0 ? i : undefined; };
+  const allHay = hayOf(`${o.headline} ${plain}`);
+
+  /* Mots-clés : couverture pondérée par l'importance ; un terme présent seulement dans une liste compte moins. */
+  const kw = (ctx.keywords || []).map(kwObj).map((k) => {
+    const where = [];
+    let count = 0;
+    const hc = kwCount(hayOf(o.headline), k);
+    if (hc) { where.push({ sec: "head", title: "En-tête" }); count += hc; }
+    o.sections.forEach((s, i) => {
+      const c = kwCount(secHay[i], k);
+      if (c) { where.push({ sec: i, title: s.title || "Introduction", list: SEC.skills.test(s.title) || SEC.languages.test(s.title) }); count += c; }
+    });
+    return { ...k, count, where, found: count > 0, onlyList: count > 0 && where.every((w) => w.list) };
+  });
+  /* Lettre : seuls les mots-clés essentiels (importance 3) comptent, pour éviter le bourrage. */
+  const eligible = kw.filter((k) => k.status !== "absent" && (kind === "cv" || k.importance === 3));
+  const wsum = eligible.reduce((n, k) => n + k.importance, 0);
+  const wfound = eligible.reduce((n, k) => n + (k.found ? k.importance * (k.onlyList && kind === "cv" ? 0.75 : 1) : 0), 0);
+  const kwPct = wsum ? Math.round((wfound / wsum) * 100) : null;
+  const titleForms = [ctx.jobTitle, ...(ctx.titleVariants || [])].filter(Boolean);
+  const titleIn = (hay) => titleForms.some((t) => kwCount(hay, { term: t, variants: [] }) > 0);
+  const titleFound = titleForms.length ? titleIn(allHay) : null;
+  const missingKw = eligible.filter((k) => !k.found);
+  if (missingKw.length && kind === "cv") {
+    const top = missingKw.filter((k) => k.importance >= 2);
+    if (top.length) add(kind === "cv" && top.some((k) => k.importance === 3) ? "warn" : "info", "ats", "kw-missing", `${top.length} mot(s)-clé(s) ${kind === "cv" ? "justifiable(s)" : "essentiel(s)"} absent(s)`, `${top.slice(0, 6).map((k) => `« ${k.term} »`).join(", ")}${top.length > 6 ? "…" : ""} : votre profil les justifie, ${kind === "cv" ? "l'ATS les cherche" : "citez-les naturellement"}.`, { tab: "kw" });
+  }
+  const listOnly = eligible.filter((k) => k.onlyList && k.importance >= 2);
+  if (kind === "cv" && listOnly.length) add("info", "ats", "kw-list", `${listOnly.length} mot(s)-clé(s) cité(s) seulement dans une liste`, `${listOnly.slice(0, 4).map((k) => `« ${k.term} »`).join(", ")} : démontrez-les aussi dans une puce d'expérience ou de réalisation.`, { tab: "kw" });
+
+  /* En-tête */
+  if (!o.contact) add("block", "format", "contact", "Coordonnées absentes", "Ajoutez une ligne de coordonnées (e-mail, téléphone, ville, LinkedIn).", { sec: "head" });
+  else {
+    if (!/@/.test(o.contact)) add("warn", "format", "email", "Pas d'adresse e-mail dans les coordonnées", null, { sec: "head" });
+    if (!/\d[\d\s./-]{7,}/.test(o.contact)) add("info", "format", "phone", "Pas de numéro de téléphone", null, { sec: "head" });
+  }
+  if (!o.name) add("block", "format", "name", "Nom absent", null, { sec: "head" });
+
+  const ph = [];
+  (text.match(/\[à compléter[^\]]*\]/gi) || []).forEach((m) => ph.push(m));
+  if (ph.length) {
+    const sec = findSec((h, i) => /\[à compléter/i.test(o.sections[i].lines.join("\n")));
+    add("block", "fiabilite", "placeholders", `${ph.length} élément(s) [à compléter]`, `${ph.slice(0, 3).join(" · ")}${ph.length > 3 ? "…" : ""} — complétez avec un fait réel ou supprimez le passage.`, { sec });
+  }
+  /* Employeur actuel : réglage unique CV + lettre (employerNamed). Non nommé → toute mention bloque ; nommé → aucune alerte. */
+  const empNames = [...(ctx.employerNames || []), ...(ctx.employerNamed === false && !genericOrg(ctx.currentOrg) ? [ctx.currentOrg] : [])];
+  const emp = ctx.employerNamed === true ? [] : mentionsEmployer(text, empNames);
+  if (emp.length) add(ctx.employerNamed === false ? "block" : "warn", "fiabilite", "employer", `Employeur actuel cité (${emp.join(", ")})`, ctx.employerNamed === false ? "Cette candidature est réglée sur « employeur non nommé » : remplacez-le par une désignation générique." : "Vous êtes en poste : vérifiez que c'est voulu avant diffusion.", { sec: findSec((h, i) => mentionsEmployer(o.sections[i].lines.join("\n"), empNames).length > 0), autoFix: ctx.employerNamed === false });
+
+  /* Clichés et affirmations non prouvées */
+  const hits = (list) => (list[lang] || list.fr).filter((c) => kwCount(allHay, { term: c, variants: [] }) > 0);
+  const cl = hits(CLICHES);
+  if (cl.length) add("warn", "style", "cliches", `Clichés : ${cl.slice(0, 5).join(", ")}`, "Remplacez-les par un fait ou un résultat.", { sec: findSec((h) => cl.some((c) => kwCount(h, { term: c, variants: [] }))), autoFix: true });
+  const cla = hits(CLAIMS);
+  if (cla.length) add("info", "style", "claims", `Affirmations à prouver : ${cla.slice(0, 5).join(", ")}`, "Un recruteur ne les retient que si une réalisation les démontre.", { sec: findSec((h) => cla.some((c) => kwCount(h, { term: c, variants: [] }))) });
+
+  /* Répétitions */
+  const kwToks = new Set(kw.flatMap((k) => normText(k.term).split(" ")));
+  const freq = {};
+  normText(plain).split(" ").forEach((w) => { if (w.length >= 5 && !REP_STOP.has(w) && !kwToks.has(w)) freq[w] = (freq[w] || 0) + 1; });
+  const reps = Object.entries(freq).filter(([, n]) => n >= (kind === "cv" ? 6 : 4)).sort((a, b) => b[1] - a[1]).slice(0, 4);
+  if (reps.length) add("info", "style", "reps", `Répétitions : ${reps.map(([w, n]) => `« ${w} » ×${n}`).join(", ")}`, "Variez le vocabulaire (sauf mots-clés de l'annonce).");
+
+  let impact = 70, read = 100, letterScores = null;
+  const pages = ctx.pages || null;
+  if (kind === "cv") {
+    const hl = o.headline;
+    const tgt = tokens(ctx.jobTitle || "");
+    const cur = tokens(ctx.currentTitle || "");
+    const sameAsCurrent = tgt.length && cur.length && jaccard(tgt, cur) >= 0.6;
+    const claims = (s) => { const t = tokens(s); return tgt.length && !sameAsCurrent && (jaccard(t, tgt) >= 0.6 || tgt.every((x) => t.includes(x))); };
+    if (!hl) add("warn", "format", "hl-missing", "Ligne sous le nom absente", "Indiquez votre positionnement : titre actuel + 2 ou 3 expertises.", { sec: "head", fix: "headline" });
+    else {
+      const first = hl.split(/\s[|·–—-]\s|[|·]|,/)[0].trim();
+      if (claims(first)) add("block", "fiabilite", "hl-claim", "Le titre sous votre nom annonce le poste visé", `« ${first} » laisse croire que vous occupez déjà ce poste. Mettez votre titre réel${ctx.currentTitle ? ` (${ctx.currentTitle})` : ""} et vos expertises ; l'intitulé visé se cite comme objectif dans le profil.`, { sec: "head", fix: "headline", autoFix: true });
+      if (hl.length > 90) add("info", "format", "hl-long", `Ligne sous le nom longue (${hl.length} caractères)`, "Visez 85 caractères maximum : une seule ligne, lisible d'un coup d'œil.", { sec: "head" });
+    }
+    const prof = o.sections.findIndex((s) => SEC.profile.test(s.title));
+    if (prof < 0) add("warn", "format", "no-profile", "Section « Profil » absente", "3 ou 4 phrases : qui vous êtes aujourd'hui, vos preuves, ce que vous apportez au poste.");
+    else {
+      const pt = secText[prof];
+      const pw = pt.split(/\s+/).filter(Boolean).length;
+      const firstSentence = pt.split(/[.!?]\s/)[0] || "";
+      if (claims(firstSentence.split(/\s+/).slice(0, 9).join(" "))) add("block", "fiabilite", "prof-claim", "Le profil se présente avec l'intitulé visé", "La première phrase doit décrire votre fonction réelle ; l'intitulé visé vient en fin de profil, comme objectif.", { sec: prof, autoFix: true });
+      if (titleForms.length && !titleIn(secHay[prof])) add("warn", "ats", "prof-title", ctx.spontaneous ? "Le rôle visé n'apparaît pas dans le profil" : "L'intitulé exact du poste n'apparaît pas dans le profil", `Citez « ${ctx.jobTitle} » comme objectif (« … dans un rôle de ${ctx.jobTitle} ») : les ATS et les recruteurs comparent l'intitulé.`, { sec: prof, autoFix: true });
+      if (ctx.voice !== "je" && PRONOUNS[lang]?.test(pt)) add("warn", "style", "prof-pron", "Pronoms personnels dans le profil", "Style CV : phrases sans « je / mon » (ou choisissez la 1re personne dans les réglages).", { sec: prof, autoFix: true });
+      if (pw > 110) add("info", "format", "prof-long", `Profil long (${pw} mots)`, "Visez 55 à 90 mots.", { sec: prof });
+      if (pw < 30) add("warn", "format", "prof-short", `Profil court (${pw} mots)`, "Visez 55 à 90 mots.", { sec: prof });
+    }
+    const need = [["experience", "Expérience professionnelle", "warn"], ["skills", "Compétences", "warn"], ["languages", "Langues", "info"], ["education", "Formation", "info"]];
+    need.forEach(([k, label, lvl]) => { if (!o.sections.some((s) => SEC[k].test(s.title))) { add(lvl, "format", `no-${k}`, `Section « ${label} » absente`, null); read -= lvl === "warn" ? 10 : 5; } });
+    if (!o.sections.some((s) => SEC.achievements.test(s.title))) add("info", "impact", "no-achievements", "Pas de section « Réalisations clés »", "3 ou 4 résultats chiffrés en tête de CV captent l'attention du recruteur.");
+
+    const impactSecs = new Set(o.sections.map((s, i) => (SEC.achievements.test(s.title) || SEC.experience.test(s.title) ? i : -1)).filter((i) => i >= 0));
+    const bul = blocks.filter((b) => b.t === "bullet" && impactSecs.has(b.sec));
+    const quant = bul.filter((b) => /\d/.test(b.text));
+    const weak = bul.filter((b) => WEAK_OPENERS[lang]?.test(b.text.trim()));
+    const qRatio = bul.length ? quant.length / bul.length : 0;
+    if (bul.length && qRatio < 0.4) add("warn", "impact", "quant", `${bul.length - quant.length} puce(s) sur ${bul.length} sans résultat chiffré`, "Ajoutez un ordre de grandeur réel (volume, %, délai, budget, utilisateurs) quand vous l'avez.", { sec: bul.find((b) => !/\d/.test(b.text))?.sec });
+    if (weak.length) add("warn", "impact", "weak", `${weak.length} puce(s) commencent par une formule faible`, `« ${weak[0].text.slice(0, 70)}${weak[0].text.length > 70 ? "…" : ""} » : commencez par un verbe d'action (Piloté, Déployé, Réduit…).`, { sec: weak[0].sec, autoFix: true });
+    const longB = blocks.filter((b) => b.t === "bullet" && b.text.length > 230);
+    if (longB.length) add("info", "format", "long-bullets", `${longB.length} puce(s) de plus de 2 lignes`, "Une idée par puce, 2 lignes maximum.", { sec: longB[0].sec });
+    if (ctx.voice !== "je") {
+      const pb = blocks.filter((b) => b.t === "bullet" && PRONOUNS[lang]?.test(b.text));
+      if (pb.length) add("info", "style", "bul-pron", `${pb.length} puce(s) à la première personne`, "Style CV : commencez directement par le verbe.", { sec: pb[0].sec });
+    }
+    impact = Math.round(100 * (0.65 * qRatio + 0.35 * (bul.length ? 1 - weak.length / bul.length : 0.5))) - cl.length * 6 - cla.length * 2;
+    if (words < 380) { add("warn", "format", "short", `CV court (${words} mots)`, "Visez 550 à 850 mots pour un poste de management."); read -= 15; }
+    if (words > 950) { add("warn", "format", "long", `CV long (${words} mots)`, "Visez 2 pages maximum : resserrez les postes anciens."); read -= 15; }
+    if (pages && pages > 2) { add("warn", "format", "pages", `${pages} pages`, "Visez 2 pages maximum."); read -= 20; }
+    read -= Math.min(15, longB.length * 3);
+  } else {
+    const subj = o.sections.find((s) => s.title)?.title || "";
+    const bodyText = o.sections.map((s, i) => secText[i]).join("\n");
+    const bodyHay = hayOf(bodyText);
+    if (!subj) add("warn", "format", "subject", "Objet absent", "Ajoutez « Objet : candidature au poste de … ».");
+    else if (titleForms.length && !titleIn(hayOf(subj))) add("warn", "ats", "subject-title", ctx.spontaneous ? "L'objet ne mentionne pas le rôle visé" : "L'objet ne reprend pas l'intitulé exact du poste", `Reprenez « ${ctx.jobTitle} »${ctx.spontaneous ? " (« Candidature spontanée — … »)" : ""}.`, { sec: o.sections.findIndex((s) => s.title === subj), autoFix: true });
+    if (ctx.spontaneous && /(votre annonce|votre offre|poste à pourvoir|vacature|your (job )?(ad|posting|offer))/i.test(bodyText)) add("block", "fiabilite", "no-ad", "La lettre fait référence à une annonce", "Candidature spontanée : aucune offre n'existe. Retirez « votre annonce », « le poste à pourvoir »…", { autoFix: true });
+    const ck = companyKey(ctx.company || "");
+    const companyIn = !ck || ck.length < 3 || bodyHay.includes(` ${ck} `) || bodyHay.includes(ck);
+    if (!companyIn) add("warn", "impact", "company", `La lettre ne cite pas ${ctx.company}`, "Nommez l'entreprise au moins une fois : une lettre générique se repère immédiatement.", { autoFix: true });
+    const paras = blocks.filter((b) => b.t === "para");
+    const lastPara = [...paras].reverse().find((b) => !/(agr[ée]er|salutations|groeten|regards|sincerely)/i.test(b.text));
+    const cta = lastPara && /(entretien|rencontr|[ée]changer|discuter|interview|meet|gesprek|kennismak|toelicht)/i.test(lastPara.text);
+    if (!cta) add("info", "impact", "cta", "Pas de demande d'entretien en conclusion", "Terminez par votre disponibilité pour un échange.", { sec: lastPara?.sec });
+    if (!/(madame|monsieur|dear|geachte|beste)/i.test(bodyText)) add("info", "format", "salutation", "Formule d'appel absente", "FR : « Madame, Monsieur, » ; NL : « Geachte heer, mevrouw, » ; EN : « Dear … ».");
+    if (!String(o.recipients.join(" ")).trim()) add("info", "format", "recipient", "Destinataire absent", null, { sec: "head" });
+    if (!o.date) add("info", "format", "date", "Lieu et date absents", null, { sec: "head" });
+    /* Débuts de phrase : jamais deux phrases consécutives en « Je ». */
+    const jeRe = lang === "en" ? /^I\b/ : lang === "nl" ? /^ik\b/i : /^(je\b|j'|j’)/i;
+    const sentences = letterBody(text).split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+    const jeFlags = sentences.map((x) => jeRe.test(x));
+    const jeRuns = jeFlags.filter((f, i) => f && jeFlags[i - 1]).length;
+    const je = jeFlags.filter(Boolean).length;
+    if (jeRuns) add("warn", "style", "je-run", `${jeRuns + 1 > 2 ? `${jeRuns} enchaînements` : "Deux phrases consécutives"} en « ${lang === "en" ? "I" : lang === "nl" ? "Ik" : "Je"} »`, "Commencez l'une par l'entreprise, le rôle ou un fait.", { autoFix: true });
+
+    /* Lettre ≠ CV : complémentarité (recouvrement, chiffres). */
+    const m = letterMetrics(text, ctx.cvText);
+    if (m.overlap !== null) {
+      if (m.overlap > 30) add("block", "complementarite", "overlap", `La lettre recopie le CV (${m.overlap} % de recouvrement)`, "Au-delà de 30 %, la lettre résume le CV. Remplacez les preuves par le « pourquoi » : entreprise, rôle, méthode, une histoire racontée.", { autoFix: true });
+      else if (m.overlap > 15) add("warn", "complementarite", "overlap", `Recouvrement avec le CV : ${m.overlap} %`, "Visez 15 % maximum : la lettre explique, le CV prouve.", { autoFix: true });
+    } else add("info", "complementarite", "no-cv", "Recouvrement non mesuré : aucun CV pour cette candidature", "Générez ou enregistrez d'abord le CV.");
+    if (m.sharedNumbers > 1) add("warn", "complementarite", "shared-nums", `${m.sharedNumbers} chiffres repris du CV`, "Gardez au plus un chiffre commun : le CV porte les résultats.", { autoFix: true });
+    if (m.numbers > 2) add("warn", "complementarite", "nums", `${m.numbers} chiffres dans la lettre`, "2 au maximum : une preuve racontée vaut mieux qu'une série de résultats.", { autoFix: true });
+
+    /* Spécificité : pourquoi eux, conviction, histoire, sans flatterie. */
+    const bodyTok = sigTokens(letterBody(text));
+    const facts = (ctx.companyFacts || []).filter(Boolean);
+    const whyThem = facts.some((f) => echoes(bodyTok, f));
+    if (!ctx.spontaneous || ctx.spontaneous === "company") {
+      if (!facts.length) add("warn", "specificite", "why-them", "« Pourquoi eux » non étayé", "Aucun fait vérifié sur l'entreprise : collez l'annonce complète ou complétez le contexte de l'entreprise.");
+      else if (!whyThem) add("warn", "specificite", "why-them", "« Pourquoi eux » absent", "Aucun fait propre à l'entreprise n'est repris : une phrase qui resterait vraie pour un concurrent est interchangeable.", { autoFix: true });
+    }
+    const motiv = ctx.motivation || emptyMotivation();
+    const convOk = motiv.convictions.some((c) => echoes(bodyTok, c.text));
+    const storyOk = motiv.stories.some((st) => echoes(bodyTok, [st.situation, st.action, st.result].join(" ")));
+    if (!motiv.convictions.length) add("info", "specificite", "conviction", "Aucune conviction dans votre profil", "Renseignez vos convictions (Profil & critères → Motivations) : elles rendent la lettre personnelle.");
+    else if (!convOk) add("warn", "specificite", "conviction", "Aucune de vos convictions n'apparaît", "Reliez « pourquoi ce rôle » à une conviction que vous défendez.", { autoFix: true });
+    if (!motiv.stories.length) add("info", "specificite", "story", "Banque d'histoires vide", "Ajoutez 2 ou 3 histoires (Motivations) : la lettre en raconte une.");
+    else if (!storyOk) add("warn", "specificite", "story", "Aucune histoire racontée", "Racontez une histoire de votre banque (situation → action → effet) plutôt qu'une liste de résultats.", { autoFix: true });
+    const flat = (FLATTERY[lang] || FLATTERY.fr).filter((c) => kwCount(bodyHay, { term: c, variants: [] }) > 0);
+    if (flat.length) add("warn", "specificite", "flattery", `Flatterie : ${flat.slice(0, 4).join(", ")}`, "Remplacez le compliment par un fait précis sur l'entreprise.", { autoFix: true });
+    const kwUsed = kw.filter((k) => k.found && k.status !== "absent" && k.importance >= 2).length;
+    if (kwUsed > 6) add("info", "complementarite", "kw-many", `${kwUsed} mots-clés de l'annonce dans la lettre`, "2 à 4 suffisent : la lettre n'est pas un second CV.");
+
+    const spec = clamp(100 - (facts.length ? (whyThem ? 0 : 35) : 25) - (motiv.convictions.length ? (convOk ? 0 : 25) : 15) - (motiv.stories.length ? (storyOk ? 0 : 25) : 15) - flat.length * 10 - (companyIn ? 0 : 15), 0, 100);
+    const compl = m.overlap === null ? null : clamp(100 - Math.max(0, m.overlap - 10) * 4 - Math.max(0, m.sharedNumbers - 1) * 15 - Math.max(0, m.numbers - 2) * 10, 0, 100);
+    impact = 100 - (cta ? 0 : 20) - (storyOk ? 0 : 20) - (subj && (!titleForms.length || titleIn(hayOf(subj))) ? 0 : 15) - cl.length * 8;
+    read -= jeRuns * 8 + Math.max(0, je - 4) * 3;
+    letterScores = { spec, compl, overlap: m.overlap, numbers: m.numbers, sharedNumbers: m.sharedNumbers };
+    const [minW, maxW] = ctx.spontaneous ? [220, 300] : [250, 320];
+    if (words < minW - 40) { add("info", "format", "short", `Lettre courte (${words} mots)`, `Visez ${minW} à ${maxW} mots.`); read -= 10; }
+    if (words > maxW + 80) { add("warn", "format", "long", `Lettre longue (${words} mots)`, `Une page maximum : visez ${minW} à ${maxW} mots.`); read -= 15; }
+    if (pages && pages > 1) { add("warn", "format", "pages", `La lettre tient sur ${pages} pages`, "Une page maximum."); read -= 20; }
+  }
+  read -= reps.length * 4;
+  if (!o.contact) read -= 20;
+  const ats = kwPct === null ? (titleFound === null ? null : titleFound ? 80 : 50) : Math.round(0.78 * kwPct + (titleFound === false ? 0 : 22));
+  const sc = (n) => (n === null ? null : clamp(Math.round(n), 0, 100));
+  /* CV : ATS 40 / impact 35 / lisibilité 25. Lettre : spécificité 35 / complémentarité 25 / impact 20 / lisibilité 20 (plus de mots-clés). */
+  const scores = kind === "cv"
+    ? { ats: sc(ats), impact: sc(impact), read: sc(read) }
+    : { ats: null, spec: sc(letterScores?.spec ?? null), compl: sc(letterScores?.compl ?? null), impact: sc(impact), read: sc(read), overlap: letterScores?.overlap ?? null, numbers: letterScores?.numbers ?? null };
+  const parts = (kind === "cv"
+    ? [[scores.ats, 0.4], [scores.impact, 0.35], [scores.read, 0.25]]
+    : [[scores.spec, 0.35], [scores.compl, 0.25], [scores.impact, 0.2], [scores.read, 0.2]]).filter(([v]) => v !== null);
+  let total = Math.round(parts.reduce((n, [v, w]) => n + v * w, 0) / parts.reduce((n, [, w]) => n + w, 0));
+  const blockers = issues.filter((i) => i.level === "block").length;
+  if (blockers) total = Math.min(total, 69);
+  issues.sort((a, b) => LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level]);
+  return { kind, issues, kw, kwPct, titleFound, scores: { ...scores, total }, words, blockers };
+}
+
+/* Points que la passe de correction automatique traite après génération. */
+function autoFixList(rep) {
+  const list = rep.issues.filter((i) => i.autoFix).map((i) => ({ title: i.title, detail: i.detail }));
+  /* Lettre : aucune injection de mots-clés. */
+  if (rep.kind === "cv") rep.kw.filter((k) => k.status !== "absent" && !k.found && k.importance >= 2).slice(0, 10)
+    .forEach((k) => list.push({ title: `Intégrer le mot-clé « ${k.term} »`, detail: k.evidence ? `preuve dans le profil : ${k.evidence}` : "justifié par le profil" }));
+  return list.slice(0, 14);
 }
 
 /* PDF texte (lisible par les ATS) via jsPDF, chargé à la demande depuis cdnjs. */
@@ -540,911 +1291,97 @@ function loadJsPDF() {
   }
   return jspdfPromise;
 }
-/* Les polices PDF standard couvrent le jeu Windows-1252 (€, œ, ’, “ ”, – …). Hors de ce jeu, on retire
-   les accents (Dvořák → Dvorak) au lieu de supprimer la lettre. */
-const CP1252_EXTRA = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ";
-const TRANSLIT = { "\u0141": "L", "\u0142": "l", "\u0110": "D", "\u0111": "d", "\u0131": "i", "\u2192": "->", "\u2713": "v" };
 const pdfSafe = (t) => String(t || "")
-  .replace(/[\u00A0\u202F\u2009]/g, " ").replace(/\u2212/g, "-").replace(/\u2032/g, "'").replace(/\u2033/g, '"')
-  .replace(/[^\x00-\xFF]/g, (ch) => (CP1252_EXTRA.includes(ch) ? ch : TRANSLIT[ch] ?? ch.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\x00-\xFF]/g, "")));
+  .replace(/[\u2018\u2019\u201A\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u2033]/g, '"')
+  .replace(/[\u2013\u2014\u2212]/g, "-").replace(/\u2026/g, "...").replace(/\u20AC/g, "EUR")
+  .replace(/\u0153/g, "oe").replace(/\u0152/g, "OE").replace(/[\u00A0\u202F\u2009]/g, " ").replace(/[\u2022\u25CF\u25AA]/g, "-")
+  .replace(/[^\x00-\xFF]/g, "");
 
-/* ── Langues, sections, icônes ─────────────────────────────────────────── */
-const DOC_LANGS = ["fr", "nl", "en", "de"];
-const SECTION_ALIASES = {
-  profile: ["profil", "profiel", "profile", "summary", "professional summary", "résumé", "à propos", "about me", "over mij", "kurzprofil", "profil professionnel"],
-  achievements: ["réalisations clés", "réalisations", "belangrijkste realisaties", "realisaties", "key achievements", "achievements", "wichtigste erfolge", "erfolge"],
-  experience: ["expérience professionnelle", "expérience", "expériences", "parcours professionnel", "werkervaring", "beroepservaring", "ervaring", "professional experience", "work experience", "experience", "berufserfahrung", "berufliche erfahrung"],
-  skills: ["compétences", "compétences clés", "vaardigheden", "competenties", "skills", "core skills", "key skills", "kompetenzen", "kenntnisse", "fähigkeiten"],
-  languages: ["langues", "talen", "talenkennis", "languages", "sprachen", "sprachkenntnisse"],
-  education: ["formation", "formations", "études", "opleiding", "opleidingen", "education", "ausbildung", "bildung"],
-  certifications: ["certifications", "certificats", "certificaties", "certificaten", "certificates", "zertifikate", "zertifizierungen"],
-  interests: ["centres d'intérêt", "intérêts", "loisirs", "interesses", "hobby's", "interests", "hobbies", "interessen"],
-  projects: ["projets", "projets clés", "projecten", "projects", "key projects", "projekte"],
-};
-const SECTION_TITLES = {
-  fr: { profile: "Profil", achievements: "Réalisations clés", experience: "Expérience professionnelle", skills: "Compétences", languages: "Langues", education: "Formation", certifications: "Certifications", interests: "Centres d'intérêt", projects: "Projets" },
-  nl: { profile: "Profiel", achievements: "Belangrijkste realisaties", experience: "Werkervaring", skills: "Vaardigheden", languages: "Talen", education: "Opleiding", certifications: "Certificaten", interests: "Interesses", projects: "Projecten" },
-  en: { profile: "Profile", achievements: "Key achievements", experience: "Professional experience", skills: "Skills", languages: "Languages", education: "Education", certifications: "Certifications", interests: "Interests", projects: "Projects" },
-  de: { profile: "Profil", achievements: "Wichtigste Erfolge", experience: "Berufserfahrung", skills: "Kompetenzen", languages: "Sprachen", education: "Ausbildung", certifications: "Zertifikate", interests: "Interessen", projects: "Projekte" },
-};
-const ALIAS_INDEX = Object.entries(SECTION_ALIASES).flatMap(([k, l]) => l.map((a) => [normText(a), k]));
-function sectionKey(title) {
-  const n = normText(title);
-  const hit = ALIAS_INDEX.find(([a]) => a === n) || ALIAS_INDEX.find(([a]) => a.length > 5 && n.startsWith(a));
-  return hit ? hit[1] : `x_${n.replace(/\s+/g, "_").slice(0, 30) || "section"}`;
-}
-const baseKey = (k) => String(k || "").replace(/_\d+$/, "");
-const sectionLabel = (sec) => sec?.title || SECTION_TITLES.fr[baseKey(sec?.key)] || "Introduction";
-const SIDE_DEFAULT = ["skills", "languages", "certifications", "interests"];
-const PHOTO_SRC = { l0: -1, l1: -1, photo: true };
-
-/* Icônes vectorielles (24 × 24, trait), dessinées à l'identique dans l'aperçu, le PDF et le Word. */
-const DOC_ICONS = {
-  mail: ["M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M22 6l-10 7L2 6"],
-  phone: ["M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"],
-  pin: ["M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z", "M12 7a3 3 0 1 0 0 6a3 3 0 1 0 0-6z"],
-  linkedin: ["M16 8a6 6 0 0 1 6 6v7h-4v-7a2 2 0 0 0-4 0v7h-4v-7a6 6 0 0 1 6-6z", "M2 9h4v12H2z", "M4 2a2 2 0 1 0 0 4a2 2 0 1 0 0-4z"],
-  globe: ["M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z", "M2 12h20", "M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"],
-  user: ["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 3a4 4 0 1 0 0 8a4 4 0 1 0 0-8z"],
-  award: ["M12 2a7 7 0 1 0 0 14a7 7 0 1 0 0-14z", "M8.21 13.89L7 23l5-3 5 3-1.21-9.12"],
-  briefcase: ["M4 7h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z", "M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"],
-  zap: ["M13 2L3 14h9l-1 8 10-12h-9l1-8z"],
-  chat: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
-  cap: ["M22 10L12 5 2 10l10 5 10-5z", "M6 12v5c3 3 9 3 12 0v-5"],
-  check: ["M22 11.08V12a10 10 0 1 1-5.93-9.14", "M22 4L12 14.01l-3-3"],
-  heart: ["M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"],
-  folder: ["M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"],
-};
-const SECTION_ICON = { profile: "user", achievements: "award", experience: "briefcase", skills: "zap", languages: "chat", education: "cap", certifications: "check", interests: "heart", projects: "folder" };
-const contactIcon = (s) => (/^\S+@\S+\.\S+$/.test(s) ? "mail" : /linkedin\./i.test(s) ? "linkedin" : /^\+?[\d\s().\/-]{7,}$/.test(s) ? "phone" : /^(https?:\/\/|www\.)|\.(com|be|eu|net|org|io|dev|me|lu|nl|fr)(\/\S*)?$/i.test(s) ? "globe" : "pin");
-
-/* ── Modèle de document ────────────────────────────────────────────────── */
-function docModel(text, kind) {
-  const blocks = parseDoc(text);
-  const head = { name: null, headline: [], contact: [] };
-  const letter = { date: null, recipient: [], subject: null, body: [], sign: null };
-  const sections = [];
-  const seen = {};
-  let cur = null;
-  for (const b of blocks) {
-    if (kind === "letter") {
-      if (b.t === "name" && !head.name) head.name = b;
-      else if (b.t === "contact" && !letter.body.length) head.contact.push(b);
-      else if (b.t === "date" && !letter.date) letter.date = b;
-      else if (b.t === "quote" && !letter.subject && !letter.body.length) letter.recipient.push(b);
-      else if (b.t === "h2" && !letter.subject && !letter.body.length) letter.subject = b;
-      else if (b.t === "sign") letter.sign = b;
-      else letter.body.push(b);
-      continue;
-    }
-    if (b.t === "h2") {
-      let key = sectionKey(b.text);
-      seen[key] = (seen[key] || 0) + 1;
-      if (seen[key] > 1) key = `${key}_${seen[key]}`;
-      cur = { key, title: b.text, heading: b, blocks: [] };
-      sections.push(cur);
-      continue;
-    }
-    if (!cur) {
-      if (b.t === "name" && !head.name) { head.name = b; continue; }
-      if (b.t === "quote") { head.headline.push(b); continue; }
-      if (b.t === "contact") { head.contact.push(b); continue; }
-      cur = { key: "intro", title: null, heading: null, blocks: [] };
-      sections.push(cur);
-    }
-    cur.blocks.push(b);
-  }
-  return { kind, head, sections, letter, blocks };
-}
-const contactItems = (head) => head.contact.flatMap((b) => b.text.split(/\s*[|·•]\s*/).map((s) => s.trim()).filter(Boolean).map((s) => ({ text: s, icon: contactIcon(s), src: b })));
-
-function arrangeSections(sections, layout, two) {
-  const L = layout || {};
-  const keys = sections.map((s) => s.key);
-  const order = [...(L.order || []).filter((k) => keys.includes(k)), ...keys.filter((k) => !(L.order || []).includes(k))];
-  const hidden = new Set(L.hidden || []);
-  const isSide = (k) => (Array.isArray(L.side) ? L.side.includes(k) : SIDE_DEFAULT.includes(baseKey(k)));
-  const byKey = Object.fromEntries(sections.map((s) => [s.key, s]));
-  const main = [], side = [];
-  order.forEach((k) => { if (!hidden.has(k)) (two && isSide(k) ? side : main).push(byKey[k]); });
-  return { main, side, order, hidden, isSide };
-}
-
-/* ── Design : base, gabarits ───────────────────────────────────────────── */
-const PAGE_SIZES = { a4: [210, 297], letter: [215.9, 279.4] };
-const PT = 0.3528; // mm par point typographique
-const FONT_CSS = { sans: 'Helvetica, Arial, "Liberation Sans", sans-serif', serif: '"Times New Roman", Times, "Liberation Serif", serif', mono: '"Courier New", Courier, "Liberation Mono", monospace' };
-const FONT_PDF = { sans: "helvetica", serif: "times", mono: "courier" };
-const FONT_DOCX = { sans: "Arial", serif: "Times New Roman", mono: "Courier New" };
-
-const DESIGN_BASE = {
-  template: "ats", page: "a4",
-  font: "sans", headingFont: "sans", size: 10, lineHeight: 1.35, nameSize: 2.3, headingSize: 1.08, headingCase: "upper", headingSpacing: 0.4,
-  margin: { t: 16, r: 17, b: 15, l: 17 }, sectionGap: 5, itemGap: 2.2, paraGap: 1.6,
-  colors: { accent: "#1f3a5f", text: "#262626", muted: "#6b6b6b", rule: "#d4d4d4", side: "#f1f5f9", sideText: "#262626", band: "#1f3a5f", bandText: "#ffffff" },
-  header: "left", headingStyle: "line", rule: 0.3, bullet: "dot",
-  icons: false, sectionIcons: false, datesRight: true, skillsAsTags: false, justify: false,
-  columns: 1, side: "left", sideWidth: 32, colGap: 7, sideFull: false,
-  photo: { show: false, shape: "circle", size: 28, border: 0, borderColor: "#ffffff" },
-  layout: { order: [], side: null, hidden: [] },
-};
-const TEMPLATES = [
-  { id: "ats", label: "Classique ATS", hint: "1 colonne, sobre, lu par tous les logiciels de tri", d: { colors: { accent: "#1f3a5f", rule: "#1f3a5f" }, rule: 0.35 } },
-  { id: "modern", label: "Moderne", hint: "2 colonnes, photo ronde, icônes", d: { columns: 2, side: "right", sideWidth: 31, header: "left", headingStyle: "bar", icons: true, photo: { show: true, shape: "circle", size: 26 }, colors: { accent: "#2563eb", side: "#f1f5f9", rule: "#e2e8f0", band: "#2563eb" } } },
-  { id: "executive", label: "Exécutif", hint: "bandeau bord à bord, titres serif", d: { header: "band", headingFont: "serif", headingStyle: "line", icons: true, nameSize: 2.4, photo: { show: true, shape: "rounded", size: 27, border: 0.8, borderColor: "#ffffff" }, colors: { accent: "#1e293b", band: "#1e293b", bandText: "#ffffff", rule: "#94a3b8" } } },
-  { id: "minimal", label: "Minimal", hint: "centré, aéré, sans filet", d: { header: "center", headingStyle: "plain", headingSpacing: 1.4, headingSize: 0.95, sectionGap: 6.5, lineHeight: 1.45, colors: { accent: "#111827", muted: "#6b7280", rule: "#e5e7eb" } } },
-  { id: "compact", label: "Compact", hint: "dense, tient sur une page", d: { columns: 2, side: "left", sideWidth: 30, size: 9.2, lineHeight: 1.25, sectionGap: 3.6, itemGap: 1.6, paraGap: 1.1, headingStyle: "pill", skillsAsTags: true, margin: { t: 12, r: 12, b: 12, l: 12 }, colors: { accent: "#0f766e", side: "#f0fdfa", rule: "#99f6e4", band: "#0f766e" } } },
-  { id: "creative", label: "Créatif", hint: "colonne colorée bord à bord, photo", d: { columns: 2, side: "left", sideWidth: 33, sideFull: true, header: "side", headingStyle: "line", icons: true, sectionIcons: true, skillsAsTags: true, photo: { show: true, shape: "circle", size: 34, border: 1, borderColor: "#ffffff" }, colors: { accent: "#0f766e", side: "#134e4a", sideText: "#f0fdfa", rule: "#5eead4", band: "#0f766e" } } },
-  { id: "elegant", label: "Élégant", hint: "serif, centré, filets doubles", d: { font: "serif", headingFont: "serif", header: "center", headingStyle: "double", headingSpacing: 1.6, headingSize: 1.0, nameSize: 2.5, lineHeight: 1.4, colors: { accent: "#7c2d12", rule: "#d6c7b8", band: "#7c2d12" } } },
-];
-const TEMPLATE_BY_ID = Object.fromEntries(TEMPLATES.map((t) => [t.id, t]));
-function mergeDesign(a, b) {
-  const o = { ...a, ...(b || {}) };
-  ["colors", "margin", "photo", "layout"].forEach((k) => { o[k] = { ...(a?.[k] || {}), ...(b?.[k] || {}) }; });
-  return o;
-}
-function designFromTemplate(id, keep) {
-  const d = mergeDesign(DESIGN_BASE, TEMPLATE_BY_ID[id]?.d);
-  d.template = TEMPLATE_BY_ID[id] ? id : "ats";
-  if (keep?.layout) d.layout = deepClone(keep.layout);
-  if (keep?.accent) d.colors = { ...d.colors, accent: keep.accent, ...(TEMPLATE_BY_ID[id]?.d?.colors?.band === TEMPLATE_BY_ID[id]?.d?.colors?.accent ? { band: keep.accent } : {}) };
-  if (keep?.photoShow !== undefined) d.photo = { ...d.photo, show: keep.photoShow };
-  if (keep?.page) d.page = keep.page;
-  return d;
-}
-/* Design effectif d'une candidature : celui de la candidature, sinon le style par défaut, sinon le gabarit ATS
-   teinté de la couleur de charte proposée par l'IA. */
-function resolveDesign(app, settings, accent) {
-  if (app?.design) return mergeDesign(DESIGN_BASE, app.design);
-  const base = settings?.designDefault ? mergeDesign(DESIGN_BASE, settings.designDefault) : designFromTemplate("ats");
-  const a = cleanHex(accent, null);
-  return a ? { ...base, colors: { ...base.colors, accent: a, ...(base.colors.band === base.colors.accent ? { band: a } : {}), ...(base.colors.rule === base.colors.accent ? { rule: a } : {}) } } : base;
-}
-
-/* ── Mesure du texte (canvas : Arial ≈ Helvetica, Times New Roman ≈ Times, métriques compatibles) ── */
-let measureCtx = null;
-const measureCache = new Map();
-function textWidth(s, f) {
-  const key = `${f.font}|${f.bold ? 1 : 0}|${f.italic ? 1 : 0}|${s}`;
-  let r = measureCache.get(key);
-  if (r === undefined) {
-    if (measureCtx === null && typeof document !== "undefined") { try { measureCtx = document.createElement("canvas").getContext("2d") || false; } catch { measureCtx = false; } }
-    if (measureCtx) {
-      measureCtx.font = `${f.italic ? "italic " : ""}${f.bold ? "bold " : ""}100px ${FONT_CSS[f.font] || FONT_CSS.sans}`;
-      r = measureCtx.measureText(s).width / 100;
-    } else r = s.length * (f.bold ? 0.56 : 0.52);
-    if (measureCache.size > 30000) measureCache.clear();
-    measureCache.set(key, r);
-  }
-  return r * f.size * PT + (f.cs ? f.cs * Math.max(0, s.length - 1) : 0);
-}
-function wrapText(s, firstW, f, restW = firstW) {
-  const words = String(s || "").split(/\s+/).filter(Boolean);
-  const lines = [];
-  let cur = "";
-  const width = () => (lines.length ? restW : firstW) * 0.99;
-  for (const w of words) {
-    const t = cur ? `${cur} ${w}` : w;
-    if (textWidth(t, f) <= width()) { cur = t; continue; }
-    if (cur) { lines.push(cur); cur = ""; }
-    if (textWidth(w, f) <= width()) { cur = w; continue; }
-    let part = "";
-    for (const ch of w) {
-      if (part && textWidth(part + ch, f) > width()) { lines.push(part); part = ch; } else part += ch;
-    }
-    cur = part;
-  }
-  if (cur || !lines.length) lines.push(cur);
-  return lines;
-}
-
-/* ── Mise en page : positions en mm, pages, zones cliquables ─────────────
-   Opérations : rect, line, circle, text (ligne de base), icon, photo. Zones : blocs (l0..l1) et sections. */
-function layoutDocument(model, design, { photo, lang = "fr" } = {}) {
-  const D = mergeDesign(DESIGN_BASE, design);
-  const C = D.colors;
-  const [W, H] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
-  const M = D.margin;
-  const isCv = model.kind === "cv";
-  const two = isCv && Number(D.columns) === 2;
-  const contentW = W - M.l - M.r;
-  const sideW = two ? (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100 : 0;
-  const mainW = two ? contentW - sideW - D.colGap : contentW;
-  const sideLeft = D.side !== "right";
-  const sideX = sideLeft ? M.l : M.l + mainW + D.colGap;
-  const mainX = two && sideLeft ? M.l + sideW + D.colGap : M.l;
-  const bottom = H - Math.max(M.b, 6) - 3;
-  const sideDark = luminance(C.side) < 0.35;
-  const sideBg = two && cleanHex(C.side) !== "#ffffff";
-  const pad = sideBg && !D.sideFull ? 4 : 0;
-  const headerMode = D.header === "side" && !two ? "left" : D.header;
-  const hasPhoto = !!(photo && D.photo.show);
-  const pages = [];
-  const page = (i) => { while (pages.length <= i) pages.push({ ops: [], hits: [], secs: [], sideTop: 0, sideBottom: 0 }); return pages[i]; };
-  const lh = (size) => size * PT * D.lineHeight;
-  const base = (size) => (lh(size) - size * PT) / 2 + size * PT * 0.8;
-  const boxes = new Map();
-  const track = (src, p, x, y0, w, y1, kind = "block") => {
-    if (!src) return;
-    const id = kind === "section" ? `s:${src.key}:${p}` : `b:${src.l0}:${p}`;
-    const b = boxes.get(id);
-    if (b) { b.x = Math.min(b.x, x); b.y0 = Math.min(b.y0, y0); b.x1 = Math.max(b.x1, x + w); b.y1 = Math.max(b.y1, y1); }
-    else boxes.set(id, { kind, p, x, y0, x1: x + w, y1, src });
-  };
-  const caseOf = (s) => (D.headingCase === "upper" ? String(s).toLocaleUpperCase(lang === "de" ? "de-DE" : "fr-BE") : s);
-  const palette = (inSide) => ({
-    text: inSide && sideBg ? C.sideText : C.text,
-    muted: inSide && sideBg ? (sideDark ? mixHex(C.sideText, C.side, 0.28) : C.muted) : C.muted,
-    accent: inSide && sideDark ? C.sideText : C.accent,
-    rule: inSide && sideDark ? mixHex(C.sideText, C.side, 0.45) : C.rule,
-    tag: inSide && sideDark ? mixHex(C.side, "#ffffff", 0.16) : mixHex(C.accent, "#ffffff", 0.88),
-    tagText: inSide && sideDark ? C.sideText : mixHex(C.accent, "#000000", 0.15),
-  });
-
-  /* Flux de colonne : y courant, page courante, saut de page automatique. */
-  const flow = (x, w, top, inSide) => ({ x, w, y: top, p: 0, top, inSide, first: true });
-  const ensure = (fl, h) => { if (fl.y + h > bottom && fl.y > M.t + 0.5) { fl.p += 1; fl.y = M.t + (fl.inSide && pad ? pad : 0); fl.first = true; } };
-  const text = (fl, s, x, f, anchor = "start", size = f.size) => {
-    page(fl.p).ops.push({ t: "text", x, y: fl.y + base(size), s, font: f.font, bold: !!f.bold, italic: !!f.italic, size: f.size, color: f.color, anchor, cs: f.cs || 0 });
-  };
-  const lines = (fl, arr, f, { x = fl.x, w = fl.w, src, justify = false, align = "start" } = {}) => {
-    const h = lh(f.size);
-    arr.forEach((ln, i) => {
-      ensure(fl, h);
-      if (justify && i < arr.length - 1 && ln.includes(" ")) {
-        const words = ln.split(" ");
-        const gap = (w - words.reduce((n, wd) => n + textWidth(wd, f), 0)) / (words.length - 1);
-        let cx = x;
-        if (gap < textWidth(" ", f) * 3) words.forEach((wd) => { text(fl, wd, cx, f); cx += textWidth(wd, f) + gap; });
-        else text(fl, ln, x, f);
-      } else if (align === "end") text(fl, ln, x + w, f, "end");
-      else if (align === "middle") text(fl, ln, x + w / 2, f, "middle");
-      else text(fl, ln, x, f);
-      track(src, fl.p, x, fl.y, w, fl.y + h);
-      fl.y += h;
-    });
-  };
-  const icon = (p, name, x, y, s, color) => { if (DOC_ICONS[name]) page(p).ops.push({ t: "icon", name, x, y, s, color }); };
-
-  /* ── Blocs ── */
-  const bulletMark = (fl, f, cy, color) => {
-    const x = fl.x + 0.9;
-    const o = page(fl.p).ops;
-    if (D.bullet === "dot") o.push({ t: "circle", cx: x + 0.3, cy, r: 0.55, fill: color });
-    else if (D.bullet === "square") o.push({ t: "rect", x: x - 0.25, y: cy - 0.55, w: 1.1, h: 1.1, fill: color });
-    else if (D.bullet === "dash") o.push({ t: "line", x1: x - 0.4, y1: cy, x2: x + 1.2, y2: cy, color, w: 0.3 });
-    else if (D.bullet === "arrow") o.push({ t: "text", x: x - 0.4, y: cy + f.size * PT * 0.32, s: "›", font: f.font, bold: true, italic: false, size: f.size * 1.15, color, anchor: "start", cs: 0 });
-  };
-  const block = (fl, b, sec) => {
-    const P = palette(fl.inSide);
-    const body = { font: D.font, size: D.size, color: P.text };
-    const key = baseKey(sec?.key);
-    if (b.t === "h3") {
-      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-      const role = parts[0] || "";
-      let rest = parts.slice(1);
-      const last = rest[rest.length - 1];
-      const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel|nu\b/i.test(last) ? last : null;
-      if (period) rest = rest.slice(0, -1);
-      const fRole = { font: D.font, bold: true, size: D.size * 1.03, color: P.text };
-      const fMeta = { font: D.font, size: D.size * 0.9, color: P.muted };
-      if (!fl.first) fl.y += D.itemGap * 0.8;
-      ensure(fl, lh(fRole.size) * 2 + lh(D.size));
-      const right = D.datesRight && period && fl.w > 60;
-      const pw = right ? textWidth(period, fMeta) + 3 : 0;
-      const rl = wrapText(role, fl.w - pw, fRole);
-      if (right) {
-        ensure(fl, lh(fRole.size));
-        page(fl.p).ops.push({ t: "text", x: fl.x + fl.w, y: fl.y + base(fRole.size), s: period, font: fMeta.font, bold: false, italic: false, size: fMeta.size, color: P.muted, anchor: "end", cs: 0 });
-      }
-      lines(fl, rl, fRole, { src: b, w: fl.w });
-      const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
-      if (meta) lines(fl, wrapText(meta, fl.w, fMeta), fMeta, { src: b });
-      fl.y += 0.6;
-    } else if (b.t === "bullet") {
-      const ind = D.bullet === "none" ? 0 : 3.6;
-      const arr = wrapText(b.text, fl.w - ind, body);
-      ensure(fl, lh(D.size));
-      if (D.bullet !== "none") bulletMark(fl, body, fl.y + lh(D.size) / 2, P.accent);
-      lines(fl, arr, body, { x: fl.x + ind, w: fl.w - ind, src: b });
-      track(b, fl.p, fl.x, fl.y - lh(D.size), ind, fl.y);
-      fl.y += D.itemGap * 0.25;
-    } else if (b.t === "kv") {
-      const fL = { ...body, bold: true };
-      if (D.skillsAsTags && key === "skills") {
-        const fT = { font: D.font, size: D.size * 0.86, color: P.tagText };
-        if (b.label) { lines(fl, wrapText(b.label.replace(/\s*:\s*$/, ""), fl.w, { ...fL, size: D.size * 0.92, color: P.muted }), { ...fL, size: D.size * 0.92, color: P.muted }, { src: b }); fl.y += 0.4; }
-        const tags = b.text.split(/\s*[,;·]\s*/).filter(Boolean);
-        const th = lh(fT.size) + 0.9;
-        let cx = fl.x;
-        ensure(fl, th + 1);
-        tags.forEach((tg) => {
-          const tw = Math.min(textWidth(tg, fT) + 3.4, fl.w);
-          if (cx > fl.x && cx + tw > fl.x + fl.w) { cx = fl.x; fl.y += th + 1.1; ensure(fl, th + 1); }
-          page(fl.p).ops.push({ t: "rect", x: cx, y: fl.y, w: tw, h: th, fill: P.tag, r: 1.2 });
-          page(fl.p).ops.push({ t: "text", x: cx + 1.7, y: fl.y + 0.45 + base(fT.size), s: tg, font: fT.font, bold: false, italic: false, size: fT.size, color: fT.color, anchor: "start", cs: 0 });
-          track(b, fl.p, cx, fl.y, tw, fl.y + th);
-          cx += tw + 1.3;
-        });
-        fl.y += th + 1.6;
-      } else {
-        const label = `${b.label} `;
-        const lw = textWidth(label, fL);
-        const arr = wrapText(b.text, Math.max(10, fl.w - lw), body, fl.w);
-        ensure(fl, lh(D.size));
-        text(fl, label.trim(), fl.x, fL);
-        lines(fl, arr.slice(0, 1), body, { x: fl.x + lw, w: fl.w - lw, src: b });
-        track(b, fl.p, fl.x, fl.y - lh(D.size), lw, fl.y);
-        if (arr.length > 1) lines(fl, arr.slice(1), body, { src: b });
-        fl.y += D.itemGap * 0.3;
-      }
-    } else if (b.t === "quote") {
-      const f = { ...body, italic: true, color: P.muted };
-      lines(fl, wrapText(b.text, fl.w, f), f, { src: b });
-      fl.y += D.paraGap;
-    } else {
-      lines(fl, wrapText(b.text, fl.w, body), body, { src: b, justify: !isCv && D.justify });
-      fl.y += isCv ? D.paraGap : Math.max(D.paraGap * 1.8, 3);
-    }
-    fl.first = false;
-  };
-
-  const heading = (fl, sec) => {
-    const P = palette(fl.inSide);
-    const f = { font: D.headingFont, bold: true, size: D.size * D.headingSize, color: P.accent, cs: D.headingCase === "upper" ? D.headingSpacing * PT : 0 };
-    const hh = lh(f.size);
-    ensure(fl, hh + 4 + lh(D.size) * 2);
-    const o = () => page(fl.p).ops;
-    const y0 = fl.y;
-    let x = fl.x;
-    const label = caseOf(sectionLabel(sec));
-    if (D.headingStyle === "double" && D.rule > 0) { o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: P.rule, w: D.rule }); fl.y += 1.4; }
-    if (D.headingStyle === "pill") { o().push({ t: "rect", x: fl.x, y: fl.y - 0.3, w: fl.w, h: hh + 0.6, fill: P.tag, r: 1.4 }); x += 2.2; }
-    if (D.headingStyle === "bar") { o().push({ t: "rect", x: fl.x, y: fl.y + hh * 0.18, w: 1.2, h: hh * 0.64, fill: P.accent, r: 0.3 }); x += 3.4; }
-    const icName = D.sectionIcons && SECTION_ICON[baseKey(sec.key)];
-    if (icName) { const s = f.size * PT * 1.15; icon(fl.p, icName, x, fl.y + (hh - s) / 2, s, P.accent); x += s + 1.8; }
-    const ls = wrapText(label, fl.x + fl.w - x, f);
-    const center = D.headingStyle !== "pill" && D.headingStyle !== "bar" && D.header === "center" && !two && !icName;
-    ls.forEach((ln) => { center ? text(fl, ln, fl.x + fl.w / 2, f, "middle") : text(fl, ln, x, f); fl.y += hh; });
-    if ((D.headingStyle === "line" || D.headingStyle === "double") && D.rule > 0) { fl.y += 0.9; o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: D.headingStyle === "line" ? P.rule : P.rule, w: D.rule }); fl.y += D.rule; }
-    fl.y += D.headingStyle === "plain" ? 1.2 : 2;
-    if (sec.heading) track(sec.heading, fl.p, fl.x, y0, fl.w, fl.y);
-    fl.first = true;
-  };
-  const section = (fl, sec) => {
-    if (!sec) return;
-    if (!fl.firstSection) fl.y += D.sectionGap; else fl.firstSection = false;
-    const p0 = fl.p, y0 = fl.y;
-    if (sec.heading) heading(fl, sec);
-    sec.blocks.forEach((b) => block(fl, b, sec));
-    for (let p = p0; p <= fl.p; p++) track(sec, p, fl.x, p === p0 ? y0 : M.t, fl.w, p === fl.p ? fl.y : bottom, "section");
-    page(fl.p).secs.push(sec.key);
-  };
-
-  /* ── En-tête ── */
-  const header = (x, w, y, mode, inSide) => {
-    const fl = { x, w, y, p: 0, inSide, first: true };
-    const P = palette(inSide);
-    const band = mode === "band";
-    const nameColor = band ? C.bandText : P.accent;
-    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : P.muted;
-    const center = mode === "center" || mode === "side";
-    const S = D.photo.size;
-    let tx = x, tw = w;
-    const y0 = y;
-    if (hasPhoto) {
-      if (center) { page(0).ops.push({ t: "photo", x: x + (w - S) / 2, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); fl.y += S + 4; }
-      else { page(0).ops.push({ t: "photo", x, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); tx = x + S + 6; tw = w - S - 6; }
-      track(PHOTO_SRC, 0, center ? x + (w - S) / 2 : x, center ? fl.y - S - 4 : fl.y, S, center ? fl.y - 4 : fl.y + S);
-    }
-    const opStart = page(0).ops.length;
-    const al = center ? "middle" : "start";
-    const ax = center ? tx + tw / 2 : tx;
-    const put = (arr, f, src) => arr.forEach((ln) => { text(fl, ln, ax, f, al); track(src, 0, tx, fl.y, tw, fl.y + lh(f.size)); fl.y += lh(f.size); });
-    if (model.head.name) {
-      const f = { font: D.headingFont, bold: true, size: D.size * D.nameSize, color: nameColor };
-      put(wrapText(model.head.name.text, tw, f), f, model.head.name);
-    }
-    model.head.headline.forEach((hb) => { const f = { font: D.font, size: D.size * 1.12, color: subColor }; fl.y += 0.6; put(wrapText(hb.text, tw, f), f, hb); });
-    const items = contactItems(model.head);
-    if (items.length) {
-      fl.y += 1.6;
-      const f = { font: D.font, size: D.size * 0.88, color: band ? subColor : P.muted };
-      const is = D.icons ? f.size * PT * 1.15 : 0;
-      const sep = D.icons ? 4 : textWidth("  ·  ", f);
-      const h = lh(f.size) + 0.4;
-      if (inSide) {
-        items.forEach((it) => {
-          const iw = textWidth(it.text, f);
-          const cw = Math.min(tw, iw + (is ? is + 1.4 : 0));
-          const cx = tx + (tw - cw) / 2;
-          if (is) icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent);
-          const arr = wrapText(it.text, tw - (is ? is + 1.4 : 0), f);
-          arr.forEach((ln, i) => { text(fl, ln, is ? cx + is + 1.4 : tx + tw / 2, f, is ? "start" : "middle"); if (i < arr.length - 1) fl.y += lh(f.size); });
-          track(it.src, 0, tx, fl.y, tw, fl.y + h);
-          fl.y += h;
-        });
-      } else {
-        const rows = [[]];
-        let rw = 0;
-        items.forEach((it) => {
-          const iw = Math.min(textWidth(it.text, f), tw) + (is ? is + 1.2 : 0);
-          if (rows[rows.length - 1].length && rw + sep + iw > tw) { rows.push([]); rw = 0; }
-          rows[rows.length - 1].push({ ...it, iw });
-          rw += (rw ? sep : 0) + iw;
-        });
-        rows.forEach((row) => {
-          const total = row.reduce((n, it, i) => n + it.iw + (i ? sep : 0), 0);
-          let cx = center ? tx + (tw - total) / 2 : tx;
-          row.forEach((it, i) => {
-            if (i && !D.icons) text(fl, "·", cx + sep / 2, { ...f, bold: true }, "middle");
-            if (i) cx += sep;
-            if (is) { icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent); }
-            text(fl, it.text, cx + (is ? is + 1.2 : 0), f);
-            track(it.src, 0, cx, fl.y, it.iw, fl.y + h);
-            cx += it.iw;
-          });
-          fl.y += h;
-        });
-      }
-    }
-    // Texte centré verticalement sur la photo quand celle-ci est plus haute.
-    if (hasPhoto && !center && fl.y - y0 < S) {
-      const dy = (S - (fl.y - y0)) / 2;
-      page(0).ops.slice(opStart).forEach((o) => { o.y += dy; });
-      const heads = new Set([model.head.name, ...model.head.headline, ...model.head.contact].filter(Boolean));
-      boxes.forEach((b) => { if (b.p === 0 && heads.has(b.src)) { b.y0 += dy; b.y1 += dy; } });
-    }
-    return Math.max(fl.y, hasPhoto && !center ? y0 + S : 0);
-  };
-
-  /* ── Assemblage ── */
-  let mainTop = M.t, sideTop = M.t;
-  if (headerMode === "band") {
-    page(0);
-    const bandIdx = pages[0].ops.length;
-    const end = header(M.l, contentW, Math.max(M.t * 0.75, 8), "band", false);
-    const bh = end + Math.max(M.t * 0.6, 6);
-    pages[0].ops.splice(bandIdx, 0, { t: "rect", x: 0, y: 0, w: W, h: bh, fill: C.band });
-    mainTop = sideTop = bh + Math.max(D.sectionGap, 5);
-  } else if (headerMode === "side" && two) {
-    sideTop = header(sideX + pad, sideW - 2 * pad, M.t + pad, "side", true) + D.sectionGap + 1;
-    mainTop = M.t;
-  } else if (isCv || model.head.name || model.head.contact.length) {
-    const end = header(M.l, contentW, M.t, headerMode === "center" ? "center" : "left", false);
-    const rule = headerMode !== "center" && D.headingStyle !== "plain" && D.rule > 0;
-    if (rule) pages[0].ops.push({ t: "line", x1: M.l, y1: end + 2.2, x2: M.l + contentW, y2: end + 2.2, color: C.accent, w: Math.max(D.rule, 0.5) });
-    mainTop = sideTop = end + (rule ? 2.2 + D.sectionGap + 0.6 : D.sectionGap + 1);
-  }
-
-  if (isCv) {
-    const arr = arrangeSections(model.sections, D.layout, two);
-    const main = flow(mainX, mainW, mainTop, false);
-    main.firstSection = true;
-    arr.main.forEach((sec) => section(main, sec));
-    if (two) {
-      const side = flow(sideX + pad, sideW - 2 * pad, sideTop + (headerMode === "side" ? 0 : pad), true);
-      side.firstSection = true;
-      arr.side.forEach((sec) => section(side, sec));
-      page(side.p);
-      pages.forEach((pg, i) => {
-        const top = i === 0 ? (headerMode === "side" ? 0 : headerMode === "band" ? mainTop - Math.max(D.sectionGap, 5) : (D.sideFull ? sideTop - D.sectionGap * 0.5 : sideTop)) : 0;
-        if (!sideBg) return;
-        const rect = D.sideFull
-          ? { x: sideLeft ? 0 : sideX - D.colGap / 2, y: top, w: sideLeft ? sideX + sideW + D.colGap / 2 : W - (sideX - D.colGap / 2), h: H - top }
-          : { x: sideX, y: i === 0 && headerMode !== "side" ? sideTop : M.t, w: sideW, h: (i === side.p ? side.y + pad : bottom) - (i === 0 && headerMode !== "side" ? sideTop : M.t), r: 2.5 };
-        if (rect.h > 0) pg.ops.unshift({ t: "rect", ...rect, fill: C.side });
-      });
-    }
-    page(main.p);
-  } else {
-    const L = model.letter;
-    const fl = flow(M.l, contentW, mainTop + 2, false);
-    const body = { font: D.font, size: D.size, color: C.text };
-    if (L.date) { lines(fl, [L.date.text], { ...body, color: C.muted }, { align: "end", src: L.date }); fl.y += 3; }
-    L.recipient.forEach((r) => lines(fl, wrapText(r.text, contentW * 0.6, body), body, { src: r }));
-    if (L.recipient.length) fl.y += 5;
-    if (L.subject) { const f = { ...body, bold: true }; lines(fl, wrapText(L.subject.text, contentW, f), f, { src: L.subject }); fl.y += 4; }
-    L.body.forEach((b) => block(fl, b, null));
-    if (L.sign) { fl.y += 3; const f = { ...body, bold: true }; lines(fl, wrapText(L.sign.text, contentW, f), f, { src: L.sign }); }
-    page(fl.p);
-  }
-
-  /* Numéros de page, zones cliquables */
-  if (pages.length > 1) pages.forEach((pg, i) => pg.ops.push({ t: "text", x: W - Math.max(M.r, 8), y: H - Math.max(M.b * 0.45, 4), s: `${i + 1} / ${pages.length}`, font: D.font, bold: false, italic: false, size: 7.5, color: C.muted, anchor: "end", cs: 0 }));
-  boxes.forEach((b) => page(b.p).hits.push({ kind: b.kind, x: b.x - 0.8, y: b.y0 - 0.4, w: b.x1 - b.x + 1.6, h: b.y1 - b.y0 + 0.8, src: b.src }));
-  return { W, H, pages, design: D, two };
-}
-
-/* ── Rendu PDF vectoriel (jsPDF) ───────────────────────────────────────── */
-const iconPngCache = new Map();
-function iconPng(name, color, px = 96) {
-  const key = `${name}|${color}|${px}`;
-  if (iconPngCache.has(key)) return iconPngCache.get(key);
-  const c = document.createElement("canvas");
-  c.width = c.height = px;
-  const ctx = c.getContext("2d");
-  ctx.scale(px / 24, px / 24);
-  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.lineJoin = "round";
-  (DOC_ICONS[name] || []).forEach((d) => ctx.stroke(new Path2D(d)));
-  const url = c.toDataURL("image/png");
-  iconPngCache.set(key, url);
-  return url;
-}
-const hexPoints = (x, y, s) => [[x + s / 2, y], [x + s, y + s * 0.25], [x + s, y + s * 0.75], [x + s / 2, y + s], [x, y + s * 0.75], [x, y + s * 0.25]];
-function pdfShape(pdf, o, style) {
-  if (o.shape === "circle") pdf.circle(o.x + o.s / 2, o.y + o.s / 2, o.s / 2, style);
-  else if (o.shape === "rounded") pdf.roundedRect(o.x, o.y, o.s, o.s, o.s * 0.18, o.s * 0.18, style);
-  else if (o.shape === "hexagon") {
-    const pts = hexPoints(o.x, o.y, o.s);
-    pdf.lines(pts.slice(1).map((p, i) => [p[0] - pts[i][0], p[1] - pts[i][1]]), pts[0][0], pts[0][1], [1, 1], style, true);
-  } else pdf.rect(o.x, o.y, o.s, o.s, style);
-}
-function drawPdfPage(pdf, pg, { photo }) {
-  for (const o of pg.ops) {
-    if (o.t === "rect") {
-      pdf.setFillColor(...hexRgb(o.fill));
-      if (o.r) pdf.roundedRect(o.x, o.y, o.w, o.h, o.r, o.r, "F"); else pdf.rect(o.x, o.y, o.w, o.h, "F");
-    } else if (o.t === "circle") { pdf.setFillColor(...hexRgb(o.fill)); pdf.circle(o.cx, o.cy, o.r, "F"); }
-    else if (o.t === "line") { pdf.setDrawColor(...hexRgb(o.color)); pdf.setLineWidth(o.w); pdf.line(o.x1, o.y1, o.x2, o.y2); }
-    else if (o.t === "text") {
-      pdf.setFont(FONT_PDF[o.font] || "helvetica", o.bold && o.italic ? "bolditalic" : o.bold ? "bold" : o.italic ? "italic" : "normal");
-      pdf.setFontSize(o.size);
-      pdf.setTextColor(...hexRgb(o.color));
-      const opt = {};
-      if (o.anchor === "end") opt.align = "right"; else if (o.anchor === "middle") opt.align = "center";
-      if (o.cs) opt.charSpace = o.cs;
-      pdf.text(pdfSafe(o.s), o.x, o.y, opt);
-    } else if (o.t === "icon") {
-      try { pdf.addImage(iconPng(o.name, o.color), "PNG", o.x, o.y, o.s, o.s, `ic_${o.name}_${o.color.slice(1)}`, "FAST"); } catch { /* icône facultative */ }
-    } else if (o.t === "photo" && photo?.src) {
-      pdf.saveGraphicsState();
-      pdfShape(pdf, o, null);
-      pdf.clip();
-      pdf.discardPath();
-      pdf.addImage(photo.src, "JPEG", o.x, o.y, o.s, o.s, "photo", "FAST");
-      pdf.restoreGraphicsState();
-      if (o.border > 0) { pdf.setDrawColor(...hexRgb(o.borderColor)); pdf.setLineWidth(o.border); pdfShape(pdf, o, "S"); }
-    }
-  }
-}
-async function buildPdf(items, { title, author, keywords, subject } = {}) {
+async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
   const { jsPDF } = await loadJsPDF();
-  const first = items[0].layout;
-  const pdf = new jsPDF({ unit: "mm", format: [first.W, first.H], compress: true });
-  let n = 0;
-  for (const it of items) {
-    const start = n + 1;
-    it.layout.pages.forEach((pg) => { if (n > 0) pdf.addPage([it.layout.W, it.layout.H]); n += 1; drawPdfPage(pdf, pg, it); });
-    if (items.length > 1) { try { pdf.outline.add(null, pdfSafe(it.title), { pageNumber: start }); } catch { /* signets facultatifs */ } }
-  }
-  pdf.setProperties({ title: pdfSafe(title), subject: pdfSafe(subject || ""), author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
-  return pdf.output("arraybuffer");
-}
-
-/* ── ZIP (méthode « stockée », sans compression) : sert au .docx et aux exports groupés ── */
-const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
-function crc32(u8) { let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
-const toBytes = (d) => (typeof d === "string" ? new TextEncoder().encode(d) : d instanceof Uint8Array ? d : new Uint8Array(d));
-function zipStore(files) {
-  const enc = new TextEncoder();
-  const now = new Date();
-  const time = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff;
-  const date = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
-  const parts = [], central = [];
-  let offset = 0;
-  for (const f of files) {
-    const name = enc.encode(f.name);
-    const data = toBytes(f.data);
-    const crc = crc32(data);
-    const lh = new DataView(new ArrayBuffer(30));
-    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]]
-      .forEach(([o, v, s]) => (s === 4 ? lh.setUint32(o, v, true) : lh.setUint16(o, v, true)));
-    parts.push(new Uint8Array(lh.buffer), name, data);
-    const ch = new DataView(new ArrayBuffer(46));
-    [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [30, 0, 2], [32, 0, 2], [34, 0, 2], [36, 0, 2], [38, 0, 4], [42, offset, 4]]
-      .forEach(([o, v, s]) => (s === 4 ? ch.setUint32(o, v, true) : ch.setUint16(o, v, true)));
-    central.push(new Uint8Array(ch.buffer), name);
-    offset += 30 + name.length + data.length;
-  }
-  const cdSize = central.reduce((n, p) => n + p.length, 0);
-  const end = new DataView(new ArrayBuffer(22));
-  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
-  const all = [...parts, ...central, new Uint8Array(end.buffer)];
-  const out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
-  let o = 0;
-  all.forEach((p) => { out.set(p, o); o += p.length; });
-  return out;
-}
-const dataUrlBytes = (u) => { const b = atob(String(u).split(",")[1] || ""); const a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
-
-/* ── Word (.docx) natif : styles Titre 1 / Titre 2 (lus par les ATS), colonnes en tableau, photo en forme native ── */
-const TW = 56.6929; // twips par mm
-const EMU = 36000; // EMU par mm
-const xmlEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-const hexW = (h) => cleanHex(h).slice(1).toUpperCase();
-const DOCX_LANG = { fr: "fr-BE", nl: "nl-BE", en: "en-GB", de: "de-DE" };
-function buildDocx(items, { photo, title, author, keywords, mode = "design" } = {}) {
-  const media = [];
-  let drawId = 1;
-  const rels = [];
-  const mediaRel = (key, name, bytes) => {
-    let m = media.find((x) => x.key === key);
-    if (!m) { m = { key, name, bytes, rid: `rIdM${media.length + 1}` }; media.push(m); rels.push(`<Relationship Id="${m.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${name}"/>`); }
-    return m.rid;
-  };
-  const drawing = (rid, wmm, hmm, prst = "rect", ln) => {
-    const id = drawId++;
-    const cx = Math.round(wmm * EMU), cy = Math.round(hmm * EMU);
-    const line = ln ? `<a:ln w="${Math.round(ln.w * EMU)}"><a:solidFill><a:srgbClr val="${hexW(ln.color)}"/></a:solidFill></a:ln>` : "";
-    return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${id}" name="Image ${id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="${id}" name="img${id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="${prst}"><a:avLst/></a:prstGeom>${line}</pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
-  };
-  const body = [];
-  let sect = null;
-  items.forEach((it, idx) => {
-    const D = mergeDesign(DESIGN_BASE, it.design);
-    const C = D.colors;
-    const lang = DOCX_LANG[it.lang] || "fr-BE";
-    const fBody = FONT_DOCX[D.font], fHead = FONT_DOCX[D.headingFont];
-    const [W] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
-    const contentW = W - D.margin.l - D.margin.r;
-    const ats = mode === "ats";
-    const two = !ats && it.kind === "cv" && Number(D.columns) === 2;
-    if (!sect) sect = D;
-    const run = (t, o = {}) => `<w:r><w:rPr><w:rFonts w:ascii="${o.font || fBody}" w:hAnsi="${o.font || fBody}" w:cs="${o.font || fBody}"/>${o.bold ? "<w:b/>" : ""}${o.italic ? "<w:i/>" : ""}${o.caps ? "<w:caps/>" : ""}<w:color w:val="${hexW(o.color || C.text)}"/>${o.cs ? `<w:spacing w:val="${Math.round(o.cs * 20)}"/>` : ""}<w:sz w:val="${Math.round((o.size || D.size) * 2)}"/><w:szCs w:val="${Math.round((o.size || D.size) * 2)}"/><w:lang w:val="${lang}"/></w:rPr><w:t xml:space="preserve">${xmlEsc(t)}</w:t></w:r>`;
-    const tab = (o = {}) => `<w:r><w:rPr><w:sz w:val="${Math.round((o.size || D.size) * 2)}"/></w:rPr><w:tab/></w:r>`;
-    const p = (runs, o = {}) => {
-      const sp = `<w:spacing w:before="${Math.round((o.before || 0) * TW)}" w:after="${Math.round((o.after ?? 0) * TW)}" w:line="${Math.round(240 * (o.line || D.lineHeight) * 0.86)}" w:lineRule="auto"/>`;
-      const bdr = o.border || "";
-      return `<w:p><w:pPr>${o.style ? `<w:pStyle w:val="${o.style}"/>` : ""}${o.keepNext ? "<w:keepNext/>" : ""}${bdr}${o.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(o.shade)}"/>` : ""}${o.tabs || ""}${sp}${o.ind ? `<w:ind w:left="${Math.round(o.ind.left * TW)}" w:hanging="${Math.round((o.ind.hanging || 0) * TW)}"/>` : ""}${o.align ? `<w:jc w:val="${o.align}"/>` : ""}</w:pPr>${runs}</w:p>`;
-    };
-    const colors = (inSide) => {
-      const dark = luminance(C.side) < 0.35;
-      return { text: inSide && two ? C.sideText : C.text, muted: inSide && two && dark ? mixHex(C.sideText, C.side, 0.28) : C.muted, accent: inSide && two && dark ? C.sideText : C.accent, rule: inSide && two && dark ? mixHex(C.sideText, C.side, 0.45) : C.rule };
-    };
-    const sectionXml = (sec, inSide, colW) => {
-      const K = colors(inSide);
-      const out = [];
-      if (sec.heading) {
-        const rulePt = Math.max(2, Math.round((D.rule / PT) * 8));
-        const bd = ats ? "" : D.headingStyle === "line" && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
-          : D.headingStyle === "double" && D.rule > 0 ? `<w:pBdr><w:top w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
-          : D.headingStyle === "bar" ? `<w:pBdr><w:left w:val="single" w:sz="24" w:space="6" w:color="${hexW(K.accent)}"/></w:pBdr>` : "";
-        out.push(p(run(sectionLabel(sec), { font: fHead, bold: true, caps: D.headingCase === "upper", cs: D.headingCase === "upper" ? D.headingSpacing : 0, size: D.size * D.headingSize, color: K.accent }), { style: "Heading1", keepNext: true, before: D.sectionGap, after: 1.6, border: bd, shade: !ats && D.headingStyle === "pill" ? mixHex(C.accent, "#ffffff", 0.88) : null }));
-      }
-      sec.blocks.forEach((b) => {
-        if (b.t === "h3") {
-          const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-          let rest = parts.slice(1);
-          const last = rest[rest.length - 1];
-          const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel/i.test(last) ? last : null;
-          if (period) rest = rest.slice(0, -1);
-          const right = D.datesRight && period && colW > 60;
-          out.push(p(run(parts[0] || "", { bold: true, size: D.size * 1.03, color: K.text }) + (right ? tab() + run(period, { size: D.size * 0.9, color: K.muted }) : ""), { style: "Heading2", keepNext: true, before: D.itemGap * 0.8, tabs: right ? `<w:tabs><w:tab w:val="right" w:pos="${Math.round(colW * TW)}"/></w:tabs>` : "" }));
-          const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
-          if (meta) out.push(p(run(meta, { size: D.size * 0.9, color: K.muted }), { after: 0.6 }));
-        } else if (b.t === "bullet") {
-          const mark = { dot: "•", square: "▪", dash: "–", arrow: "›", none: "" }[D.bullet] ?? "•";
-          out.push(p((mark ? run(mark, { color: K.accent }) + tab() : "") + run(b.text, { color: K.text }), { ind: mark ? { left: 3.6, hanging: 3.6 } : null, after: 0.4 }));
-        } else if (b.t === "kv") {
-          out.push(p(run(`${b.label} `, { bold: true, color: K.text }) + run(b.text, { color: K.text }), { after: 0.5 }));
-        } else if (b.t === "quote") out.push(p(run(b.text, { italic: true, color: K.muted }), { after: D.paraGap }));
-        else out.push(p(run(b.text, { color: K.text }), { after: D.paraGap }));
-      });
-      return out.join("");
-    };
-    const m = docModel(it.text, it.kind);
-    const showPhoto = !ats && photo?.src && D.photo.show;
-    const prst = { circle: "ellipse", rounded: "roundRect", hexagon: "hexagon", square: "rect" }[D.photo.shape] || "rect";
-    const photoRun = showPhoto ? drawing(mediaRel("photo", "photo.jpg", dataUrlBytes(photo.src)), D.photo.size, D.photo.size, prst, D.photo.border > 0 ? { w: D.photo.border, color: D.photo.borderColor } : null) : "";
-    const band = !ats && D.header === "band";
-    const center = D.header === "center" || (D.header === "side" && !two);
-    const nameColor = band ? C.bandText : C.accent;
-    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : C.muted;
-    const headParas = (align, inSide) => {
-      const out = [];
-      const K = colors(inSide);
-      if (m.head.name) out.push(p(run(m.head.name.text, { font: fHead, bold: true, size: D.size * D.nameSize, color: inSide ? K.accent : nameColor }), { style: "Title", align, after: 0.6, line: 1.05 }));
-      m.head.headline.forEach((h) => out.push(p(run(h.text, { size: D.size * 1.12, color: inSide ? K.muted : subColor }), { align, after: 0.6 })));
-      const items = contactItems(m.head);
-      if (items.length) {
-        const col = inSide ? K.muted : band ? subColor : C.muted;
-        const icCol = inSide ? K.accent : band ? C.bandText : C.accent;
-        const runs = items.map((x, i) => {
-          const ic = !ats && D.icons ? drawing(mediaRel(`ic_${x.icon}_${icCol}`, `ic_${x.icon}_${hexW(icCol)}.png`, dataUrlBytes(iconPng(x.icon, icCol))), D.size * 0.88 * PT * 1.15, D.size * 0.88 * PT * 1.15) + run(" ", { size: D.size * 0.88 }) : "";
-          return (inSide ? "" : i ? run(D.icons && !ats ? "     " : "  ·  ", { size: D.size * 0.88, color: col }) : "") + ic + run(x.text, { size: D.size * 0.88, color: col });
-        });
-        if (inSide) runs.forEach((r) => out.push(p(r, { align, after: 0.5 })));
-        else out.push(p(runs.join(""), { align, before: 1.2, after: 0.4 }));
-      }
-      return out.join("");
-    };
-    const tbl = (cells, { indent = 0, width } = {}) => {
-      const total = width || contentW;
-      return `<w:tbl><w:tblPr><w:tblW w:w="${Math.round(total * TW)}" w:type="dxa"/>${indent ? `<w:tblInd w:w="${Math.round(indent * TW)}" w:type="dxa"/>` : ""}<w:tblBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/><w:insideH w:val="nil"/><w:insideV w:val="nil"/></w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${cells.map((c) => `<w:gridCol w:w="${Math.round(c.w * TW)}"/>`).join("")}</w:tblGrid><w:tr>${cells.map((c) => `<w:tc><w:tcPr><w:tcW w:w="${Math.round(c.w * TW)}" w:type="dxa"/>${c.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(c.shade)}"/>` : ""}<w:tcMar><w:top w:w="${Math.round((c.pad?.[0] || 0) * TW)}" w:type="dxa"/><w:left w:w="${Math.round((c.pad?.[1] || 0) * TW)}" w:type="dxa"/><w:bottom w:w="${Math.round((c.pad?.[2] || 0) * TW)}" w:type="dxa"/><w:right w:w="${Math.round((c.pad?.[3] || 0) * TW)}" w:type="dxa"/></w:tcMar><w:vAlign w:val="${c.valign || "top"}"/></w:tcPr>${c.xml || p("")}</w:tc>`).join("")}</w:tr></w:tbl>`;
-    };
-    if (idx > 0) body.push(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`);
-    // En-tête
-    if (!(two && D.header === "side")) {
-      const align = center ? "center" : "left";
-      if (band) {
-        const inner = photoRun && !center
-          ? tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: W - D.photo.size - 6 - D.margin.l - D.margin.r, xml: headParas("left", false), valign: "center" }], { width: W - D.margin.l - D.margin.r }) + p("", { line: 0.5 })
-          : (photoRun ? p(photoRun, { align: "center" }) : "") + headParas(align, false);
-        body.push(tbl([{ w: W, shade: C.band, pad: [Math.max(D.margin.t * 0.6, 6), D.margin.l, Math.max(D.margin.t * 0.6, 6), D.margin.r], xml: inner }], { indent: -D.margin.l, width: W }));
-        body.push(p("", { after: 1 }));
-      } else if (photoRun && !center) {
-        body.push(tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: contentW - D.photo.size - 6, xml: headParas("left", false), valign: "center" }]));
-        body.push(p("", { after: 1, border: !ats && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / PT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` : "" }));
-      } else {
-        if (photoRun) body.push(p(photoRun, { align: "center", after: 2 }));
-        body.push(headParas(align, false));
-        if (!center && !ats && D.rule > 0) body.push(p("", { after: 1, border: `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / PT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` }));
-      }
+  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
+  doc.setProperties({ title: pdfSafe(title), subject: kind === "cv" ? "Curriculum vitae" : "Lettre de motivation", author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).map((k) => (typeof k === "string" ? k : k?.term)).filter(Boolean).join(", ")), creator: "Radar" });
+  const A = hexRgb(accent);
+  const M = 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
+  const cv = kind === "cv";
+  let y = 18;
+  const lh = (size) => size * 0.3528 * 1.38;
+  const ensure = (h) => { if (y + h > BOTTOM && y > 18) { doc.addPage(); y = 18; } };
+  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color); };
+  const nLines = (txt, size, style = "normal", indent = 0) => { font(size, style); return doc.splitTextToSize(pdfSafe(txt), W - indent).length; };
+  const write = (txt, { size = 10, style = "normal", color = [45, 45, 45], indent = 0, after = 1.4, align } = {}) => {
+    font(size, style, color);
+    const lines = doc.splitTextToSize(pdfSafe(txt), W - indent);
+    for (const line of lines) {
+      ensure(lh(size));
+      if (align === "right") doc.text(line, M + W, y + lh(size) * 0.78, { align: "right" });
+      else doc.text(line, M + indent, y + lh(size) * 0.78);
+      y += lh(size);
     }
-    if (it.kind === "letter") {
-      const L = m.letter;
-      if (L.date) body.push(p(run(L.date.text, { color: C.muted }), { align: "right", before: 4, after: 3 }));
-      L.recipient.forEach((r) => body.push(p(run(r.text))));
-      if (L.subject) body.push(p(run(L.subject.text, { bold: true }), { before: 5, after: 4 }));
-      L.body.forEach((b) => {
-        if (b.t === "bullet") body.push(p(run("•", { color: C.accent }) + tab() + run(b.text), { ind: { left: 3.6, hanging: 3.6 }, after: 0.4 }));
-        else body.push(p(run(b.text), { after: Math.max(D.paraGap * 1.8, 3), align: D.justify ? "both" : null }));
-      });
-      if (L.sign) body.push(p(run(L.sign.text, { bold: true }), { before: 4 }));
-    } else {
-      const arr = arrangeSections(m.sections, D.layout, two);
-      if (!two) {
-        // ATS : une seule colonne, colonne principale puis secondaire, dans l'ordre choisi dans le Studio.
-        const flat = ats && Number(D.columns) === 2 ? (({ main, side }) => [...main, ...side])(arrangeSections(m.sections, D.layout, true)) : arr.main;
-        flat.forEach((sec) => body.push(sectionXml(sec, false, contentW)));
-      }
-      else {
-        const sideW = (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100;
-        const mainW = contentW - sideW;
-        const pad = 3.5;
-        let sideXml = arr.side.map((sec) => sectionXml(sec, true, sideW - 2 * pad)).join("");
-        if (D.header === "side") sideXml = (photoRun ? p(photoRun, { align: "center", after: 3 }) : "") + headParas("center", true) + sideXml;
-        const mainXml = arr.main.map((sec) => sectionXml(sec, false, mainW - D.colGap)).join("");
-        const sideCell = { w: sideW, shade: cleanHex(C.side) !== "#ffffff" ? C.side : null, pad: [pad, pad, pad, pad], xml: sideXml || p("") };
-        const mainCell = { w: mainW, pad: [0, D.side === "left" ? D.colGap : 0, 0, D.side === "left" ? 0 : D.colGap], xml: mainXml || p("") };
-        body.push(tbl(D.side === "left" ? [sideCell, mainCell] : [mainCell, sideCell]));
-        body.push(p(""));
-      }
+    y += after;
+  };
+  /* Hauteur d'un bloc (mêmes règles que l'aperçu) : les blocs courts ne sont jamais coupés, les titres restent avec la suite. */
+  const height = (b) => {
+    if (!b) return 0;
+    if (b.t === "para") return nLines(b.text, 10) * lh(10) + (cv ? 1.8 : 3.2);
+    if (b.t === "bullet") return nLines(b.text, 10, "normal", 4.5) * lh(10) + 0.7;
+    if (b.t === "kv") return nLines(`${b.label} ${b.text}`, 10) * lh(10) + 0.9;
+    if (b.t === "h3") { const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean); return 0.8 + nLines(parts[0] || "", 10.5, "bold") * lh(10.5) + 0.2 + (parts.length > 1 ? nLines(parts.slice(1).join("  ·  "), 9) * lh(9) + 1 : 0); }
+    if (b.t === "h2") return cv ? 2.5 + lh(10.5) + 0.4 + 2.6 : 2 + nLines(b.text, 10.5, "bold") * lh(10.5) + 3;
+    return lh(10) * 2;
+  };
+  const blocks = layoutBlocks(text, kind);
+  blocks.forEach((b, i) => {
+    const h = height(b);
+    if (b.t === "h2" || b.t === "h3") ensure(h + Math.min(height(blocks[i + 1]), 50));
+    else if (["para", "bullet", "kv"].includes(b.t) && h < 50) ensure(h);
+    if (b.t === "name") write(b.text, { size: cv ? 22 : 16, style: "bold", color: A, after: 0.6 });
+    else if (b.t === "quote") {
+      if (cv) write(b.text, { size: 11, color: [70, 70, 70], after: 1.2 });
+      else write(b.text, { size: 10, after: 0.2 });
     }
+    else if (b.t === "contact") {
+      write(b.text, { size: 9, color: [110, 110, 110], after: 1.6 });
+      doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5;
+    }
+    else if (b.t === "date") { y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
+    else if (b.t === "h2") {
+      if (cv) {
+        y += 2.5;
+        write(b.text.toUpperCase(), { size: 10.5, style: "bold", color: A, after: 0.4 });
+        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6;
+      } else { y += 2; write(b.text, { size: 10.5, style: "bold", color: [30, 30, 30], after: 3 }); }
+    }
+    else if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      y += 0.8;
+      write(parts[0] || "", { size: 10.5, style: "bold", color: [25, 25, 25], after: 0.2 });
+      if (parts.length > 1) write(parts.slice(1).join("  ·  "), { size: 9, color: [115, 115, 115], after: 1 });
+    }
+    else if (b.t === "bullet") {
+      ensure(lh(10));
+      doc.setFillColor(...A); doc.circle(M + 1.3, y + lh(10) * 0.5, 0.65, "F");
+      write(b.text, { indent: 4.5, after: 0.7 });
+    }
+    else if (b.t === "kv") {
+      font(10, "bold", [30, 30, 30]);
+      const label = `${pdfSafe(b.label)} `;
+      const lw = doc.getTextWidth(label);
+      font(10);
+      const first = doc.splitTextToSize(pdfSafe(b.text), W - lw);
+      ensure(lh(10));
+      font(10, "bold", [30, 30, 30]); doc.text(label, M, y + lh(10) * 0.78);
+      font(10); doc.text(first[0] || "", M + lw, y + lh(10) * 0.78);
+      y += lh(10);
+      const rest = first.slice(1).join(" ");
+      if (rest) write(rest, { after: 0.9 }); else y += 0.9;
+    }
+    else if (b.t === "sign") { y += 4; write(b.text, { style: "bold", after: 1 }); }
+    else write(b.text, { after: cv ? 1.8 : 3.2 });
   });
-  const D0 = mergeDesign(DESIGN_BASE, sect);
-  const [PW, PH] = PAGE_SIZES[D0.page] || PAGE_SIZES.a4;
-  const sectPr = `<w:sectPr><w:pgSz w:w="${Math.round(PW * TW)}" w:h="${Math.round(PH * TW)}"/><w:pgMar w:top="${Math.round(D0.margin.t * TW)}" w:right="${Math.round(D0.margin.r * TW)}" w:bottom="${Math.round(D0.margin.b * TW)}" w:left="${Math.round(D0.margin.l * TW)}" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>`;
-  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
-  const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${body.join("")}${sectPr}</w:body></w:document>`;
-  const f0 = FONT_DOCX[D0.font];
-  const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${f0}" w:hAnsi="${f0}" w:cs="${f0}" w:eastAsia="${f0}"/><w:sz w:val="${Math.round(D0.size * 2)}"/><w:szCs w:val="${Math.round(D0.size * 2)}"/><w:lang w:val="${DOCX_LANG[items[0]?.lang] || "fr-BE"}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="264" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style></w:styles>`;
-  const settingsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="709"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`;
-  const docRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rIdT" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>${rels.join("")}</Relationships>`;
-  const ct = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>`;
-  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>`;
-  const iso = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${xmlEsc(title || "")}</dc:title><dc:creator>${xmlEsc(author || "")}</dc:creator><cp:keywords>${xmlEsc((keywords || []).join(", "))}</cp:keywords><dcterms:created xsi:type="dcterms:W3CDTF">${iso}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${iso}</dcterms:modified></cp:coreProperties>`;
-  const app = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Radar</Application></Properties>`;
-  return zipStore([
-    { name: "[Content_Types].xml", data: ct },
-    { name: "_rels/.rels", data: rootRels },
-    { name: "docProps/core.xml", data: core },
-    { name: "docProps/app.xml", data: app },
-    { name: "word/document.xml", data: doc },
-    { name: "word/styles.xml", data: styles },
-    { name: "word/settings.xml", data: settingsXml },
-    { name: "word/_rels/document.xml.rels", data: docRels },
-    ...media.map((m) => ({ name: `word/media/${m.name}`, data: m.bytes })),
-  ]);
-}
-
-/* ── Photo : recadrage local (jamais envoyée à l'IA) ──────────────────── */
-const loadImg = (src) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Image illisible")); i.src = src; });
-function drawCrop(ctx, img, size, crop) {
-  const { zoom = 1, x = 0, y = 0, rot = 0 } = crop || {};
-  const r = ((rot % 360) + 360) % 360;
-  const iw = r % 180 ? img.height : img.width, ih = r % 180 ? img.width : img.height;
-  const s = Math.max(size / iw, size / ih) * zoom;
-  ctx.save();
-  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, size, size);
-  ctx.translate(size / 2 + x * size, size / 2 + y * size);
-  ctx.rotate((r * Math.PI) / 180);
-  ctx.drawImage(img, (-img.width * s) / 2, (-img.height * s) / 2, img.width * s, img.height * s);
-  ctx.restore();
-}
-async function downscaleImage(src, max = 1200) {
-  const img = await loadImg(src);
-  const k = Math.min(1, max / Math.max(img.width, img.height));
-  const c = document.createElement("canvas");
-  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
-  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-  return c.toDataURL("image/jpeg", 0.88);
-}
-async function cropPhoto(original, crop, out = 640) {
-  const img = await loadImg(original);
-  const c = document.createElement("canvas");
-  c.width = c.height = out;
-  drawCrop(c.getContext("2d"), img, out, crop);
-  return c.toDataURL("image/jpeg", 0.9);
-}
-
-/* ── Qualité du document : contrôles locaux, 0 token (inspirés de Rezi, Enhancv, Jobscan) ── */
-const CLICHES = {
-  fr: ["passionné", "passionnée", "dynamique", "force de proposition", "motivé", "motivée", "rigoureux", "rigoureuse", "je me permets", "n'hésitez pas", "fort de", "forte de", "polyvalent", "esprit d'équipe", "sens du relationnel", "proactif", "proactive", "synergie", "challenge"],
-  nl: ["gepassioneerd", "dynamisch", "gemotiveerd", "teamplayer", "proactief", "stressbestendig", "hierbij solliciteer ik", "leergierig", "flexibel ingesteld"],
-  en: ["passionate", "dynamic", "hardworking", "hard-working", "team player", "detail-oriented", "go-getter", "synergy", "results-driven", "self-starter", "i am writing to apply", "highly motivated"],
-  de: ["dynamisch", "motiviert", "teamfähig", "belastbar", "leidenschaftlich", "hiermit bewerbe ich mich", "zielstrebig"],
-};
-const WEAK_STARTS = {
-  fr: ["responsable de", "en charge de", "chargé de", "chargée de", "participation à", "participation au", "aide à", "travail sur"],
-  nl: ["verantwoordelijk voor", "betrokken bij", "hulp bij", "werken aan"],
-  en: ["responsible for", "worked on", "helped", "duties included", "involved in", "tasked with"],
-  de: ["verantwortlich für", "zuständig für", "mitarbeit bei", "beteiligt an"],
-};
-const FIRST_PERSON = { fr: /(^|\s)(je|j'|moi|mon|ma|mes)\s/i, nl: /(^|\s)(ik|mijn)\s/i, en: /(^|\s)(I|my|me)\s/, de: /(^|\s)(ich|mein|meine)\s/i };
-function docQuality(text, { kind = "cv", lang = "fr", keywords = [], kwLang, design } = {}) {
-  const model = docModel(text, kind);
-  const blocks = model.blocks;
-  const plain = docPlainText(text);
-  const words = plain.split(/\s+/).filter(Boolean).length;
-  const low = ` ${plain.toLowerCase()} `;
-  const checks = [];
-  const add = (id, ok, w, label, detail, tone) => checks.push({ id, ok, w, label, detail, tone: ok ? "ok" : tone || "warn" });
-  const ph = (text.match(/\[(à compléter|aan te vullen|to complete|zu ergänzen)/gi) || []).length;
-  const cl = (CLICHES[lang] || CLICHES.fr).filter((c) => low.includes(` ${c} `) || low.includes(` ${c},`) || low.includes(` ${c}.`));
-  if (kind === "cv") {
-    const m = model;
-    const contact = contactItems(m.head).map((x) => x.icon);
-    const bullets = blocks.filter((b) => b.t === "bullet");
-    const quant = bullets.filter((b) => /\d|%|€|\bk€|x\d/.test(b.text));
-    const weak = bullets.filter((b) => (WEAK_STARTS[lang] || WEAK_STARTS.fr).some((w) => normText(b.text).startsWith(normText(w))));
-    const long = bullets.filter((b) => b.text.split(/\s+/).length > 32);
-    const prof = m.sections.find((s) => baseKey(s.key) === "profile");
-    const profWords = prof ? prof.blocks.map((b) => b.text).join(" ").split(/\s+/).filter(Boolean).length : 0;
-    const entries = blocks.filter((b) => b.t === "h3" && m.sections.some((s) => baseKey(s.key) === "experience" && s.blocks.includes(b)));
-    const dated = entries.filter((b) => /\d{4}/.test(b.text));
-    const keys = new Set(m.sections.map((s) => baseKey(s.key)));
-    const fp = [...(prof?.blocks || []), ...bullets].filter((b) => FIRST_PERSON[lang]?.test(` ${b.text} `));
-    add("contact", contact.includes("mail") && contact.includes("phone"), 10, "Coordonnées complètes", contact.includes("mail") && contact.includes("phone") ? `${contact.length} élément(s)${contact.includes("linkedin") ? ", LinkedIn inclus" : " · ajoutez LinkedIn"}` : "Ajoutez e-mail et téléphone sur la ligne « @ ».", "danger");
-    add("headline", m.head.headline.length > 0, 5, "Accroche sous le nom", m.head.headline.length ? "Présente" : "Ajoutez une ligne « > » qui reprend l'intitulé du poste.");
-    add("profile", profWords >= 30 && profWords <= 100, 7, "Profil de 30 à 100 mots", prof ? `${profWords} mots` : "Section Profil absente");
-    add("quant", quant.length >= 3, 12, "Au moins 3 résultats chiffrés", `${quant.length} puce(s) chiffrée(s) sur ${bullets.length}`, "danger");
-    add("quantShare", bullets.length > 0 && quant.length / bullets.length >= 0.4, 7, "40 % des puces quantifiées", bullets.length ? `${Math.round((quant.length / bullets.length) * 100)} %` : "Aucune puce");
-    add("weak", weak.length === 0, 7, "Verbes d'action plutôt que « responsable de »", weak.length ? `À reformuler : ${weak.slice(0, 2).map((b) => `« ${b.text.slice(0, 40)}… »`).join(", ")}` : "Aucune formulation passive détectée");
-    add("cliche", cl.length === 0, 7, "Aucun cliché", cl.length ? `À remplacer par une preuve : ${cl.slice(0, 4).join(", ")}` : "Aucun");
-    add("fp", fp.length === 0, 4, "Pas de première personne", fp.length ? `${fp.length} occurrence(s) à vérifier` : "Style nominal respecté");
-    add("long", long.length === 0, 5, "Puces de 2 lignes maximum", long.length ? `${long.length} puce(s) de plus de 32 mots` : "OK");
-    add("length", words >= 380 && words <= 850, 7, "Longueur 1 à 2 pages", `${words} mots${words > 850 ? " : resserrez" : words < 380 ? " : étoffez avec des résultats" : ""}`);
-    add("dates", entries.length > 0 && dated.length === entries.length, 6, "Dates sur chaque expérience", entries.length ? `${dated.length}/${entries.length} datée(s)` : "Aucune expérience détaillée (### …)");
-    add("sections", ["experience", "skills", "education"].every((k) => keys.has(k)), 6, "Sections Expérience, Compétences, Formation", ["experience", "skills", "education"].filter((k) => !keys.has(k)).map((k) => `manque : ${SECTION_TITLES.fr[k]}`).join(", ") || "Toutes présentes");
-  } else {
-    const L = model.letter;
-    const paras = L.body.filter((b) => b.t === "para");
-    add("subject", !!L.subject, 8, "Objet explicite", L.subject ? L.subject.text.slice(0, 60) : "Ajoutez une ligne « ## Objet : … »");
-    add("length", words >= 200 && words <= 380, 10, "Longueur 200 à 380 mots", `${words} mots`);
-    add("paras", paras.length >= 3 && paras.length <= 5, 7, "3 à 5 paragraphes", `${paras.length} paragraphe(s)`);
-    add("cliche", cl.length === 0, 10, "Aucun cliché", cl.length ? `À remplacer : ${cl.slice(0, 4).join(", ")}` : "Aucun");
-    add("opening", !/^(je me permets|hierbij|i am writing|hiermit)/i.test(paras[1]?.text || paras[0]?.text || ""), 6, "Accroche spécifique (pas « je me permets »)", "Ouvrez sur un élément précis de l'annonce.");
-    add("proof", /\d/.test(paras.map((x) => x.text).join(" ")), 8, "Au moins une preuve chiffrée", /\d/.test(paras.map((x) => x.text).join(" ")) ? "Présente" : "Ajoutez un résultat mesurable.");
-    add("sign", !!L.sign, 4, "Signature", L.sign ? "Présente" : "Ajoutez « ~ Prénom Nom ».");
-  }
-  add("placeholders", ph === 0, 10, "Aucun élément à compléter", ph ? `${ph} élément(s) entre crochets à remplir avant envoi` : "Prêt", "danger");
-  if (keywords?.length) {
-    const sameLang = !kwLang || kwLang === lang;
-    const cov = keywordCoverage(text, keywords);
-    if (sameLang) add("keywords", cov.pct >= 70, 10, "Mots-clés de l'annonce (≥ 70 %)", `${cov.pct} % couverts${cov.missing.length ? ` · absents : ${cov.missing.slice(0, 5).join(", ")}` : ""}`);
-  }
-  if (design) {
-    const D = mergeDesign(DESIGN_BASE, design);
-    add("readable", D.size >= 9 && Math.min(D.margin.l, D.margin.r) >= 10, 4, "Lisibilité (police ≥ 9 pt, marges latérales ≥ 10 mm)", `${D.size} pt · marges ${D.margin.l}/${D.margin.r} mm`);
-    if (kind === "cv" && D.photo.show && lang === "en") add("photo", false, 2, "Photo et candidature en anglais", "Déconseillée pour les recruteurs anglo-saxons : masquez-la pour cette langue.", "warn");
-    if (kind === "cv" && Number(D.columns) === 2) checks.push({ id: "cols", ok: true, w: 0, label: "Mise en page 2 colonnes", detail: "Lue par les ATS récents. Pour un portail ancien, exportez en Word « ATS 1 colonne ».", tone: "info" });
-  }
-  const tot = checks.reduce((n, c) => n + c.w, 0);
-  const got = checks.reduce((n, c) => n + (c.ok ? c.w : 0), 0);
-  return { score: tot ? Math.round((got / tot) * 100) : 0, checks, words };
+  const pages = doc.getNumberOfPages();
+  if (pages > 1) for (let i = 1; i <= pages; i++) { doc.setPage(i); font(8, "normal", [150, 150, 150]); doc.text(`${i} / ${pages}`, M + W, 297 - 9, { align: "right" }); }
+  return doc.output("arraybuffer");
 }
 
 async function saveFile(filename, data, mime) {
@@ -1462,15 +1399,9 @@ async function saveFile(filename, data, mime) {
 }
 
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
-const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId;
+const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId || (!offer.demo && offer.score.method !== 2);
 const offerLang = (o) => o?.language || "fr";
-const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais", de: "allemand" };
-const LANG_FLAG = { fr: "FR", nl: "NL", en: "EN", de: "DE" };
-/* Versions de documents par langue : une version sans langue (v2) vaut la langue du dossier. */
-const docLangOf = (app, offer, v) => v?.lang || app?.docLanguage || offerLang(offer);
-const docVersions = (app, offer, type, lang) => (app?.docs?.[type] || []).filter((v) => docLangOf(app, offer, v) === lang);
-const latestDoc = (app, offer, type, lang) => docVersions(app, offer, type, lang).slice(-1)[0] || null;
-const docLangs = (app, offer, type) => [...new Set((app?.docs?.[type] || []).filter((v) => v.format === "markup").map((v) => docLangOf(app, offer, v)))];
+const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais" };
 
 /* ════════════════════════════════════════════════════════════════════════
    3. ENVIRONNEMENT & PERSISTANCE
@@ -1501,32 +1432,102 @@ async function initRuntime() {
   return RT;
 }
 
-/* Données publiées : un document par tranche de 180 Ko (limite 256 Kio par document), sous data/users/<id>/ (privé). */
-const DB_CHUNK = 180000;
+/* ── Données publiées, sous data/users/<id>/ (privé) ─────────────────────
+   Le format v1 découpait chaque collection en tranches de 180 000 caractères réécrites sur place : une
+   écriture interrompue laissait une tranche neuve à côté de tranches anciennes, et la lecture échouait
+   (« Expected ',' or ']' … position 180000 »). Désormais :
+   - les offres sont stockées UNE PAR DOCUMENT (seules les offres modifiées sont réécrites) ;
+   - les autres collections sont écrites en tranches d'une nouvelle « génération », puis le document
+     __meta bascule sur elle (avec somme de contrôle), puis l'ancienne génération est supprimée :
+     une écriture interrompue laisse l'ancienne version intacte ;
+   - une collection illisible est réparée (récupération élément par élément) au lieu de tout bloquer. */
+const DB_CHUNK = 100000;
 const dbQueues = {};
 const dbDoc = (name) => RT.db.doc(`data/users/${RT.uid}/${name}`);
 const dbName = (key) => key.replace(/[^a-z0-9]/gi, "_");
+function checksum(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return `${s.length.toString(36)}-${(h >>> 0).toString(36)}`;
+}
+const dbRetry = async (fn) => {
+  try { return await fn(); }
+  catch (e) {
+    if (e?.code !== "unavailable" && e?.code !== "resource_exhausted") throw e;
+    await sleep(600 + Math.random() * 900);
+    return fn();
+  }
+};
+class StoreCorrupt extends Error {
+  constructor(key, raw, cause) { super(`données illisibles (${cause})`); this.key = key; this.raw = raw; }
+}
+
+/* Récupère les objets complets d'un tableau JSON endommagé (ceux qui chevauchent la zone abîmée sont perdus). */
+function scanObjectEnd(s, i) {
+  let depth = 0, inStr = false;
+  for (let j = i; j < s.length; j++) {
+    const c = s[j];
+    if (inStr) { if (c === "\\") j++; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return j + 1;
+  }
+  return -1;
+}
+function salvageArray(raw, isItem) {
+  const out = [], seen = new Set();
+  const re = /\{"id":"/g;
+  let m;
+  while ((m = re.exec(raw || ""))) {
+    const end = scanObjectEnd(raw, m.index);
+    if (end < 0) continue;
+    let o;
+    try { o = JSON.parse(raw.slice(m.index, end)); } catch { continue; }
+    if (!o || typeof o.id !== "string" || !isItem(o)) continue;
+    if (!seen.has(o.id)) { seen.add(o.id); out.push(o); }
+    re.lastIndex = end;
+  }
+  return out;
+}
+const SALVAGE = {
+  offers: (o) => typeof o.title === "string" && Array.isArray(o.sources),
+  apps: (o) => typeof o.offerId === "string" && typeof o.stage === "string",
+  contacts: (o) => typeof o.name === "string",
+};
+
 const dbStore = {
-  async get(key) {
+  async readRaw(key) {
     const k = dbName(key);
-    const meta = await dbDoc(`${k}__meta`).get();
+    const meta = await dbRetry(() => dbDoc(`${k}__meta`).get());
     if (!meta.exists) return null;
-    const n = Number(meta.data()?.n) || 0;
-    const parts = await Promise.all(Array.from({ length: n }, (_, i) => dbDoc(`${k}__${i}`).get()));
-    return JSON.parse(parts.map((x) => String(x.data()?.c ?? "")).join(""));
+    const m = meta.data() || {};
+    const n = Number(m.n) || 0;
+    const name = (i) => (m.gen ? `${k}__${m.gen}_${i}` : `${k}__${i}`);
+    const parts = await Promise.all(Array.from({ length: n }, (_, i) => dbRetry(() => dbDoc(name(i)).get())));
+    return { raw: parts.map((x) => String(x.data()?.c ?? "")).join(""), meta: m };
+  },
+  async get(key) {
+    const r = await this.readRaw(key);
+    if (!r) return null;
+    if (r.meta.sum && checksum(r.raw) !== r.meta.sum) throw new StoreCorrupt(key, r.raw, "somme de contrôle");
+    try { return JSON.parse(r.raw); } catch (e) { throw new StoreCorrupt(key, r.raw, e.message); }
   },
   set(key, value) {
     const k = dbName(key);
     const run = async () => {
-      const str = JSON.stringify(value);
+      const str = typeof value === "string" ? value : JSON.stringify(value);
       const chunks = [];
       for (let i = 0; i < str.length; i += DB_CHUNK) chunks.push(str.slice(i, i + DB_CHUNK));
       if (!chunks.length) chunks.push("");
-      const prev = await dbDoc(`${k}__meta`).get();
-      const prevN = prev.exists ? Number(prev.data()?.n) || 0 : 0;
-      for (let i = 0; i < chunks.length; i++) await dbDoc(`${k}__${i}`).set({ c: chunks[i] });
-      await dbDoc(`${k}__meta`).set({ n: chunks.length, at: nowISO() });
-      for (let i = chunks.length; i < prevN; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+      const prev = await dbRetry(() => dbDoc(`${k}__meta`).get());
+      const pm = prev.exists ? prev.data() || {} : null;
+      const gen = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      for (let i = 0; i < chunks.length; i++) await dbRetry(() => dbDoc(`${k}__${gen}_${i}`).set({ c: chunks[i] }));
+      await dbRetry(() => dbDoc(`${k}__meta`).set({ n: chunks.length, gen, sum: checksum(str), at: nowISO(), v: 2 }));
+      if (pm) {
+        const old = (i) => (pm.gen ? `${k}__${pm.gen}_${i}` : `${k}__${i}`);
+        for (let i = 0; i < (Number(pm.n) || 0); i++) await dbDoc(old(i)).delete().catch(() => {});
+      }
     };
     dbQueues[k] = (dbQueues[k] || Promise.resolve()).catch(() => {}).then(run);
     return dbQueues[k];
@@ -1534,9 +1535,63 @@ const dbStore = {
   async remove(key) {
     const k = dbName(key);
     const meta = await dbDoc(`${k}__meta`).get().catch(() => null);
-    const n = meta?.exists ? Number(meta.data()?.n) || 0 : 0;
-    for (let i = 0; i < n; i++) await dbDoc(`${k}__${i}`).delete().catch(() => {});
+    const m = meta?.exists ? meta.data() || {} : {};
+    for (let i = 0; i < (Number(m.n) || 0); i++) await dbDoc(m.gen ? `${k}__${m.gen}_${i}` : `${k}__${i}`).delete().catch(() => {});
     await dbDoc(`${k}__meta`).delete().catch(() => {});
+  },
+};
+
+/* Offres : un document par offre sous data/users/<id>/radar_offers_v2/items/<offerId>.
+   Synchronisation par différence : seules les offres dont l'objet a changé sont réécrites. */
+const offerStore = {
+  saved: new Map(),
+  queue: Promise.resolve(),
+  root: () => RT.db.doc(`data/users/${RT.uid}/radar_offers_v2`),
+  col() { return this.root().collection("items"); },
+  async load() {
+    const meta = await dbRetry(() => this.root().get());
+    if (!meta.exists) return null;
+    const out = [];
+    let last = null;
+    for (let page = 0; page < 30; page++) {
+      let q = this.col().orderBy("id").limit(1000);
+      if (last) q = q.where("id", ">", last);
+      const snap = await dbRetry(() => q.get());
+      snap.docs.forEach((d) => { const o = d.data(); if (o && o.id) out.push(o); });
+      if (snap.size < 1000) break;
+      last = snap.docs[snap.docs.length - 1].data().id;
+    }
+    this.saved = new Map(out.map((o) => [o.id, o]));
+    return out;
+  },
+  /* Première écriture (migration ou import) : tout est écrit, puis le marqueur racine. */
+  async writeAll(list, info = {}) {
+    this.saved = new Map();
+    await this.sync(list);
+    await dbRetry(() => this.root().set({ v: 2, count: list.length, at: nowISO(), ...info }));
+  },
+  sync(list) {
+    const run = async () => {
+      const cur = new Map(list.map((o) => [o.id, o]));
+      const changed = list.filter((o) => this.saved.get(o.id) !== o);
+      const removed = [...this.saved.keys()].filter((id) => !cur.has(id));
+      if (!changed.length && !removed.length) return;
+      const ops = [
+        ...changed.map((o) => async () => { await dbRetry(() => this.col().doc(o.id).set(JSON.parse(JSON.stringify(o)))); this.saved.set(o.id, o); }),
+        ...removed.map((id) => async () => { await dbRetry(() => this.col().doc(id).delete()); this.saved.delete(id); }),
+      ];
+      let firstErr = null;
+      await pool(ops, 3, async (op) => { try { await op(); } catch (e) { firstErr = firstErr || e; } });
+      if (firstErr) throw firstErr;
+      if (this.pendingMigration) { await dbRetry(() => this.root().set({ v: 2, count: list.length, at: nowISO(), migratedFrom: "v1" })); this.pendingMigration = false; }
+    };
+    this.queue = this.queue.catch(() => {}).then(run);
+    return this.queue;
+  },
+  async clear() {
+    for (const id of [...this.saved.keys()]) await this.col().doc(id).delete().catch(() => {});
+    this.saved = new Map();
+    await this.root().delete().catch(() => {});
   },
 };
 
@@ -1557,14 +1612,21 @@ const storage = {
     if (r === null || r === undefined) return null;
     const raw = typeof r === "string" ? r : r.value;
     if (raw === null || raw === undefined) return null;
-    return typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (typeof raw !== "string") return raw;
+    try { return JSON.parse(raw); } catch (e) { throw new StoreCorrupt(key, raw, e.message); }
   },
   async set(key, value) {
-    if (RT.mode === "published") return dbStore.set(key, value);
+    if (RT.mode === "published") {
+      if (key === KEYS.offers) return offerStore.sync(value);
+      return dbStore.set(key, value);
+    }
     await window.storage.set(key, JSON.stringify(value));
   },
   async remove(key) {
-    if (RT.mode === "published") return dbStore.remove(key);
+    if (RT.mode === "published") {
+      if (key === KEYS.offers) { await offerStore.clear(); return dbStore.remove(key); }
+      return dbStore.remove(key);
+    }
     try { await window.storage.delete(key); } catch { /* clé absente */ }
   },
 };
@@ -1573,24 +1635,7 @@ const storage = {
    4. COUCHE IA — API Claude (web_search, MCP Gmail / Google Calendar)
    ════════════════════════════════════════════════════════════════════════ */
 
-let WORKING_VARIANT = null; // mémorise ce que l'API accepte : outil web, format MCP, cache de prompt, effort
-const MODEL_IDX = {}; // modèle retenu par niveau (profond, équilibré, rapide) après un éventuel repli
-/* Consommation de la session (version « chat ») : affichée dans Confidentialité & données. */
-const USAGE = { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, byTier: {} };
-const usageListeners = new Set();
-function addUsage(tier, u) {
-  if (!u) return;
-  USAGE.calls += 1;
-  USAGE.input += u.input_tokens || 0;
-  USAGE.output += u.output_tokens || 0;
-  USAGE.cacheRead += u.cache_read_input_tokens || 0;
-  USAGE.cacheWrite += u.cache_creation_input_tokens || 0;
-  const t = (USAGE.byTier[tier] = USAGE.byTier[tier] || { calls: 0, input: 0, output: 0 });
-  t.calls += 1; t.input += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0); t.output += u.output_tokens || 0;
-  usageListeners.forEach((f) => f({ ...USAGE }));
-}
-const TIER_LABEL = { deep: "profond", balanced: "équilibré", fast: "rapide" };
-const tierModels = (s, tier) => [...new Set((tier === "fast" ? [s.modelFast, s.modelBalanced, s.model] : tier === "balanced" ? [s.modelBalanced, s.model] : [s.model, s.fallbackModel]).filter(Boolean))];
+let WORKING_VARIANT = null; // mémorise la combinaison modèle / outil web / format MCP acceptée
 
 function collectBlocks(content, acc) {
   for (const b of content || []) {
@@ -1635,16 +1680,11 @@ async function runConversation(settings, v, o) {
   }
   const headers = { "Content-Type": "application/json" };
   if (servers.length && mode === "toolset") headers["anthropic-beta"] = "mcp-client-2025-11-20";
-  // Contexte stable (profil, critères, barème) placé en fin de system avec un point de cache : les lots suivants le relisent à 5 %.
-  const system = o.context
-    ? (v.cache === false ? `${o.system}\n\n${o.context}` : [{ type: "text", text: o.system }, { type: "text", text: o.context, cache_control: { type: "ephemeral" } }])
-    : o.system;
 
   const messages = [{ role: "user", content: o.prompt }];
   const acc = { text: [], urls: new Set(), toolText: [], toolCalls: [], toolErrors: [] };
   for (let turn = 0; turn < 5; turn++) {
-    const body = { model, max_tokens: o.maxTokens, system, messages };
-    if (o.effort && v.effort !== false) body.output_config = { effort: o.effort };
+    const body = { model, max_tokens: o.maxTokens, system: o.system, messages };
     if (tools.length) body.tools = tools;
     if (servers.length) body.mcp_servers = servers;
     let r;
@@ -1663,7 +1703,6 @@ async function runConversation(settings, v, o) {
       throw err;
     }
     collectBlocks(data.content, acc);
-    addUsage(o.tier, data.usage);
     if (data.stop_reason === "refusal") throw new Error("Le modèle a décliné cette requête. Reformulez ou réessayez.");
     if (data.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: data.content });
@@ -1710,7 +1749,7 @@ const SAMPLE_ERRORS = {
   cancelled: "Demande annulée.",
 };
 
-async function callSample(settings, { system, prompt, web, mcp = [], context }) {
+async function callSample(settings, { system, prompt, web, mcp = [] }) {
   if (!RT.sample) throw new Error("Claude n'est pas disponible dans cette vue : ouvrez la page connecté à claude.ai.");
   const acc = { toolText: [], toolCalls: [], toolErrors: [] };
   const tools = [];
@@ -1745,7 +1784,11 @@ async function callSample(settings, { system, prompt, web, mcp = [], context }) 
     ? "\n\nIMPORTANT : aucune recherche web n'est disponible ici. N'utilise que les informations fournies ; n'invente aucune URL, aucun fait externe ni aucune source. Laisse vides les listes qui exigeraient une recherche."
     : "";
   try {
-    const r = await RT.sample(`${system}${context ? `\n\n${context}` : ""}\n\n${prompt}${note}`, tools.length ? { tools } : {});
+    let r;
+    for (let attempt = 0; ; attempt++) {
+      try { r = await RT.sample(`${system}\n\n${prompt}${note}`, tools.length ? { tools } : {}); break; }
+      catch (e) { if (e?.code === "rate_limited" && attempt < 2) { await sleep(4000 * (attempt + 1)); continue; } throw e; }
+    }
     const text = (r.text || "").trim();
     return { text, lastText: text, urls: [], toolText: acc.toolText.join("\n"), toolCalls: acc.toolCalls, toolErrors: acc.toolErrors, stop: r.truncated ? "max_tokens" : "end_turn", model: `claude.ai (${r.modelTierApplied || "default"})` };
   } catch (e) {
@@ -1758,33 +1801,24 @@ async function callClaude(settings, opts) {
   return callClaudeApi(settings, opts);
 }
 
-/* Niveaux : « deep » (Opus : scoring, CV, recherche web), « balanced » (Sonnet : traduction, Gmail, relances),
-   « fast » (Haiku : priorisation, synonymes, doublons, réparation JSON). Effort bas sur les tâches légères. */
-async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000, tier = "deep", effort, context }) {
-  const t = settings.routing === false ? "deep" : tier;
+async function callClaudeApi(settings, { system, prompt, web = null, mcp = [], maxTokens = 12000 }) {
   const o = {
-    system, prompt, web, mcp, maxTokens, context, tier: t,
-    effort: settings.effortTuning === false ? null : effort,
-    models: tierModels(settings, t),
+    system, prompt, web, mcp, maxTokens,
+    models: [...new Set([settings.model, settings.fallbackModel].filter(Boolean))],
     webTypes: ["web_search_20260209", "web_search_20250305"],
     mcpModes: settings.mcpMode === "auto" ? ["legacy", "toolset"] : [settings.mcpMode],
   };
-  if (settings.promptCache === false && context) { o.context = null; o.system = `${system}\n\n${context}`; }
-  let v = { w: 0, p: 0, ...(WORKING_VARIANT || {}), m: MODEL_IDX[t] || 0 };
+  let v = WORKING_VARIANT ? { ...WORKING_VARIANT } : { m: 0, w: 0, p: 0 };
   let lastErr;
-  for (let attempt = 0; attempt < 9; attempt++) {
+  for (let attempt = 0; attempt < 7; attempt++) {
     try {
       const res = await runConversation(settings, v, o);
-      const { m, ...shared } = v;
-      WORKING_VARIANT = shared;
-      MODEL_IDX[t] = m;
+      WORKING_VARIANT = v;
       return res;
     } catch (e) {
       lastErr = e;
       const msg = (e.message || "").toLowerCase();
       if (e.status === 400 || e.status === 404) {
-        if (o.context && v.cache !== false && /cache_control|cache/.test(msg)) { v = { ...v, cache: false }; continue; }
-        if (o.effort && v.effort !== false && /output_config|effort/.test(msg)) { v = { ...v, effort: false }; continue; }
         if (web && /web_search|20260209|tool.*type|tools\.\d/.test(msg) && v.w < o.webTypes.length - 1) { v = { ...v, w: v.w + 1 }; continue; }
         if (mcp.length && /mcp|toolset|beta|tool_configuration/.test(msg) && v.p < o.mcpModes.length - 1) { v = { ...v, p: v.p + 1 }; continue; }
         if (/model/.test(msg) && v.m < o.models.length - 1) { v = { ...v, m: v.m + 1 }; continue; }
@@ -1824,8 +1858,6 @@ async function askJSON(settings, opts) {
         system: SYSTEM_REPAIR,
         prompt: `Texte à convertir :\n<<<\n${res.text.slice(0, 40000)}\n>>>`,
         maxTokens: opts.maxTokens || 8000,
-        tier: "fast",
-        effort: "low",
       });
       return { ...res, data: extractJSON(fix.text) };
     }
@@ -1849,12 +1881,11 @@ Réponds UNIQUEMENT avec le JSON demandé, sans texte autour.`;
 const SYSTEM_REPAIR = `Convertis le texte fourni en un JSON strictement valide, en conservant exactement les informations présentes, sans rien ajouter ni inventer. Réponds uniquement avec le JSON.`;
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
-let HOME_LABEL = "Ohain (Brabant wallon)"; // suit le domicile du profil (mis à jour par l'application)
 
 function criteriaDigest(c) {
   return [
     `Postes visés : ${c.roles.join(" ; ")}`,
-    `Zones : ${c.zones.join(", ")} — trajet max ${c.maxCommute} min depuis ${HOME_LABEL}`,
+    `Zones : ${c.zones.join(", ")} — trajet max ${c.maxCommute} min depuis Ohain (Brabant wallon)`,
     `Télétravail : ${c.remote}`,
     `Indispensables : ${c.mustHave.join(" ; ") || "aucun"}`,
     `Souhaités (poids 1-5) : ${c.wishes.map((w) => `${w.label} [${w.weight}]`).join(" ; ") || "aucun"}`,
@@ -1879,7 +1910,266 @@ function profileDigest(p, full = false) {
   ].filter(Boolean).join("\n");
 }
 
-const OFFER_SCHEMA = `{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD ou null","url":"","description":"","commuteMinutes":null}`;
+const OFFER_SCHEMA = `{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD ou null","deadline":"YYYY-MM-DD ou null (date limite de candidature)","url":"","description":"","commuteMinutes":null}`;
+
+/* ── Rédaction des documents : réglages, contexte, analyse de l'annonce ── */
+const SYSTEM_WRITER = `Tu es un rédacteur senior de CV et de lettres de motivation (niveau cabinet de recrutement de cadres), spécialiste du marché belge en français, néerlandais et anglais.
+Tu écris pour deux lecteurs successifs : un logiciel de tri (ATS) qui cherche des termes exacts, puis un recruteur qui décide en 30 secondes.
+Règles absolues :
+- Vérité : uniquement des faits présents dans le profil fourni. Aucun chiffre, diplôme, outil, employeur, période ou résultat inventé. Une information utile mais absente s'écrit [à compléter : …].
+- Le candidat n'occupe pas le poste visé : son poste actuel se décrit au présent, ses postes passés au passé, le poste visé uniquement comme un objectif.
+- Répondre UNIQUEMENT avec un objet JSON valide conforme au schéma demandé, sans texte autour ni balise markdown.`;
+const DOC_TONES = { sobre: "sobre et factuel", direct: "direct et assertif, phrases très courtes", chaleureux: "chaleureux et engagé, sans emphase" };
+const DEFAULT_DOC_PREFS = { language: "auto", tone: "sobre", voice: "nominal", cvLength: "2" };
+const docLang = (offer, prefs, a) => (prefs?.language && prefs.language !== "auto" ? prefs.language : a?.language || offer?.language || "fr");
+const profileContact = (p) => [String(p.home || "").split("(")[0].trim(), p.email, p.phone, p.linkedinUrl].filter(Boolean).join(" | ") || "[à compléter : coordonnées]";
+const profileBlock = (p) => [
+  profileDigest(p, true),
+  `Formation : ${(p.education || []).join(" ; ") || "non renseignée"}`,
+  `Certifications : ${(p.certifications || []).join(" ; ") || "aucune"}`,
+].join("\n");
+/* ── Motivations (profil) : le « pourquoi », source de la lettre, des messages et de la préparation d'entretien. Jamais du CV. ──
+   Champ facultatif profile.motivation ; absent = vide. */
+const MOTIV_TEXT_FIELDS = [
+  { id: "purpose", label: "Raison d'être professionnelle", hint: "Ce qui vous fait avancer dans votre travail, avec vos mots." },
+  { id: "whyNow", label: "Pourquoi changer maintenant", hint: "Le déclencheur réel, formulé positivement." },
+  { id: "lookingFor", label: "Ce que vous cherchez", hint: "Rôle, périmètre, culture, type de direction." },
+  { id: "method", label: "Votre méthode", hint: "Comment vous menez une transformation, du cadrage à l'adoption." },
+  { id: "management", label: "Votre management", hint: "Comment vous dirigez une équipe, avec un exemple." },
+];
+const emptyMotivation = () => ({ purpose: "", convictions: [], stories: [], management: "", method: "", whyNow: "", lookingFor: "", sectors: [] });
+function motivOf(p) {
+  const m = p?.motivation && typeof p.motivation === "object" ? p.motivation : {};
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  return {
+    ...emptyMotivation(),
+    ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, String(m[f.id] || "")])),
+    convictions: arr(m.convictions).map((c, i) => ({ id: c?.id || `c${i + 1}`, text: String(c?.text ?? c ?? "") })).filter((c) => c.text.trim()),
+    stories: arr(m.stories).map((s, i) => ({ id: s?.id || `s${i + 1}`, title: String(s?.title || ""), situation: String(s?.situation || ""), action: String(s?.action || ""), result: String(s?.result || ""), lesson: String(s?.lesson || "") })).filter((s) => s.title.trim() || s.situation.trim() || s.action.trim()),
+    sectors: arr(m.sectors).map(String).filter((x) => x.trim()),
+  };
+}
+const motivFilled = (m) => MOTIV_TEXT_FIELDS.filter((f) => m[f.id].trim()).length + (m.convictions.length ? 1 : 0) + (m.stories.length ? 1 : 0) + (m.sectors.length ? 1 : 0);
+const storyText = (s) => [s.title && `« ${s.title} »`, s.situation && `situation : ${s.situation}`, s.action && `action : ${s.action}`, s.result && `résultat : ${s.result}`, s.lesson && `leçon : ${s.lesson}`].filter(Boolean).join(" · ");
+/* Bloc « pourquoi » injecté dans la lettre, les messages et la préparation d'entretien (jamais dans le CV). */
+function motivationBlock(p) {
+  const m = motivOf(p);
+  if (!motivFilled(m)) return "MOTIVATIONS DU CANDIDAT : non renseignées. Toute phrase de motivation personnelle s'écrit [à compléter : …].";
+  return [
+    "MOTIVATIONS DU CANDIDAT (ses propres mots, seule source autorisée pour le « pourquoi » ; reformule sans rien ajouter)",
+    m.purpose && `Raison d'être : ${m.purpose}`,
+    m.whyNow && `Pourquoi maintenant : ${m.whyNow}`,
+    m.lookingFor && `Ce qu'il cherche : ${m.lookingFor}`,
+    m.method && `Méthode : ${m.method}`,
+    m.management && `Management : ${m.management}`,
+    m.sectors.length && `Secteurs qui l'attirent : ${m.sectors.join(" ; ")}`,
+    m.convictions.length && `Convictions :\n${m.convictions.map((c) => `- [${c.id}] ${c.text}`).join("\n")}`,
+    m.stories.length && `Banque d'histoires (à raconter, pas à lister) :\n${m.stories.map((s) => `- [${s.id}] ${storyText(s)}`).join("\n")}`,
+  ].filter(Boolean).join("\n");
+}
+
+/* Entretien de motivation : 10 questions ; l'IA reformule les réponses, sans rien ajouter. */
+const MOTIV_QUESTIONS = [
+  { id: "q1", field: "purpose", q: "Qu'est-ce qui vous fait avancer dans votre travail ? Un moment où vous vous êtes dit « c'est pour ça que je fais ce métier »." },
+  { id: "q2", field: "convictions", q: "Quelles convictions défendez-vous sur la transformation digitale, et qu'est-ce qui les a forgées ?" },
+  { id: "q3", field: "stories", q: "Racontez le projet dont vous êtes le plus fier : contexte, ce que VOUS avez fait, résultat." },
+  { id: "q4", field: "stories", q: "Racontez une résistance au changement ou un échec, et ce que vous en avez appris." },
+  { id: "q5", field: "management", q: "Comment dirigez-vous une équipe ? Donnez un exemple concret." },
+  { id: "q6", field: "method", q: "Quelle est votre méthode pour mener une transformation, du cadrage à l'adoption par les utilisateurs ?" },
+  { id: "q7", field: "whyNow", q: "Pourquoi chercher un nouveau poste maintenant ?" },
+  { id: "q8", field: "lookingFor", q: "Que cherchez-vous dans votre prochain poste : rôle, périmètre, culture, type de direction ?" },
+  { id: "q9", field: "sectors", q: "Quels secteurs ou types d'organisations vous attirent, et pourquoi ?" },
+  { id: "q10", field: "stories", q: "Que diraient de vous votre direction ou vos collègues ? Appuyez-vous sur une situation réelle." },
+];
+
+/* ── Règles d'écriture (6a) : prioritaires sur les consignes de style, jamais sur la vérité. Champ facultatif profile.writingRules. ── */
+const SEED_RULES = [
+  "Positionnement : généraliste de la transformation digitale, pont entre le métier et la technique. Jamais « responsable CRM », ni un rôle réduit au seul CRM.",
+  "Trilinguisme FR / NL / EN cité dans le Profil du CV.",
+  "Master mentionné discrètement : section Formation uniquement, sans mise en avant.",
+  "Preuves prioritaires, quand le profil les contient : plus de 20 projets ; 120 utilisateurs et 80 000 contacts ; 1,5 ETP ; −40 % ; comité IA ; rôle de conseil auprès du COO et du CEO.",
+  "Ton humble : les faits parlent, aucune autopromotion.",
+].map((text, i) => ({ id: `r${i + 1}`, text, active: true, origin: "départ" }));
+const writingRulesOf = (p) => (Array.isArray(p?.writingRules) ? p.writingRules : SEED_RULES);
+function rulesBlock(p) {
+  const act = writingRulesOf(p).filter((r) => r.active && String(r.text || "").trim());
+  const locked = Array.isArray(p?.lockedBullets) ? p.lockedBullets.filter((x) => String(x || "").trim()) : [];
+  const parts = [];
+  if (act.length) parts.push(`RÈGLES D'ÉCRITURE DU CANDIDAT (prioritaires sur toutes les consignes de style et de ton ci-dessus ; jamais sur la vérité : un fait absent du profil reste [à compléter : …])\n${act.map((r) => `- ${r.text}`).join("\n")}`);
+  if (locked.length) parts.push(`PUCES VERROUILLÉES (si tu en utilises une, recopie-la mot pour mot ; ne propose jamais de la modifier)\n${locked.map((b) => `- ${b}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+/* Insère les règles juste avant la consigne de format JSON finale. */
+function withRules(prompt, p) {
+  const block = rulesBlock(p);
+  if (!block) return prompt;
+  const i = prompt.lastIndexOf("Réponds uniquement");
+  return i < 0 ? `${prompt}\n\n${block}` : `${prompt.slice(0, i)}${block}\n\n${prompt.slice(i)}`;
+}
+/* ── Fiches entreprise (companyBriefs) : faits sourcés, valables 60 jours. Un fait sans URL vérifiée est exclu. ── */
+const BRIEF_TTL_DAYS = 60;
+const briefKey = (company) => companyKey(company || "").replace(/\s+/g, "-").slice(0, 120);
+const briefFresh = (b) => !!b && !!b.expiresAt && new Date(b.expiresAt).getTime() > Date.now();
+const isHttp = (u) => /^https?:\/\/[^\s/]+\.[^\s]+/i.test(String(u || "").trim());
+/* verifiedUrls : URL réellement vues dans les résultats de recherche (null = URL fournie par l'utilisateur ou vérifiée par la Routine). */
+function makeBrief({ company, summary, facts, origin, verifiedUrls = null, createdAt }) {
+  const seen = (u) => verifiedUrls === null || verifiedUrls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+  const list = (Array.isArray(facts) ? facts : []).map((f) => ({ text: str(f?.text), url: str(f?.url || f?.sourceUrl) }))
+    .filter((f) => f.text && isHttp(f.url) && seen(f.url))
+    .slice(0, 12)
+    .map((f, i) => ({ id: `B${i + 1}`, text: f.text, url: f.url, verified: true, source: origin }));
+  const at = createdAt && !isNaN(new Date(createdAt)) ? new Date(createdAt) : new Date();
+  return { company: str(company) || "", summary: str(summary), facts: list, origin, createdAt: at.toISOString(), expiresAt: new Date(at.getTime() + BRIEF_TTL_DAYS * 864e5).toISOString() };
+}
+function mergeBriefs(a, b) {
+  if (!a || !briefFresh(a)) return b;
+  const seen = new Set(a.facts.map((f) => normText(f.text)));
+  const facts = [...a.facts, ...b.facts.filter((f) => !seen.has(normText(f.text)))].slice(0, 16).map((f, i) => ({ ...f, id: `B${i + 1}` }));
+  return { ...b, summary: b.summary || a.summary, facts, origin: a.origin === b.origin ? b.origin : `${a.origin}+${b.origin}` };
+}
+
+/* ── Pourquoi cette candidature (app.motivation, facultatif) ── */
+const appMotivOf = (app) => ({ factIds: [], whyCompany: "", whyRole: "", personalLink: "", convictionId: null, storyId: null, employerNamed: true, ...(app?.motivation && typeof app.motivation === "object" ? app.motivation : {}) });
+/* Faits disponibles : annonce (avec son URL) + fiche entreprise à jour. Les faits sans URL sont exclus. */
+function companyFactsFor(app, offer, briefs) {
+  const out = [];
+  const adUrl = (offer?.sources || []).find((x) => isHttp(x.url))?.url;
+  if (!offer?.spontaneous && adUrl) (app?.analysis?.companyFacts || []).filter(Boolean).forEach((t, i) => out.push({ id: `A${i + 1}`, text: t, url: adUrl, source: "annonce" }));
+  const b = offer?.company ? briefs?.[briefKey(offer.company)] : null;
+  if (briefFresh(b)) b.facts.forEach((f) => out.push({ ...f }));
+  return out;
+}
+function selectedFacts(app, offer, briefs) {
+  const all = companyFactsFor(app, offer, briefs);
+  const ids = appMotivOf(app).factIds;
+  const sel = ids.length ? all.filter((f) => ids.includes(f.id)) : all;
+  return sel.length ? sel : all;
+}
+const genericOrg = (o) => !o || /^(une?|the|a|een)\s/i.test(o) || normText(o) === normText("Fédération patronale belge");
+function employerRule(app, profile) {
+  const org = profile?.experiences?.[0]?.org || "";
+  return appMotivOf(app).employerNamed
+    ? `Employeur actuel : nommé par son libellé exact (« ${org || "voir profil"} ») dans le CV ET dans la lettre.`
+    : "Employeur actuel : JAMAIS nommé, ni dans le CV ni dans la lettre ni dans les messages. Désigne-le de façon générique (« une fédération patronale belge »), y compris dans les lignes « ### Fonction | Organisation… ».";
+}
+/* Bloc « pourquoi cette candidature » : vide → [à compléter] (bloquant au contrôle). */
+function appMotivationBlock(app, offer, profile, facts) {
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const conv = bank.convictions.find((c) => c.id === m.convictionId);
+  const story = bank.stories.find((s) => s.id === m.storyId);
+  const company = offer?.spontaneous === "base" ? "l'entreprise" : show(offer?.company);
+  return [
+    "POURQUOI CETTE CANDIDATURE (choix du candidat pour cette cible)",
+    `Faits retenus sur ${company} : ${facts.length ? facts.map((f) => f.id).join(", ") : "aucun → [à compléter : un fait vérifiable sur l'entreprise, avec sa source]"}`,
+    `Pourquoi ${company} : ${m.whyCompany.trim() || (facts.length ? "non précisé : relie un fait retenu à une conviction" : "[à compléter : pourquoi cette entreprise]")}`,
+    `Pourquoi ce rôle, maintenant : ${m.whyRole.trim() || (bank.whyNow ? `non précisé pour cette cible ; s'appuyer sur « ${bank.whyNow} »` : "[à compléter : pourquoi ce rôle maintenant]")}`,
+    m.personalLink.trim() ? `Lien personnel avec l'entreprise : ${m.personalLink.trim()}` : "",
+    conv ? `Conviction à mettre en avant : [${conv.id}] ${conv.text}` : "Conviction : au choix dans la banque (la plus liée aux faits retenus).",
+    story ? `Histoire à raconter : [${story.id}] ${storyText(story)}` : "Histoire : au choix dans la banque (la plus proche des enjeux de l'entreprise).",
+  ].filter(Boolean).join("\n");
+}
+const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
+const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
+
+/* Cible de rédaction : offre publiée, candidature spontanée (entreprise ciblée, sans offre) ou CV de base (ni offre ni entreprise). */
+const SPONT_LABEL = { company: "Candidature spontanée", base: "CV de base" };
+function targetInfo(offer, a) {
+  const mode = offer?.spontaneous || "offer";
+  return { mode, spont: mode !== "offer", base: mode === "base", role: a?.jobTitle || offer?.title || "le poste visé", company: offer?.company || null };
+}
+function targetBlock(offer, a) {
+  const t = targetInfo(offer, a);
+  if (!t.spont) return `OFFRE\nIntitulé : ${offer.title} · Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)}`;
+  return [
+    t.base ? "CV DE BASE : aucune offre et aucune entreprise ciblée (document réutilisable pour ce type de rôle)" : "CANDIDATURE SPONTANÉE : aucune offre n'a été publiée",
+    `Rôle visé : ${offer.title}`,
+    t.base ? "" : `Entreprise ciblée : ${show(offer.company)}`,
+    offer.location ? `Lieu souhaité : ${offer.location}` : "",
+    offer.contactName ? `Interlocuteur : ${offer.contactName}` : "",
+    `Contexte fourni par le candidat (seule source d'information sur l'entreprise) : ${adTextOf(offer) || "aucun"}`,
+  ].filter(Boolean).join("\n");
+}
+const targetLine = (offer, a) => {
+  const t = targetInfo(offer, a);
+  return t.base ? `CV de base pour un rôle de ${t.role} (aucune entreprise ciblée)` : t.spont ? `candidature spontanée chez ${show(t.company)} pour un rôle de ${t.role}` : `${t.role} chez ${show(offer.company)}`;
+};
+function hashStr(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+function analysisDigest(a, offer) {
+  if (!a) return `(analyse indisponible : appuie-toi sur l'annonce)\n${adTextOf(offer).slice(0, 6000)}`;
+  const kw = (a.keywords || []).map((k) => `- « ${k.term} »${k.variants?.length ? ` (variantes : ${k.variants.join(", ")})` : ""} [${k.category}, importance ${k.importance}, ${k.status}]${k.evidence ? ` — preuve : ${k.evidence}` : ""}`).join("\n");
+  return [
+    `Intitulé exact du poste : ${a.jobTitle}${a.titleVariants?.length ? ` (équivalents : ${a.titleVariants.join(", ")})` : ""}`,
+    a.angle ? `Ce que l'employeur cherche vraiment : ${a.angle}` : "",
+    a.requirements?.length ? `Exigences clés :\n${a.requirements.map((r) => `- ${r.text} [importance ${r.importance}]${r.proof ? ` — preuve : ${r.proof}` : " — pas de preuve directe"}`).join("\n")}` : "",
+    a.companyFacts?.length ? `Contexte de l'entreprise (tiré de l'annonce) :\n${a.companyFacts.map((f) => `- ${f}`).join("\n")}` : "",
+    kw ? `Mots-clés ATS :\n${kw}` : "",
+    a.positioning?.headline ? `Ligne de positionnement proposée : ${a.positioning.headline}` : "",
+    a.positioning?.pitch ? `Proposition de valeur : ${a.positioning.pitch}` : "",
+    a.gaps?.length ? `Écarts à traiter honnêtement :\n${a.gaps.map((g) => `- ${g.text}${g.approach ? ` → ${g.approach}` : ""}`).join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+function normalizeAnalysis(d, offer) {
+  d = d && typeof d === "object" ? d : {};
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  const txt = (x) => (x && typeof x === "object" ? null : str(x));
+  const seen = new Set();
+  const keywords = arr(d.keywords).map((k) => {
+    const term = txt(k?.term);
+    const key = normText(term);
+    if (!term || !key || seen.has(key)) return null;
+    seen.add(key);
+    const status = KW_STATUS.includes(k.status) ? k.status : txt(k.evidence) ? "prouvé" : "absent";
+    return {
+      term, category: KW_CATS[k.category] ? k.category : "competence",
+      importance: clamp(Math.round(Number(k.importance) || 2), 1, 3),
+      variants: arr(k.variants).map(txt).filter(Boolean).slice(0, 4),
+      status, evidence: status === "absent" ? null : txt(k.evidence),
+    };
+  }).filter(Boolean).slice(0, 40);
+  const pos = d.positioning && typeof d.positioning === "object" ? d.positioning : {};
+  return {
+    jobTitle: txt(d.jobTitle) || offer.title,
+    titleVariants: arr(d.titleVariants).map(txt).filter(Boolean).slice(0, 4),
+    language: /^(fr|nl|en)$/.test(d.language) ? d.language : offer.language || null,
+    keywords,
+    requirements: arr(d.requirements).map((r) => ({ text: txt(r?.text) || txt(r), importance: clamp(Math.round(Number(r?.importance) || 2), 1, 3), proof: txt(r?.proof) })).filter((r) => r.text).slice(0, 12),
+    angle: txt(d.angle),
+    companyFacts: arr(d.companyFacts).map(txt).filter(Boolean).slice(0, 6),
+    positioning: { currentTitle: txt(pos.currentTitle), headline: txt(pos.headline), pitch: txt(pos.pitch) },
+    gaps: arr(d.gaps).map((g) => ({ text: txt(g?.text) || txt(g), approach: txt(g?.approach) })).filter((g) => g.text).slice(0, 8),
+  };
+}
+
+/* CV de référence pour la lettre : brouillon en cours, sinon dernière version enregistrée. */
+const latestCvText = (app) => app?.drafts?.cv?.text || app?.docs?.cv?.slice(-1)[0]?.text || "";
+const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallbackKeywords, cvText, app, briefs }) => ({
+  cvText: cvText || "", motivation: motivOf(profile),
+  companyFacts: app ? selectedFacts({ ...app, analysis: analysis || app.analysis }, offer, briefs).map((f) => f.text) : analysis?.companyFacts || [],
+  employerNamed: app ? appMotivOf(app).employerNamed : null,
+  currentOrg: profile?.experiences?.[0]?.org || "",
+  lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
+  jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
+  company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
+});
+async function settleLimited(fns, n) {
+  const out = new Array(fns.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < fns.length) {
+      const i = next++;
+      try { out[i] = { status: "fulfilled", value: await fns[i]() }; } catch (e) { out[i] = { status: "rejected", reason: e }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, fns.length) }, worker));
+  return out;
+}
 
 const P = {
   search(src, c, s) {
@@ -1900,8 +2190,10 @@ MÉTHODE
 RÈGLES STRICTES
 - N'invente jamais une offre. L'URL doit être exactement celle d'un résultat de recherche que tu as vu.
 - Champ inconnu ou absent de l'annonce → null. Le salaire n'est renseigné que s'il est écrit dans l'annonce.
+- publishedAt : date de publication visible (« il y a 5 jours » → calcule la date). deadline : date limite de candidature si elle est indiquée (« postuler avant le… », « apply by », « solliciteren tot »), sinon null.
+- Écarte toute annonce marquée « expirée », « n'accepte plus de candidatures », « no longer accepting applications », « closed », « vacature gesloten », ou dont la date limite est passée.
 - description : résumé factuel (missions, profil, conditions) en 600 caractères max, sans extrapoler.
-- commuteMinutes : estimation du trajet en voiture hors heures de pointe depuis ${HOME_LABEL}, null si le lieu est inconnu.
+- commuteMinutes : estimation du trajet en voiture hors heures de pointe depuis Ohain, null si le lieu est inconnu.
 
 Réponds uniquement avec ce JSON :
 {"offers":[${OFFER_SCHEMA}],"notes":"remarque courte sur la recherche (ex. site peu indexé, annonces expirées)"}`;
@@ -1918,11 +2210,12 @@ Mission : importer les offres d'emploi reçues dans les e-mails d'alertes emploi
 
 RÈGLES
 - N'extrais que ce qui figure dans les e-mails. url = lien de l'offre tel qu'il apparaît dans l'e-mail. Champ absent → null.
+- publishedAt : date de publication si l'e-mail l'indique ; sinon la date de réception de l'e-mail, avec "publishedApprox": true. deadline : date limite si indiquée, sinon null.
 - Garde les offres de niveau management / digital / IT / CRM / transformation / opérations ; ignore stages, postes juniors et métiers sans rapport.
 - description : ce que l'e-mail dit de l'offre (souvent court), sans extrapoler.
 
 Réponds uniquement avec ce JSON :
-{"offers":[{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":null,"url":"","description":"","commuteMinutes":null,"sourceName":"LinkedIn|Indeed|Jobat|…","emailSubject":""}],"messagesRead":0,"notes":""}`;
+{"offers":[{"title":"","company":null,"location":null,"contract":null,"seniority":null,"salary":null,"remote":null,"language":"fr|nl|en","publishedAt":"YYYY-MM-DD","publishedApprox":false,"deadline":null,"url":"","description":"","commuteMinutes":null,"sourceName":"LinkedIn|Indeed|Jobat|…","emailSubject":""}],"messagesRead":0,"notes":""}`;
   },
 
   structure({ text, url }) {
@@ -1930,144 +2223,486 @@ Réponds uniquement avec ce JSON :
 Mission : structurer une annonce d'emploi fournie par l'utilisateur.
 ${url ? `URL fournie : ${url}\n` : ""}${text ? `Texte de l'annonce :\n<<<\n${text.slice(0, 20000)}\n>>>\n` : ""}
 ${url && !text ? `Utilise web_search pour retrouver CETTE annonce précise (intitulé, entreprise, contenu). Si tu ne la retrouves pas avec certitude, réponds {"found":false,"reason":"…"}.` : "Base-toi uniquement sur le texte fourni."}
-Règles : aucun champ inventé (null si absent) ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 1 200 caractères max (missions, profil, conditions) ; commuteMinutes = trajet voiture estimé depuis ${HOME_LABEL} ou null.
+Règles : aucun champ inventé (null si absent) ; publishedAt et deadline (date limite de candidature) au format YYYY-MM-DD s'ils figurent dans l'annonce ; ${url ? "garde l'URL fournie telle quelle" : "url = null si aucune URL n'apparaît dans le texte"} ; description = résumé factuel de 800 caractères max ; commuteMinutes = trajet voiture estimé depuis Ohain ou null.
 Réponds uniquement avec ce JSON :
 {"found":true,"offer":${OFFER_SCHEMA}}`;
   },
 
-  /* Partie stable du scoring (profil, critères, barème) : mise en cache entre les lots. */
-  scoreContext(profile, c, versionLabel) {
-    return `Mission : évaluer l'adéquation de chaque offre avec le profil et les critères du candidat. Sois factuel, sobre, sans complaisance.
-
-PROFIL
-${profileDigest(profile)}
-
-CRITÈRES (version « ${versionLabel} »)
-${criteriaDigest(c)}
-
-BARÈME
-- breakdown : une ligne par critère indispensable, souhaité, exclusion et signal d'alerte, en reprenant EXACTEMENT le libellé du critère.
-  · indispensable / souhaité : match 0-100 = degré de satisfaction.
-  · exclusion / alerte : match 0-100 = degré de PRÉSENCE (100 = clairement présent dans l'annonce).
-  · note : 15 mots max, factuelle, qui s'appuie sur l'annonce. Information absente → match 50 et note « non précisé ».
-- score 0-100 : moyenne pondérée des souhaités, ajustée par le reste. Plafond 45 si un indispensable est clairement non rempli ; plafond 20 si une exclusion est clairement présente.
-- confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre (moins de ~3 phrases utiles ou champs clés absents).
-- redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce (type : stress, turnover, role_flou, autre).
-- questions : points à clarifier avec le recruteur.
-
-CLARTÉ (uniquement ce que dit l'annonce, sinon null ou liste vide)
-- tldr : une phrase EN FRANÇAIS de 25 mots max qui dit ce qu'est vraiment le poste, quelle que soit la langue de l'annonce.
-- facts : contract (CDI | CDD | Freelance | Intérim | Stage | Autre), remoteDays (jours de télétravail par semaine, nombre), salaryMin / salaryMax (nombres, en euros), salaryPeriod (an | mois), languages (codes fr, nl, en, de exigés), teamSize (nombre de personnes à manager), reportsTo (rattachement), seniority (Junior | Médior | Senior | Manager | Direction).
-- must : exigences indispensables de l'annonce (5 max, 8 mots chacune) ; nice : atouts souhaités (5 max) ; missions : missions principales (5 max, 10 mots chacune). En français.
-
-Réponds uniquement avec ce JSON :
-{"scores":[{"id":"","score":0,"confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","tldr":"","facts":{"contract":null,"remoteDays":null,"salaryMin":null,"salaryMax":null,"salaryPeriod":null,"languages":[],"teamSize":null,"reportsTo":null,"seniority":null},"must":[],"nice":[],"missions":[],"breakdown":[{"criterion":"","kind":"indispensable|souhaité|exclusion|alerte","weight":1,"match":0,"note":""}],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
-  },
-
-  score(offers) {
+  score(offers, profile, c, versionLabel) {
     const compact = offers.map((o) => ({
       id: o.id, title: o.title, company: o.company, location: o.location,
       commuteMinutes: o.commute?.minutes ?? null, contract: o.contract, seniority: o.seniority,
-      salary: o.salary, remote: o.remote, language: o.language, description: o.description,
+      salary: o.salary, remote: o.remote, language: o.language, publishedAt: o.publishedAt || null, deadline: o.deadline || null,
+      description: (o.description || "").slice(0, 1800),
     }));
-    return `OFFRES À ÉVALUER\n${JSON.stringify(compact)}`;
+    const list = criteriaList(c).map((x) => `${x.id} [${x.kind}${x.weight ? `, poids ${x.weight}` : ""}] ${x.label}`).join("\n");
+    return `Mission : évaluer, critère par critère, l'adéquation de chaque offre avec le profil du candidat. Le score final est calculé par la plateforme à partir de tes taux : sois rigoureux et constant d'une offre à l'autre.
+
+PROFIL
+${profileDigest(profile)}
+Domicile : Ohain (Brabant wallon). Trajet max souhaité : ${c.maxCommute} min. Télétravail : ${c.remote}.
+
+CRITÈRES (version « ${versionLabel} ») — évalue CHACUN, pour CHAQUE offre, avec son identifiant :
+${list}
+
+OFFRES
+${JSON.stringify(compact)}
+
+GRILLE (identique pour toutes les offres)
+- indispensable / souhaité : match = degré de satisfaction. 100 = explicitement satisfait ; 75 = très probable ; 50 = non précisé dans l'annonce ; 25 = peu probable ; 0 = explicitement contraire.
+- exclusion / alerte : match = degré de PRÉSENCE. 100 = explicitement présent ; 50 = non précisé ; 0 = explicitement absent.
+- Le niveau de responsabilité compte : un poste d'exécution, de consultant sans équipe ou de chef de projet sans management direct ne satisfait pas un critère « responsabilités managériales ».
+- note : 12 mots max, factuelle, tirée de l'annonce ; « non précisé » si l'information manque.
+- fit : "fort" | "moyen" | "faible" — ton avis global en une lettre de lecture rapide.
+- confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre.
+- redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce.
+
+Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifiant de critère) :
+{"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
-  dossier(offer, profile, types, instruction) {
+  dossier(offer, profile, types, instruction, analysis, extra = {}) {
     const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
-    return `Mission : préparer des documents de candidature pour l'offre ci-dessous. Le candidat relira, modifiera et validera tout : rien n'est envoyé automatiquement.
-
-OFFRE
+    const head = offer.spontaneous
+      ? `${targetBlock(offer, analysis)}
+Règle : aucune offre n'existe, jamais « suite à votre annonce ». linkedin = prise de contact avec un décideur ou un recruteur de l'entreprise pour proposer un échange ; email = candidature spontanée courte qui demande un échange de 20 à 30 minutes ; answers = questions probables lors d'un premier échange, avec réponses.`
+      : `OFFRE
 Intitulé : ${offer.title}
 Entreprise : ${show(offer.company)}
 Lieu : ${show(offer.location)}
 Contrat : ${show(offer.contract)} · Télétravail : ${show(offer.remote)}
-Annonce (résumé) : ${show(offer.description)}
-URL : ${show(offer.sources?.[0]?.url)}
+Annonce : ${adTextOf(offer).slice(0, 6000)}
+URL : ${show(offer.sources?.[0]?.url)}`;
+    return `Mission : préparer des documents de candidature pour la cible ci-dessous. Le candidat relira, modifiera et validera tout : rien n'est envoyé automatiquement.
 
+${head}
+${analysis ? `\nANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}\n${analysisDigest(analysis, offer)}\n` : ""}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+${extra.facts?.length ? `\nFAITS SOURCÉS SUR L'ENTREPRISE (seuls autorisés)\n${extra.facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 DOCUMENTS DEMANDÉS : ${types.join(", ")}
 
 CONSIGNES
 - Langue : ${lang}.
 - Ton naturel, précis, orienté résultats ; phrases courtes. Aucun cliché ni superlatif (« passionné », « dynamique », « force de proposition », « je me permets », « n'hésitez pas », « fort de », « motivé et rigoureux », « challenge »…).
 - N'utilise que des faits présents dans le profil. Aucun chiffre inventé. Si un élément utile manque, écris [à compléter : …].
-- Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom.
-- cv : CV adapté en texte brut (titre, accroche de 3 lignes, expériences réordonnées selon le poste, compétences), plus 4 à 6 points clés à mettre en avant.
-- letter : 250 à 350 mots, 3 ou 4 paragraphes, lien concret entre les réalisations et les missions.
-- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager, personnalisé.
-- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses.
+- Le candidat n'occupe PAS encore le poste visé : présente son poste actuel tel qu'il est, et le poste visé comme un objectif.
+- ${extra.employer || "Discrétion : le candidat est en poste. Désigne l'employeur actuel de façon générique (« une fédération patronale belge ») plutôt que par son nom."}
+- linkedin : 300 caractères maximum, adressé au recruteur ou au hiring manager : un fait propre à l'entreprise (annonce ou contexte) + une conviction ou une histoire du candidat. Pas de liste de compétences. Test de substitution : le message ne doit pas rester vrai pour un concurrent.
+- answers : 5 à 7 questions probables du formulaire (motivation, prétentions salariales formulées sans chiffre inventé, préavis, disponibilité, télétravail, langues…) avec réponses. La réponse « Pourquoi nous / votre motivation » s'appuie sur les faits propres à l'entreprise et sur les MOTIVATIONS (conviction, pourquoi maintenant, une histoire), jamais sur un résumé du CV ; manque → [à compléter : …].
 - email : objet et corps courts (120 mots max) mentionnant CV et lettre en pièces jointes.
 ${instruction ? `- Instruction spécifique de l'utilisateur : ${instruction}` : ""}
 
 Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
-{"language":"fr|nl|en","cv":{"text":"","highlights":[]},"letter":{"text":""},"linkedin":{"text":""},"answers":{"items":[{"question":"","answer":""}]},"email":{"subject":"","body":""}}`;
+{"language":"fr|nl|en","linkedin":{"text":""},"answers":{"items":[{"question":"","answer":""}]},"email":{"subject":"","body":""}}`;
   },
 
-  cvPro(offer, profile, parts, instruction) {
-    const lang = offer.language ? LANG_NAME[offer.language] : "celle de l'annonce (détecte-la)";
-    const contact = [profile.home, profile.email, profile.phone, profile.linkedinUrl].filter(Boolean).join(" | ") || "[à compléter : coordonnées]";
-    return `Mission : produire des documents de candidature PRÊTS À ENVOYER pour l'offre ci-dessous, optimisés à la fois pour les logiciels de tri (ATS) et pour un recruteur humain qui reçoit des centaines de candidatures. Le candidat relira tout avant envoi.
+  adAnalysis(offer, adText, profile) {
+    return `Mission : analyser cette annonce comme le feraient un logiciel de tri (ATS) puis un recruteur, et la confronter au profil du candidat. Cette analyse pilotera la rédaction de son CV et de sa lettre.
 
-OFFRE
-Intitulé : ${offer.title}
-Entreprise : ${show(offer.company)}
-Lieu : ${show(offer.location)} · Contrat : ${show(offer.contract)} · Télétravail : ${show(offer.remote)}
-Annonce : ${show(offer.description)}
+ANNONCE
+Intitulé affiché : ${offer.title}
+Entreprise : ${show(offer.company)} · Lieu : ${show(offer.location)} · Contrat : ${show(offer.contract)}
+Texte de l'annonce :
+<<<
+${adText.slice(0, 18000)}
+>>>
 
-PROFIL
+PROFIL DU CANDIDAT (seule source de preuves)
+${profileBlock(profile)}
+
+À PRODUIRE
+1. jobTitle : l'intitulé exact tel qu'écrit dans l'annonce. titleVariants : 1 à 4 formes équivalentes qu'un ATS ou un recruteur pourrait chercher (traduction FR/NL/EN, abréviation).
+2. language : langue de rédaction de l'annonce (fr, nl ou en).
+3. keywords : 20 à 35 termes qu'un ATS indexerait pour ce poste, recopiés EXACTEMENT sous la forme de l'annonce. Couvre tout le texte : intitulé, responsabilités, compétences métier, outils et technologies, méthodes et cadres, savoir-être explicitement demandés, langues, secteur, diplôme. Pour chacun :
+   - category : titre | competence | outil | methode | soft | langue | secteur | diplome
+   - importance : 3 = exigé, répété ou présent dans l'intitulé ; 2 = demandé ; 1 = atout
+   - variants : 0 à 3 formes que l'ATS considère équivalentes (singulier/pluriel, acronyme et forme longue, traduction si l'annonce mélange les langues)
+   - status : "prouvé" si le profil le démontre directement ; "transférable" si une expérience proche du profil permet de l'affirmer honnêtement ; "absent" sinon
+   - evidence : l'élément précis du profil qui le justifie (fonction, réalisation, outil, compétence), null si absent
+4. requirements : 5 à 10 exigences ou missions clés, une ligne chacune, avec importance (1-3) et proof (preuve tirée du profil, ou null).
+5. angle : en 2 phrases, le problème que l'employeur veut résoudre avec ce recrutement, d'après l'annonce.
+6. companyFacts : 0 à 5 faits sur l'entreprise ou son contexte figurant DANS l'annonce (rien d'extérieur).
+7. positioning :
+   - currentTitle : le titre réel actuel du candidat, tel que dans le profil.
+   - headline : la ligne qui figurera sous son nom sur le CV. Elle part de son titre RÉEL (ou d'une expertise vraie), suivi de 2 ou 3 domaines d'expertise qui recoupent l'annonce, séparés par « | » ou « · », 85 caractères maximum. Elle ne reprend JAMAIS l'intitulé du poste visé comme s'il l'occupait déjà, sauf si cet intitulé est identique à son titre actuel.
+   - pitch : une phrase : ce que le candidat apporte concrètement à CE poste, appuyé sur ses preuves.
+8. gaps : exigences sans preuve dans le profil, chacune avec une façon honnête de l'aborder (lettre, entretien, compétence voisine).
+
+Réponds uniquement avec ce JSON :
+{"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
+  },
+
+  targetAnalysis(offer, profile) {
+    const base = offer.spontaneous === "base";
+    const lang = LANG_NAME[offer.language] || "français";
+    return `Mission : préparer ${base ? "un CV de base (aucune offre ni entreprise ciblée)" : "une candidature SPONTANÉE (aucune offre publiée)"}. Déduis ce qu'un recruteur et un logiciel de tri (ATS) attendent pour le rôle visé sur le marché belge, puis confronte-le au profil du candidat. Cette analyse pilotera la rédaction.
+
+CIBLE
+${targetBlock(offer)}
+
+PROFIL DU CANDIDAT (seule source de preuves)
+${profileBlock(profile)}
+
+À PRODUIRE
+1. jobTitle : l'intitulé le plus courant pour ce rôle dans les annonces belges, en ${lang}. titleVariants : 2 à 4 intitulés équivalents (FR/NL/EN, abréviations).
+2. language : "${offer.language || "fr"}".
+3. keywords : 20 à 30 termes que les annonces pour ce rôle contiennent habituellement (responsabilités, compétences métier, outils, méthodes, savoir-être, langues, secteur), priorisés selon le contexte fourni. Pour chacun :
+   - category : titre | competence | outil | methode | soft | langue | secteur | diplome
+   - importance : 3 = cœur du rôle ; 2 = fréquent ; 1 = atout
+   - variants : 0 à 3 formes équivalentes (pluriel, acronyme et forme longue, traduction)
+   - status : "prouvé" si le profil le démontre directement ; "transférable" si une expérience proche permet de l'affirmer honnêtement ; "absent" sinon
+   - evidence : l'élément précis du profil qui le justifie, null si absent
+4. requirements : 5 à 8 attentes typiques du rôle, une ligne chacune, avec importance (1-3) et proof (preuve tirée du profil, ou null).
+5. angle : en 2 phrases, ${base ? "ce qu'une organisation cherche en général en recrutant ce rôle" : "ce que l'entreprise pourrait gagner à recruter ce profil, d'après le contexte fourni (sinon d'après le rôle)"}, formulé comme une hypothèse.
+6. companyFacts : uniquement les faits présents dans le contexte fourni (aucun fait extérieur, aucune supposition).
+7. positioning :
+   - currentTitle : le titre réel actuel du candidat, tel que dans le profil.
+   - headline : la ligne sous son nom sur le CV : son titre RÉEL (ou une expertise vraie), puis 2 ou 3 domaines d'expertise qui recoupent le rôle visé, séparés par « | » ou « · », 85 caractères maximum. Jamais le rôle visé présenté comme déjà occupé.
+   - pitch : une phrase : ce que le candidat apporte concrètement dans ce rôle${base ? "" : " pour cette entreprise"}, appuyé sur ses preuves.
+8. gaps : attentes sans preuve dans le profil, chacune avec une façon honnête de l'aborder.
+
+Réponds uniquement avec ce JSON :
+{"jobTitle":"","titleVariants":[],"language":"fr|nl|en","keywords":[{"term":"","category":"competence","importance":2,"variants":[],"status":"prouvé|transférable|absent","evidence":null}],"requirements":[{"text":"","importance":2,"proof":null}],"angle":"","companyFacts":[],"positioning":{"currentTitle":"","headline":"","pitch":""},"gaps":[{"text":"","approach":""}]}`;
+  },
+
+  cvWrite(offer, profile, a, prefs, instruction, extra = {}) {
+    const lang = LANG_NAME[docLang(offer, prefs, a)] || "celle de l'annonce";
+    const contact = profileContact(profile);
+    const target = a?.jobTitle || offer.title;
+    const voice = prefs.voice === "je"
+      ? "à la première personne (« je »), phrases courtes"
+      : "sans pronom personnel, style CV (verbes sans sujet ou phrases nominales : « Pilote… », « Responsable du CRM… »)";
+    const tg = targetInfo(offer, a);
+    const projection = tg.base
+      ? `c) la projection : le type de rôle recherché (« ${target} ») comme OBJECTIF, sans nommer d'entreprise.`
+      : tg.spont
+        ? `c) la projection : ce qu'il veut apporter à ${show(offer.company)} dans un rôle de « ${target} », formulé comme un OBJECTIF (aucune offre n'existe : jamais « en réponse à votre annonce »).`
+        : `c) la projection : ce qu'il veut apporter, en citant l'intitulé exact « ${target} » comme OBJECTIF (par ex. « … souhaite mettre cette expérience au service de ${show(offer.company)} en tant que ${target} »), jamais comme une fonction déjà exercée.`;
+    const masterBlock = extra.master ? `
+CV MAÎTRE (${LANG_NAME[extra.masterLang] || "même langue"}) — base OBLIGATOIRE. Tu l'ADAPTES, tu ne le réécris pas.
+Tu ne peux modifier QUE : la ligne de positionnement (« > »), la section Profil, la section Réalisations clés (choisir et ordonner des réalisations du maître ou du profil), l'ORDRE des puces dans chaque poste (sans changer leur texte) et la section Compétences. Tout le reste (en-tête, postes, puces, langues, formation) est recopié à l'identique ; toute autre modification sera annulée.
+<<<
+${extra.master}
+>>>
+` : "";
+    return `Mission : rédiger le CV du candidat, adapté à la cible ci-dessous et prêt à envoyer après relecture.
+${masterBlock}
+${targetBlock(offer, a)}
+
+ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (déjà confrontée au profil)
+${analysisDigest(a, offer)}
+
+PROFIL (seule source de faits)
 Nom : ${profile.name || "[à compléter : prénom nom]"}
 Coordonnées : ${contact}
-${profileDigest(profile, true)}
-Formation : ${(profile.education || []).join(" ; ") || "[à compléter]"}
-Certifications : ${(profile.certifications || []).join(" ; ") || "aucune renseignée"}
+${profileBlock(profile)}
 
-DOCUMENTS À PRODUIRE : ${parts.join(", ")}
+CONSIGNES DE RÉDACTION
+Langue : ${lang}. Titres de sections standard dans cette langue (FR : Profil, Réalisations clés, Expérience professionnelle, Compétences, Langues, Formation, Certifications ; NL : Profiel, Belangrijkste realisaties, Werkervaring, Vaardigheden, Talen, Opleiding ; EN : Profile, Key achievements, Professional experience, Skills, Languages, Education).
+1. Ligne sous le nom (balise « > ») : le positionnement RÉEL du candidat — son titre actuel (« ${profile.headline || "titre actuel"} ») ou une expertise vraie — puis 2 ou 3 domaines d'expertise qui recoupent l'annonce, séparés par « | » ou « · ». 85 caractères maximum. INTERDIT : y placer l'intitulé du poste visé (« ${target} ») comme s'il était déjà occupé, sauf s'il est identique au titre actuel.
+2. Profil : 3 ou 4 phrases, 55 à 90 mots, ${voice}. Construction :
+   a) qui est le candidat AUJOURD'HUI : fonction réelle, périmètre (équipe, outils, domaine), années d'expérience seulement si elles figurent dans le profil ;
+   b) 1 ou 2 preuves fortes, chiffrées si le profil contient des chiffres ;
+   ${projection}
+   Ne décris pas les missions du rôle visé comme si le candidat les exerçait déjà.
+3. Réalisations clés : 3 ou 4 puces choisies pour les exigences clés, chiffrées si le profil le permet, au format « verbe d'action + périmètre + résultat ».
+4. Expérience professionnelle, du plus récent au plus ancien : « ### Fonction | Organisation | Lieu | Période » puis 3 à 6 puces (2 à 4 pour les postes anciens). Verbes d'action au présent pour le poste actuel, au passé pour les précédents. Aucune puce ne commence par « Responsable de », « En charge de », « Participation à ». Une idée par puce, 2 lignes maximum.
+5. Compétences : 3 ou 4 groupes « **Groupe :** élément, élément » (ex. Transformation & pilotage, Outils & plateformes, Méthodes, Management), avec les termes exacts de l'annonce quand le profil les justifie.
+6. Langues (niveau tel que dans le profil), Formation (« ### Diplôme | Établissement | | Année »), Certifications si le profil en contient. N'invente ni niveau ni diplôme.
 
-RÈGLES DE FOND
-- Langue : ${lang}. Titres de sections standard dans cette langue (FR : Profil, Réalisations clés, Expérience professionnelle, Compétences, Langues, Formation, Certifications ; NL : Profiel, Belangrijkste realisaties, Werkervaring, Vaardigheden, Talen, Opleiding ; EN : Profile, Key achievements, Professional experience, Skills, Languages, Education).
-- Vérité absolue : uniquement des faits du profil. Aucun chiffre, diplôme, outil ou résultat inventé. Manque → [à compléter : …].
-- ATS : reprends mot pour mot les termes de l'annonce quand le profil les justifie (intitulé, compétences, outils, méthodes), avec acronyme et forme longue (ex. « CRM (Customer Relationship Management) »). Mise en page à une colonne, aucun tableau. L'accroche reprend l'intitulé exact du poste.
-- Humain : proposition de valeur claire en 2 lignes pour CETTE entreprise ; 3 réalisations chiffrées en tête ; puces « verbe d'action + périmètre + résultat » ; zéro cliché ni superlatif ; phrases courtes.
-- Différenciation : relie explicitement 2 ou 3 exigences de l'annonce à des preuves du profil ; dans la lettre, ouvre sur un élément précis de l'annonce ou du contexte de l'entreprise (seulement ce que l'annonce dit, ou un fait public certain), jamais sur « je me permets de… ».
-- Organisation actuelle : reprends exactement le libellé du profil dans le CV ; dans la lettre, désigne-la de façon générique.
-- Longueur : CV 1 à 2 pages (550 à 800 mots), lettre 230 à 320 mots.
-${instruction ? `- Consigne de l'utilisateur : ${instruction}` : ""}
+MOTS-CLÉS ATS — exigence de couverture
+- Chaque mot-clé de statut « prouvé » ou « transférable » d'importance 2 ou 3 apparaît au moins une fois sous sa forme exacte, de préférence dans le Profil, les Réalisations ou une puce d'Expérience où il est démontré — pas seulement dans Compétences.
+- Les outils et méthodes prouvés figurent aussi dans Compétences.
+- Première occurrence d'un acronyme : forme longue entre parenthèses si l'annonce l'utilise (ex. « CRM (Customer Relationship Management) »).
+- N'utilise JAMAIS un mot-clé de statut « absent ». Pas de bourrage : 3 occurrences maximum par terme, toujours dans une phrase qui a du sens.
 
-FORMAT DES DOCUMENTS (balisage léger, une instruction par ligne)
-CV :
+STYLE
+- Zéro cliché ni affirmation creuse (« passionné », « dynamique », « force de proposition », « orienté résultats », « rigoureux », « esprit d'équipe », « challenge »…) : montre-le par un fait.
+- ${extra.employer || `Organisation actuelle : reprends exactement le libellé du profil (« ${profile.experiences?.[0]?.org || "…"} »).`}
+- Longueur : ${prefs.cvLength === "1" ? "1 page (420 à 560 mots)" : "1 à 2 pages (600 à 850 mots)"}.
+${instruction ? `- Consigne du candidat : ${instruction}` : ""}
+
+FORMAT (balisage léger, une instruction par ligne)
 # Prénom Nom
-> Accroche reprenant l'intitulé du poste — proposition de valeur
+> Ligne de positionnement
 @ ${contact}
 ## Profil
-paragraphe de 3-4 lignes
+paragraphe
 ## Réalisations clés
-- réalisation chiffrée
+- puce
 ## Expérience professionnelle
 ### Fonction | Organisation | Lieu | Période
 - puce
 ## Compétences
-**Groupe :** élément, élément, élément
+**Groupe :** élément, élément
 ## Langues
-**Français :** niveau
+**Langue :** niveau
 ## Formation
-### Diplôme | École | Année
-Lettre :
+### Diplôme | Établissement | | Année
+
+COULEUR : accent = couleur principale de la charte de l'entreprise en hexadécimal SEULEMENT si tu la connais avec certitude, sinon null.
+
+Réponds uniquement avec ce JSON :
+{"cv":"<balisage>","accent":"#RRGGBB ou null","accentSource":"charte connue ou null","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
+  },
+
+  letterWrite(offer, profile, a, prefs, instruction, cvText, extra = {}) {
+    const code = docLang(offer, prefs, a) || "fr";
+    const target = a?.jobTitle || offer.title;
+    const city = String(profile.home || "").split(/[(,]/)[0].trim() || "[à compléter : ville]";
+    const dateLine = code === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(code)}`;
+    return P.letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, ...extra });
+  },
+
+  /* Règle d'or : le CV prouve, la lettre explique. Lettre = pourquoi eux + pourquoi ce rôle maintenant + méthode + 1 preuve racontée. */
+  letterCore({ offer, profile, a, prefs, instruction, cvText, code, target, dateLine, facts: factsIn, appBlock, employer }) {
+    const tg = targetInfo(offer, a);
+    const company = tg.base ? "[à compléter : entreprise]" : show(offer.company);
+    const facts = factsIn || [];
+    const kws = (a?.keywords || []).filter((k) => k.status !== "absent" && k.importance === 3).slice(0, 6).map((k) => `« ${k.term} »`);
+    const subject = tg.spont ? `## Objet : candidature spontanée — ${target}` : `## Objet : candidature au poste de ${target}`;
+    return `Mission : rédiger ${tg.base ? "une lettre de candidature spontanée MODÈLE, réutilisable (l'entreprise et ses faits restent à compléter)" : tg.spont ? "une lettre de candidature SPONTANÉE" : "la lettre de motivation"} pour ${tg.spont ? `un rôle de « ${target} »` : `le poste « ${target} »`}${tg.base ? "" : ` chez ${company}`}, prête à envoyer après relecture.
+
+RÈGLE D'OR : le CV prouve, la lettre explique. Le CV ci-dessous est déjà joint : la lettre ne le résume pas. Elle dit pourquoi CETTE entreprise, pourquoi CE rôle MAINTENANT, comment le candidat travaille, et raconte UNE preuve.
+TEST DE SUBSTITUTION : relis chaque phrase en remplaçant ${tg.base ? "l'entreprise" : company} par un concurrent. Si elle reste vraie, réécris-la avec un fait propre à ${tg.base ? "l'entreprise" : company}, ou supprime-la.
+
+${targetBlock(offer, a).split("\n").filter((l) => !l.startsWith("Contexte fourni par le candidat")).join("\n")}
+${tg.spont && adTextOf(offer) ? `\nNOTES DU CANDIDAT SUR L'ENTREPRISE (son point de vue, pas des faits vérifiés : à utiliser pour le « pourquoi » personnel, jamais citées comme faits sur l'entreprise)\n${adTextOf(offer).slice(0, 1500)}\n` : ""}
+CE QUE L'ON SAIT DE ${tg.base ? "L'ENTREPRISE" : company.toUpperCase()} (faits sourcés, seules informations autorisées sur l'entreprise ; cite leurs identifiants dans « used »)
+${facts.length ? facts.map((f) => `${f.id}. ${f.text} (source : ${f.url})`).join("\n") : "Aucun fait vérifié. Le paragraphe « pourquoi vous » s'écrit alors [à compléter : un fait précis et vérifiable sur l'entreprise, avec sa source]."}
+
+${appBlock || ""}
+
+ANALYSE ${tg.spont ? "DU RÔLE VISÉ" : "DE L'ANNONCE"} (repères, pas une liste à recopier)
+${analysisDigest(a, offer)}
+
+${motivationBlock(profile)}
+
+PROFIL (faits autorisés)
+Nom : ${profile.name || "[à compléter : prénom nom]"}
+Coordonnées : ${profileContact(profile)}
+${profileBlock(profile)}
+
+CV DÉJÀ JOINT (à NE PAS répéter)
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 9000)}
+>>>
+
+TRAME (corps de ${tg.spont ? "220 à 300" : "250 à 320"} mots, paragraphes séparés par une ligne vide)
+1. Appel : formule seule sur sa ligne (FR « Madame, Monsieur, » ; NL « Geachte mevrouw, geachte heer, » ; EN « Dear Hiring Manager, » ; interlocuteur nommé si connu).
+2. Pourquoi vous (2-3 phrases) : un ou deux faits propres à ${tg.base ? "l'entreprise" : company} (liste ci-dessus) reliés à une conviction ou à un intérêt réel du candidat. Aucune flatterie (« leader », « référence », « renommée », « prestigieuse », « j'admire »…).${tg.spont ? " Aucune offre n'existe : jamais « votre annonce », « le poste à pourvoir »." : ""}
+3. Pourquoi ce rôle, maintenant (2-3 phrases) : à partir de « pourquoi maintenant », « ce qu'il cherche » et d'une conviction. Le candidat n'occupe pas le poste visé.
+4. Preuve racontée (3-4 phrases) : UNE histoire de la banque, racontée (situation → ce qu'il a fait → ce que ça a changé), pas une liste de réalisations.
+5. Méthode (2 phrases) : comment il aborderait les enjeux de ${tg.base ? "l'entreprise" : company}, à partir de sa méthode, formulé comme une intention.
+6. Échange (1-2 phrases) : ${tg.spont ? "proposer un échange de 20 à 30 minutes, même sans poste ouvert" : "disponibilité pour un entretien, sans insistance"}, puis formule de politesse sobre adaptée à la langue.
+
+CONTRAINTES
+- Langue : ${LANG_NAME[code] || code}. Ton : ${DOC_TONES[prefs.tone] || DOC_TONES.sobre}, humble.
+- 2 chiffres au maximum dans toute la lettre.
+- Au plus 1 réalisation commune avec le CV, et formulée autrement qu'en puce de CV.
+- 2 à 4 mots-clés de l'annonce au plus, seulement s'ils viennent naturellement${kws.length ? ` (parmi : ${kws.join(", ")})` : ""}. Aucune énumération de compétences.
+- Jamais deux phrases consécutives commençant par « Je » (« Ik », « I »).
+- Intitulé exact « ${target} » dans l'objet ; ${tg.base ? "entreprise laissée en [à compléter]" : `${company} citée au moins une fois`}.
+- ${employer || "Discrétion : le candidat est en poste ; désigne son employeur actuel de façon générique (« une fédération patronale belge »), jamais par son nom."}
+- Motivation, conviction ou histoire absentes des MOTIVATIONS : écris [à compléter : …], n'invente rien. Aucun fait inventé, aucun cliché.
+${instruction ? `- Consigne du candidat : ${instruction}` : ""}
+
+FORMAT (balisage léger, une instruction par ligne)
 # Prénom Nom
 @ coordonnées
-= Lieu, le JJ mois AAAA
-> Destinataire (service recrutement / nom si connu)
-> Entreprise
-## Objet : candidature au poste de …
-paragraphes séparés par une ligne vide (accroche, preuves, valeur pour l'entreprise, conclusion avec appel à l'entretien)
+= ${dateLine}
+> ${offer.contactName || "Destinataire (service recrutement, ou nom si connu)"}
+> ${company}
+${subject}
+paragraphes séparés par une ligne vide
 ~ Prénom Nom
 
-COULEUR : accent = la couleur principale de la charte de l'entreprise en hexadécimal SEULEMENT si tu la connais avec certitude, sinon null.
+« used » décrit honnêtement ce que la lettre utilise : faits entreprise (A1, B1…), conviction (id [c…]), histoire (id [s…]), mots-clés de l'annonce, chiffres écrits, réalisation commune avec le CV (texte ou null).
 
-Réponds uniquement avec ce JSON (n'inclus que les documents demandés) :
-{"language":"fr|nl|en","accent":"#RRGGBB ou null","accentSource":"charte connue | null","keywords":{"fromAd":["15 à 25 termes exacts de l'annonce"],"missingInProfile":["termes de l'annonce que le profil ne permet pas de justifier"]},"cv":"<balisage>","letter":"<balisage>","tips":["3 conseils concrets pour sortir du lot sur CETTE offre"]}`;
+Réponds uniquement avec ce JSON :
+{"letter":"<balisage>","used":{"companyFacts":["A1"],"convictionId":null,"storyId":null,"keywords":[],"numbers":[],"sharedWithCv":null}}`;
+  },
+
+  companyBrief(company, context) {
+    return `Date du jour : ${todayStr()}.
+Mission : établir une fiche factuelle sur l'entreprise « ${company} » (Belgique de préférence), pour aider un candidat à expliquer « pourquoi cette entreprise ».
+${context ? `Contexte : ${context}` : ""}
+Utilise web_search avec le NOM DE L'ENTREPRISE uniquement (jamais le nom d'une personne). Cherche : activité et modèle, taille et implantation, organisation, stratégie et projets digitaux ou de transformation, actualité des 12 derniers mois, engagements ou valeurs affichés publiquement.
+Règles : 5 à 10 faits, une phrase factuelle chacun, chacun avec l'URL EXACTE du résultat qui le montre. Pas de flatterie, pas d'interprétation, pas de fait sans URL. Information introuvable → ne la mentionne pas.
+Réponds uniquement {"summary":"2 phrases factuelles","facts":[{"text":"","url":""}]}`;
+  },
+
+  briefFromText(company, url, text) {
+    return `Mission : extraire de la source ci-dessous les faits utiles sur l'entreprise « ${company} », pour expliquer « pourquoi cette entreprise » dans une candidature.
+SOURCE (${url})
+<<<
+${String(text || "").slice(0, 15000)}
+>>>
+Règles : uniquement ce que dit la source, une phrase factuelle par fait, 3 à 8 faits, aucune interprétation ni flatterie.
+Réponds uniquement {"summary":"1 phrase","facts":[{"text":""}]}`;
+  },
+
+  learnRules(edits, rules) {
+    return `Mission : déduire des corrections manuelles d'un candidat les règles d'écriture qu'il applique de façon RÉCURRENTE à ses CV et lettres générés par IA.
+
+RÈGLES DÉJÀ CONNUES (ne pas les reproposer)
+${rules.map((r) => `- ${r.text}`).join("\n") || "(aucune)"}
+
+CORRECTIONS (supprimé → ajouté), regroupées par document
+${edits.map((e) => `[${e.type} · ${e.appId.slice(-6)}]\n${e.hunks.slice(0, 12).map((h) => `- « ${h.del || "∅"} » → « ${h.add || "∅"} »`).join("\n")}`).join("\n\n").slice(0, 14000)}
+
+RÈGLES
+- Une règle n'est proposée que si le même type de correction apparaît dans AU MOINS 2 documents différents. Cite ces exemples dans evidence.
+- Règle courte, impérative, applicable par un rédacteur (ex. « Ne jamais écrire "responsable CRM" : préférer "transformation digitale" »).
+- Style, vocabulaire, ton, structure seulement : une règle ne peut jamais autoriser un fait absent du profil.
+- 0 à 5 règles. Aucune si rien n'est récurrent.
+
+Réponds uniquement {"rules":[{"text":"","evidence":"2 exemples courts","docs":2}]}`;
+  },
+
+  motivationDraft(answers, current) {
+    return `Mission : ranger les réponses d'un candidat à un entretien de motivation dans sa fiche « Motivations ».
+
+RÈGLE ABSOLUE : tu REFORMULES seulement. Aucune idée, aucun fait, aucun chiffre, aucun adjectif valorisant qui ne soit pas dans ses réponses. Garde ses mots quand ils sont précis. Un champ sans matière reste vide ("" ou []). Langue : français, sauf si les réponses sont dans une autre langue.
+
+RÉPONSES
+${answers.map((x) => `Q (${x.field}) : ${x.q}\nR : ${x.a || "(pas de réponse)"}`).join("\n\n")}
+
+FICHE ACTUELLE (ne la répète pas ; propose seulement ce que les réponses apportent)
+${JSON.stringify(current).slice(0, 6000)}
+
+CHAMPS
+- purpose : raison d'être professionnelle (1-2 phrases).
+- convictions : 1 phrase chacune, affirmée, telle qu'il la défend.
+- stories : histoires racontables { title (5 mots), situation, action (ce qu'IL a fait), result (avec ses chiffres exacts s'il en donne), lesson }.
+- management, method, whyNow, lookingFor : 1-3 phrases chacun.
+- sectors : secteurs ou types d'organisations cités.
+- followUps : 0 à 3 questions de relance quand une réponse est trop vague pour écrire une lettre spécifique (ex. histoire sans résultat, conviction sans exemple). Chaque relance vise un champ.
+
+Réponds uniquement avec ce JSON :
+{"purpose":"","convictions":[],"stories":[{"title":"","situation":"","action":"","result":"","lesson":""}],"management":"","method":"","whyNow":"","lookingFor":"","sectors":[],"followUps":[{"field":"","q":""}]}`;
+  },
+
+  fixDoc({ kind, text, issues, analysis, profile, offer }) {
+    return `Mission : corriger ${kind === "cv" ? "le CV" : "la lettre de motivation"} ci-dessous sur les seuls points listés, par des remplacements ciblés. Ne touche à rien d'autre.
+
+DOCUMENT (balisage ; chaque « before » doit en être une copie EXACTE, caractère pour caractère)
+<<<
+${text}
+>>>
+
+POINTS À CORRIGER
+${issues.map((i, n) => `${n + 1}. ${i.title}${i.detail ? ` — ${i.detail}` : ""}`).join("\n")}
+
+RÉFÉRENCES
+Cible : ${targetLine(offer, analysis)}
+Fonction réelle actuelle du candidat : ${profile.headline || "non renseignée"}
+${analysisDigest(analysis, offer)}
+
+PROFIL (faits autorisés)
+${profileBlock(profile)}
+
+RÈGLES
+- Chaque correction remplace un passage court (une ligne ou une phrase) : "before" = texte exact du document, "after" = nouvelle version, avec le même balisage en début de ligne (« - », « > », « ### »…).
+- ${kind === "cv" ? "Pour ajouter un mot-clé, réécris la phrase ou la puce où le profil le démontre ; jamais de liste de mots ajoutée." : "Lettre : n'ajoute ni mot-clé ni chiffre ; elle explique le « pourquoi » (entreprise, rôle, méthode, une histoire), le CV porte les preuves."}
+- Le candidat n'occupe pas le poste visé : la ligne sous le nom part de sa fonction réelle ; l'intitulé visé ne s'écrit que comme objectif.
+- Aucun fait, chiffre ou outil absent du profil. Aucun cliché. Même langue que le document.
+- Un point qui ne peut pas être corrigé honnêtement est ignoré.
+
+Réponds uniquement avec ce JSON :
+{"edits":[{"before":"","after":"","reason":"10 mots max"}]}`;
+  },
+
+  review({ kind, text, analysis, profile, offer, cvText }) {
+    const tg = targetInfo(offer, analysis);
+    const reader = tg.base
+      ? `un recruteur exigeant qui cherche un profil de « ${tg.role} »`
+      : tg.spont
+        ? `un dirigeant de ${show(offer.company)} qui reçoit cette candidature spontanée pour un rôle de « ${tg.role} » sans avoir publié d'offre`
+        : `un recruteur exigeant qui reçoit 200 candidatures pour le poste « ${tg.role} » chez ${show(offer.company)}`;
+    return `Mission : relire ${kind === "cv" ? "ce CV" : "cette lettre de motivation"} comme ${reader}, puis proposer des corrections ciblées.
+
+DOCUMENT (balisage)
+<<<
+${text}
+>>>
+
+ANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
+${analysisDigest(analysis, offer)}
+
+PROFIL (faits autorisés)
+${profileBlock(profile)}
+${kind === "cv" ? "" : `
+${motivationBlock(profile)}
+
+CV JOINT À LA LETTRE
+<<<
+${String(cvText || "(CV non fourni)").slice(0, 8000)}
+>>>
+
+LETTRE : le CV prouve, la lettre explique. Vérifie en priorité :
+- TEST DE SUBSTITUTION : chaque phrase qui resterait vraie si l'on remplaçait ${show(offer.company)} par un concurrent est à réécrire (fait propre à l'entreprise, ou [à compléter : fait vérifiable]).
+- Répétition du CV : toute phrase qui reformule une puce du CV est à remplacer par du « pourquoi » (conviction, pourquoi maintenant, méthode) ou par l'histoire racontée.
+- Présence de : pourquoi eux, pourquoi ce rôle maintenant, une histoire racontée, la méthode, la demande d'échange. Au plus 2 chiffres. Aucune flatterie.
+`}
+Évalue : positionnement compris en 10 secondes, preuves chiffrées, adéquation aux exigences clés, couverture des mots-clés prouvés, honnêteté (aucune prétention d'occuper déjà le poste visé), style (clichés, répétitions, phrases longues), cohérence des temps.
+Propose 4 à 10 corrections, les plus utiles d'abord : "before" = copie EXACTE d'un passage court du document (une ligne ou une phrase), "after" = version améliorée avec le même balisage de début de ligne, "reason" = pourquoi (12 mots max), "severity" = haute | moyenne | basse. Aucun fait absent du profil.
+
+Réponds uniquement avec ce JSON :
+{"verdict":"2 phrases : impression d'ensemble et principal levier","score":0,"strengths":["2 ou 3 points forts"],"edits":[{"before":"","after":"","reason":"","severity":"moyenne"}]}`;
+  },
+
+  improveSection({ kind, text, title, body, goal, custom, missing, analysis, profile, offer, lang }) {
+    const goals = {
+      impact: "plus percutant : verbe d'action en tête, périmètre et résultat chiffré quand le profil le contient, une idée par puce",
+      concise: "plus concis : environ 30 % de mots en moins, sans perdre les preuves ni les mots-clés",
+      keywords: `intégrer, là où le profil les justifie, les mots-clés manquants suivants : ${(missing || []).map((k) => `« ${k.term} »${k.evidence ? ` (preuve : ${k.evidence})` : ""}`).join(", ") || "aucun"}`,
+      style: "corriger le style : supprimer clichés, affirmations creuses, pronoms superflus, répétitions et formules faibles",
+      custom: custom || "améliorer la section",
+    };
+    return `Mission : réécrire UNE section ${kind === "cv" ? "du CV" : "de la lettre de motivation"} selon l'objectif ci-dessous.
+
+SECTION « ${title || "introduction"} » (balisage actuel)
+<<<
+${body}
+>>>
+
+OBJECTIF : ${goals[goal] || goals.custom}
+
+DOCUMENT COMPLET (contexte, à ne pas réécrire)
+<<<
+${text}
+>>>
+
+CIBLE : ${targetLine(offer, analysis)}
+${analysisDigest(analysis, offer)}
+
+PROFIL (faits autorisés)
+${profileBlock(profile)}
+
+RÈGLES
+- Garde le même balisage (« - » puce, « ### Fonction | Organisation | Lieu | Période », « **Libellé :** valeur », paragraphes séparés par une ligne vide) et la même structure (mêmes postes, même ordre). Ne renvoie PAS la ligne de titre « ## ».
+- Langue : ${LANG_NAME[lang] || "celle du document"}. Uniquement des faits du profil ; [à compléter : …] si un chiffre manque. Aucun cliché.
+- Le candidat n'occupe pas le poste visé : poste actuel au présent, postes passés au passé, poste visé uniquement comme objectif.
+
+Réponds uniquement avec ce JSON :
+{"body":"<balisage de la section>","note":"ce qui a changé, 15 mots max"}`;
+  },
+
+  headlines({ analysis, profile, offer, lang }) {
+    return `Propose 4 lignes de positionnement à placer sous le nom du candidat, en tête de son CV. Cible : ${targetLine(offer, analysis)}.
+
+PROFIL
+${profileBlock(profile)}
+
+ANALYSE ${offer.spontaneous ? "DU RÔLE VISÉ" : "DE L'ANNONCE"}
+${analysisDigest(analysis, offer)}
+
+Règles : chaque ligne part de la fonction RÉELLE du candidat (« ${profile.headline || "fonction actuelle"} ») ou d'une expertise vraie, puis 2 ou 3 domaines d'expertise qui recoupent l'annonce, séparés par « | » ou « · » ; 85 caractères maximum ; langue : ${LANG_NAME[lang] || "celle de l'annonce"} ; aucune ligne ne présente le candidat comme occupant déjà le poste visé ; aucun cliché. Varie les angles (technique, management, transformation, résultats).
+Réponds uniquement {"options":[{"headline":"","angle":"5 mots max"}]}`;
   },
 
   ratings(companies) {
@@ -2115,7 +2750,7 @@ Consignes : langue ${LANG_NAME[offerLang(offer)]} ; 90 mots maximum ; courtois e
 Réponds uniquement {"subject":"","body":""}.`;
   },
 
-  prep(offer, profile) {
+  prep(offer, profile, extra = {}) {
     return `Date du jour : ${todayStr()}.
 Mission : préparer un entretien pour le poste « ${offer.title} » chez « ${show(offer.company)} ».
 Annonce : ${show(offer.description)}
@@ -2123,9 +2758,11 @@ Annonce : ${show(offer.description)}
 PROFIL
 ${profileDigest(profile, true)}
 
+${motivationBlock(profile)}
+${extra.facts?.length ? `\nFICHE ENTREPRISE DÉJÀ VÉRIFIÉE (réutilise ces faits avec leur URL ; ne les recherche pas à nouveau, complète seulement l'actualité récente)\n${extra.facts.map((f) => `- ${f.text} (${f.url})`).join("\n")}\n` : ""}${extra.appBlock ? `\n${extra.appBlock}\n` : ""}
 1. Utilise web_search pour documenter l'entreprise (activité, taille, organisation, actualité des 12 derniers mois, culture, avis publics). Chaque fait doit citer l'URL de sa source. Si une information n'est pas trouvée, ne la mentionne pas.
 2. Questions probables pour ce poste, avec l'angle attendu.
-3. Exemples STAR construits UNIQUEMENT à partir du profil ; si un élément manque, écris [à compléter].
+3. Exemples STAR construits UNIQUEMENT à partir du profil et de la banque d'histoires (priorité aux histoires) ; si un élément manque, écris [à compléter]. Inclure la réponse à « Pourquoi nous ? » à partir des faits trouvés et des motivations du candidat.
 4. Questions pertinentes à poser.
 5. Points de négociation. Fourchette salariale uniquement si une source publique chiffrée existe (avec URL), sinon null.
 
@@ -2158,67 +2795,32 @@ RÈGLES
 Réponds uniquement {"groups":[{"ids":["",""],"confidence":"haute|moyenne","reason":"20 mots max"}]}`;
   },
 
-  replies(items, { after, query }) {
+  replies(items) {
     return `Date du jour : ${todayStr()}.
-Mission : surveiller la boîte Gmail pour le pipeline de candidatures ci-dessous. LECTURE SEULE.
-CANDIDATURES SUIVIES
+Mission : détecter dans Gmail les réponses reçues aux candidatures ci-dessous. LECTURE SEULE.
+CANDIDATURES
 ${JSON.stringify(items)}
 
 MÉTHODE
-1. Lance cette recherche Gmail (ajuste-la si elle ne renvoie rien) : ${query}
-   Ne regarde que les e-mails reçus après le ${after} (vérification incrémentale).
-2. Ouvre uniquement les fils pertinents (25 au maximum) : réponses d'entreprises ou de cabinets, accusés de réception de logiciels de recrutement (Workday, SmartRecruiters, Greenhouse, Lever, Teamtailor, Recruitee, SuccessFactors, Taleo, iCIMS, Personio, Workable…), confirmations « candidature envoyée » de LinkedIn ou Indeed, invitations, tests, refus, offres.
-3. Ignore les alertes emploi automatiques et les newsletters. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
+1. Pour chaque candidature, recherche les e-mails reçus depuis sa date d'envoi (champ since) venant de l'entreprise, du cabinet ou des contacts listés (nom, domaine, adresse). Ignore les alertes emploi automatiques, newsletters et e-mails envoyés par l'utilisateur.
+2. Ouvre les messages pertinents (25 au maximum au total).
+3. N'envoie, ne supprime, n'archive, ne marque et ne modifie aucun message.
 
 RÈGLES
-- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. threadId = identifiant du fil tel que renvoyé par l'outil, sinon null.
-- Rattache un e-mail à une candidature (appId) seulement si l'entreprise, le cabinet, le poste ou le contact correspondent clairement.
-- kind : confirmation_candidature | accuse_reception | invitation_entretien | test_evaluation | demande_info | refus | offre | autre.
-- proposedStage : "sent" pour une confirmation de candidature envoyée, "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
-- interviewAt : date et heure proposées (YYYY-MM-DDTHH:mm), sinon null.
-- untracked : confirmations de candidature ou réponses de recruteurs qui ne correspondent à AUCUNE candidature suivie (candidature envoyée hors de l'outil).
-Réponds uniquement {"replies":[{"appId":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"untracked":[{"company":"","title":"","threadId":null,"date":"YYYY-MM-DD","from":"","subject":"","kind":"confirmation_candidature|invitation_entretien|refus|autre","summary":""}],"messagesRead":0}`;
+- Ne rapporte qu'un e-mail réellement lu. subject = objet exact. Si le rattachement à une candidature est incertain, ne le rapporte pas.
+- kind : accuse_reception | invitation_entretien | refus | demande_info | offre | autre.
+- proposedStage : "interview" pour une invitation, "closed" pour un refus, "offer" pour une offre, sinon null.
+- interviewAt : date et heure proposées dans l'e-mail (YYYY-MM-DDTHH:mm), sinon null.
+Réponds uniquement {"replies":[{"appId":"","date":"YYYY-MM-DD","from":"","subject":"","kind":"","summary":"25 mots max","proposedStage":null,"interviewAt":null}],"messagesRead":0}`;
   },
 
-  translate(text, kind, from, to, offer) {
-    const titles = SECTION_TITLES[to] || SECTION_TITLES.en;
-    const conv = {
-      fr: "Formules belges francophones : « Madame, Monsieur, » ; conclusion sobre (« Je me tiens à votre disposition pour un entretien. ») ; date au format « Ville, le 21 octobre 2026 ».",
-      nl: "Néerlandais de Belgique, vouvoiement « u » : « Geachte heer, mevrouw, » ; « Met vriendelijke groeten, » ; date au format « Ville, 21 oktober 2026 ». Intitulés de fonction usuels en Flandre (souvent en anglais).",
-      en: "Anglais britannique professionnel : « Dear Hiring Manager, » ; « Kind regards, » ; date au format « Ville, 21 October 2026 ».",
-      de: "Allemand standard : « Sehr geehrte Damen und Herren, » ; « Mit freundlichen Grüßen » ; date au format « Ville, 21. Oktober 2026 ».",
-    }[to];
-    return `Mission : traduire ${kind === "cv" ? "un CV" : "une lettre de motivation"} du ${LANG_NAME[from]} vers le ${LANG_NAME[to]}, pour un recruteur ${to === "nl" ? "flamand ou bruxellois" : to === "fr" ? "belge francophone" : "international"}. Poste visé : ${offer?.title || "non communiqué"}${offer?.company ? ` chez ${offer.company}` : ""}.
-
-RÈGLES
-- Conserve EXACTEMENT le balisage en début de ligne (#, >, @, =, ##, ###, -, **Libellé :**, ~), l'ordre des lignes et les lignes vides.
-- Conserve tels quels : noms propres, organisations, outils, certifications, chiffres, e-mails, téléphones, URL. Traduis les mois.
-- Titres de sections standard en ${LANG_NAME[to]} : ${Object.values(titles).join(", ")}.
-- Traduction idiomatique et professionnelle, pas littérale. Garde le ton sobre et orienté résultats ; n'ajoute aucun fait, aucun superlatif.
-- Les éléments [à compléter : …] restent entre crochets, traduits (${to === "nl" ? "[aan te vullen: …]" : to === "en" ? "[to complete: …]" : to === "de" ? "[zu ergänzen: …]" : "[à compléter : …]"}).
-- ${conv}
-
-DOCUMENT
-<<<
-${text}
->>>
-
-Réponds uniquement {"text":"<document traduit, même balisage>"}.`;
-  },
-
-  practice(question, answer, offer, profile) {
-    return `Mission : évaluer la réponse écrite d'un candidat à une question d'entretien, comme un recruteur exigeant et bienveillant.
-Poste : ${offer?.title || "non communiqué"} chez ${show(offer?.company)}.
-Profil (seule source de faits) : ${profile.summary} Réalisations : ${(profile.achievements || []).join(" ; ")}
-
-QUESTION : ${question}
-RÉPONSE DU CANDIDAT :
-<<<
-${answer}
->>>
-
-Règles : note de 1 à 5 ; indique les éléments STAR présents (situation, tâche, action, résultat) ; 3 forces et 3 améliorations concrètes maximum ; réponse améliorée de 180 mots maximum, dans la langue de la réponse, qui n'utilise que les faits de la réponse et du profil (chiffre manquant → [à compléter]) ; durée orale estimée en secondes (130 mots par minute).
-Réponds uniquement {"score":1,"star":{"situation":false,"task":false,"action":false,"result":false},"strengths":[],"improvements":[],"improved":"","seconds":0}`;
+  verify(items) {
+    return `Date du jour : ${todayStr()}.
+Mission : pour chaque offre d'emploi ci-dessous, déterminer si elle est ENCORE OUVERTE aux candidatures.
+${JSON.stringify(items)}
+Méthode : web_search sur l'intitulé exact + l'entreprise (et le domaine de l'URL). Une offre est "closed" si un résultat montre « expirée », « n'accepte plus de candidatures », « no longer accepting applications », « closed », « vacature gesloten », une date limite passée, ou si l'annonce n'apparaît plus que sur des agrégateurs anciens. "open" seulement si un résultat récent (moins de 30 jours) montre l'annonce active. Sinon "unknown".
+evidence : la preuve courte (texte du résultat). publishedAt / deadline : YYYY-MM-DD si visibles, sinon null. N'invente rien.
+Réponds uniquement {"results":[{"id":"","state":"open|closed|unknown","evidence":"","publishedAt":null,"deadline":null}]}`;
   },
 
   today(items) {
@@ -2228,87 +2830,34 @@ Réponds uniquement {"ordered":[{"id":"","priority":1,"reason":""}]} (priorité 
   },
 };
 
-/* Faits normalisés extraits au scoring : nombres et listes propres, null si absents. */
-function normFacts(f) {
-  if (!f || typeof f !== "object") return null;
-  const num = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) && n > 0 ? n : null; };
-  const contract = str(f.contract);
+/* Score final : chaque critère de la version active reçoit un taux (50 « non précisé » si l'IA l'a omis),
+   puis computeScore applique toujours la même formule. */
+function finalizeScore(s, ver) {
+  const byId = Object.fromEntries((Array.isArray(s.matches) ? s.matches : []).filter((m) => m && m.c).map((m) => [String(m.c).trim().toUpperCase(), m]));
+  const breakdown = criteriaList(ver).map((c) => {
+    const m = byId[c.id];
+    const raw = Number(m?.match);
+    return { id: c.id, criterion: c.label, kind: c.kind, weight: c.weight, match: m && Number.isFinite(raw) ? clamp(Math.round(raw), 0, 100) : 50, note: m ? str(m.note) : "non évalué" };
+  });
+  const calc = computeScore(breakdown);
   return {
-    contract: contract && /^(CDI|CDD|Freelance|Intérim|Stage|Autre)$/i.test(contract) ? contract : contract,
-    remoteDays: f.remoteDays === 0 ? 0 : num(f.remoteDays) !== null && num(f.remoteDays) <= 5 ? num(f.remoteDays) : null,
-    salaryMin: num(f.salaryMin), salaryMax: num(f.salaryMax),
-    salaryPeriod: /mois|month|maand/i.test(f.salaryPeriod || "") ? "mois" : f.salaryMin || f.salaryMax ? "an" : null,
-    languages: (Array.isArray(f.languages) ? f.languages : []).map((l) => String(l).toLowerCase().slice(0, 2)).filter((l) => DOC_LANGS.includes(l)),
-    teamSize: num(f.teamSize), reportsTo: str(f.reportsTo), seniority: str(f.seniority),
-  };
-}
-const fmtK = (n) => (n >= 1000 ? `${Math.round(n / 100) / 10}`.replace(".", ",") + " k" : String(n));
-function fmtSalary(f, raw) {
-  if (f && (f.salaryMin || f.salaryMax)) {
-    const range = f.salaryMin && f.salaryMax && f.salaryMin !== f.salaryMax ? `${fmtK(f.salaryMin)} – ${fmtK(f.salaryMax)}` : fmtK(f.salaryMin || f.salaryMax);
-    return `${range} € / ${f.salaryPeriod || "an"}`;
-  }
-  return raw || null;
-}
-/* Verdict calculé localement (cohérent avec le score, gratuit) : Postuler, À creuser, Passer. */
-function offerVerdict(o, threshold) {
-  const s = o?.score;
-  if (!s) return null;
-  if (s.caps?.length || s.value < 50) return { id: "skip", label: "Passer", tone: "neutral" };
-  if (s.value >= threshold && s.confidence !== "faible" && !(s.redFlags || []).length) return { id: "apply", label: "Postuler", tone: "ok" };
-  return { id: "dig", label: "À creuser", tone: "warn" };
-}
-
-/* Score final : score IA borné par les règles dures, pour qu'il reste cohérent avec sa décomposition. */
-function finalizeScore(s, versionId) {
-  const bd = Array.isArray(s.breakdown) ? s.breakdown : [];
-  let score = clamp(Math.round(Number(s.score) || 0), 0, 100);
-  const caps = [];
-  if (bd.some((b) => b.kind === "indispensable" && Number(b.match) < 30)) { score = Math.min(score, 45); caps.push("indispensable non rempli"); }
-  if (bd.some((b) => b.kind === "exclusion" && Number(b.match) >= 70)) { score = Math.min(score, 20); caps.push("exclusion touchée"); }
-  return {
-    value: score,
+    method: 2,
+    value: calc.value,
+    wishAvg: calc.wishAvg,
+    mustAvg: calc.mustAvg,
+    fit: ["fort", "moyen", "faible"].includes(s.fit) ? s.fit : null,
     confidence: ["haute", "moyenne", "faible"].includes(s.confidence) ? s.confidence : "moyenne",
     confidenceReason: str(s.confidenceReason),
     summary: str(s.summary),
-    breakdown: bd.map((b) => ({ criterion: String(b.criterion || ""), kind: b.kind || "souhaité", weight: Number(b.weight) || null, match: clamp(Number(b.match) || 0, 0, 100), note: str(b.note) })),
-    strengths: (s.strengths || []).map(String),
-    gaps: (s.gaps || []).map(String),
-    questions: (s.questions || []).map(String),
+    breakdown,
+    strengths: (s.strengths || []).map(String).slice(0, 6),
+    gaps: (s.gaps || []).map(String).slice(0, 6),
+    questions: (s.questions || []).map(String).slice(0, 5),
     redFlags: (s.redFlags || []).filter((r) => r && r.evidence).map((r) => ({ type: r.type || "autre", evidence: String(r.evidence) })),
-    tldr: str(s.tldr),
-    facts: normFacts(s.facts),
-    must: (s.must || []).map(String).filter(Boolean).slice(0, 6),
-    nice: (s.nice || []).map(String).filter(Boolean).slice(0, 6),
-    missions: (s.missions || []).map(String).filter(Boolean).slice(0, 6),
-    caps,
-    criteriaVersionId: versionId,
+    caps: calc.caps,
+    criteriaVersionId: ver.id,
     scoredAt: nowISO(),
   };
-}
-
-/* Re-pondération locale : si seule la pondération des souhaités change, le score est recalculé sans appel IA. */
-function onlyWeightsChanged(prev, next) {
-  if (!prev || !next) return false;
-  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-  if (!["roles", "zones", "maxCommute", "remote", "mustHave", "exclusions", "redFlags", "keywords"].every((k) => same(prev[k], next[k]))) return false;
-  const lab = (c) => (c.wishes || []).map((w) => w.label), wt = (c) => (c.wishes || []).map((w) => w.weight);
-  return same(lab(prev), lab(next)) && !same(wt(prev), wt(next));
-}
-function reweightScore(score, prevWishes, nextWishes, versionId) {
-  const rows = (score?.breakdown || []).filter((b) => b.kind === "souhaité");
-  const find = (label) => rows.find((r) => normText(r.criterion) === normText(label)) || rows.find((r) => jaccard(tokens(r.criterion), tokens(label)) >= 0.5);
-  // Un souhait absent de la décomposition vaut 50 (« non précisé »), comme dans le barème IA ; au moins la moitié doit correspondre.
-  const pairs = nextWishes.map((w) => ({ w, r: find(w.label) || { match: 50, missing: true }, old: prevWishes.find((x) => x.label === w.label)?.weight || w.weight }));
-  if (!pairs.length || pairs.filter((x) => x.r.missing).length > pairs.length / 2) return null;
-  const avg = (useOld) => {
-    const tot = pairs.reduce((n, x) => n + (useOld ? x.old : x.w.weight), 0);
-    return tot ? pairs.reduce((n, x) => n + x.r.match * (useOld ? x.old : x.w.weight), 0) / tot : 0;
-  };
-  let value = clamp(Math.round(score.value + avg(false) - avg(true)), 0, 100);
-  if (score.caps?.includes("indispensable non rempli")) value = Math.min(value, 45);
-  if (score.caps?.includes("exclusion touchée")) value = Math.min(value, 20);
-  return { ...score, value, breakdown: score.breakdown.map((b) => { const x = pairs.find((q) => q.r === b); return x ? { ...b, weight: x.w.weight } : b; }), criteriaVersionId: versionId, local: true, scoredAt: nowISO() };
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -2319,54 +2868,6 @@ function makeCriteriaState(body = DEFAULT_CRITERIA_BODY) {
   const v = { id: uid("crit"), label: "v1 — critères initiaux", createdAt: nowISO(), ...deepClone(body) };
   return { draft: deepClone(body), versions: [v] };
 }
-
-const DEMO_KEYWORDS = ["transformation digitale", "CRM", "Dynamics 365", "automatisation", "management", "feuille de route", "gouvernance", "Power Automate", "KPI", "SAP"];
-const DEMO_CV = `# Alex Martin (exemple)
-> Digital Transformation Manager — CRM, automatisation et pilotage d'équipe
-@ Ohain, Belgique | alex.martin@exemple.be | +32 470 00 00 00 | linkedin.com/in/exemple
-## Profil
-Manager de la transformation digitale dans une fédération patronale belge. Responsable du CRM Dynamics 365 et d'une équipe de 4 personnes. Pilote la digitalisation et l'automatisation des processus, du cadrage au déploiement, avec un suivi par KPI et une gouvernance claire.
-## Réalisations clés
-- Réduction de 35 % du délai de traitement des adhésions grâce à 12 flux Power Automate (exemple)
-- Migration de 48 000 contacts vers Dynamics 365 sans perte de données, en 4 mois (exemple)
-- Adoption du CRM portée de 52 % à 88 % en un an par la formation et des tableaux de bord (exemple)
-## Expérience professionnelle
-### Business Improvement Manager | Fédération patronale belge | Bruxelles | 2019 – aujourd'hui
-- Pilotage de la feuille de route digitale et de son budget (exemple)
-- Management d'une équipe de 4 : priorisation, montée en compétences, rituels agiles
-- Automatisation de 20 processus métier avec Power Automate et Make (exemple)
-### Chef de projet CRM | Entreprise de services | Wavre | 2015 – 2019
-- Déploiement d'un CRM pour 120 utilisateurs, en 3 vagues (exemple)
-- Conception des rapports Power BI de suivi commercial
-## Compétences
-**CRM :** Dynamics 365, Dataverse, Customer Insights
-**Automatisation :** Power Automate, Make, API REST
-**Management :** équipe de 4, gestion de projets ICT, conduite du changement
-## Langues
-**Français :** langue maternelle
-**Néerlandais :** courant
-**Anglais :** courant
-## Formation
-### Master en sciences de gestion | Université (exemple) | 2012
-## Certifications
-- Microsoft Certified: Power Platform Functional Consultant (exemple)`;
-const DEMO_LETTER = `# Alex Martin (exemple)
-@ Ohain, Belgique | alex.martin@exemple.be | +32 470 00 00 00
-= Ohain, le 21 octobre 2026
-> Service recrutement
-> Exemple Logistics SA
-## Objet : candidature au poste de Digital Transformation Manager
-Madame, Monsieur,
-
-Votre annonce met l'accent sur la gouvernance du CRM et l'automatisation des processus : ce sont précisément les deux chantiers que je pilote depuis cinq ans dans une fédération patronale belge.
-
-J'y ai réduit de 35 % le délai de traitement des adhésions en automatisant 12 flux, et porté l'adoption du CRM de 52 % à 88 % en un an. Je dirige une équipe de 4 personnes, avec des priorités claires et un suivi par indicateurs.
-
-Chez Exemple Logistics, je mettrais cette méthode au service de votre feuille de route digitale : cadrer, livrer par étapes, mesurer.
-
-Je me tiens à votre disposition pour un entretien.
-
-~ Alex Martin`;
 
 function makeDemo(versionId) {
   const t = nowISO();
@@ -2439,12 +2940,10 @@ function makeDemo(versionId) {
   ];
   const sentAt = addDays(t, -8);
   const itv = new Date(addDays(t, 3)); itv.setHours(10, 0, 0, 0);
-  const demoDoc = (text) => ({ id: uid("doc"), text, format: "markup", lang: "fr", accent: "#0f766e", accentSource: "exemple", keywords: DEMO_KEYWORDS, missingInProfile: ["SAP (exemple)"], tips: ["Exemple : chiffrez l'impact sur les délais logistiques.", "Exemple : citez un projet de gouvernance de données."], createdAt: addDays(t, -10), origin: "IA" });
   const apps = [
     {
       id: "demo_app_1", offerId: "demo_off_1", stage: "sent", demo: true, createdAt: addDays(t, -12), updatedAt: sentAt, sentAt,
-      closed: null, docs: { cv: [demoDoc(DEMO_CV)], letter: [demoDoc(DEMO_LETTER)] }, docLanguage: "fr", design: designFromTemplate("modern", { accent: "#0f766e" }),
-      prep: null, contactIds: ["demo_ct_1"], interviews: [],
+      closed: null, docs: {}, prep: null, contactIds: ["demo_ct_1"], interviews: [],
       followUps: [
         { id: "demo_fu_1", kind: "relance1", due: addDays(sentAt, 7), status: "pending", draft: null },
         { id: "demo_fu_2", kind: "relance2", due: addDays(sentAt, 14), status: "pending", draft: null },
@@ -2458,7 +2957,6 @@ function makeDemo(versionId) {
       id: "demo_app_2", offerId: "demo_off_2", stage: "interview", demo: true, createdAt: addDays(t, -20), updatedAt: t, sentAt: addDays(t, -15),
       closed: null, docs: {}, prep: null, contactIds: [],
       interviews: [{ id: "demo_itv_1", at: itv.toISOString(), durationMin: 60, type: "Visioconférence", location: "Teams", notes: "Premier entretien RH (exemple)", eventCreated: false }],
-      emails: [{ id: "demo_mail_1", date: addDays(t, -2).slice(0, 10), from: "rh@exemple-mutualite.be", subject: "Invitation à un premier entretien (exemple)", kind: "invitation_entretien", summary: "Proposition d'un entretien RH en visioconférence (exemple).", threadId: null, at: addDays(t, -2) }],
       followUps: [{ id: "demo_fu_3", kind: "merci", due: addDays(itv.toISOString(), 2), status: "pending", draft: null }],
       log: [{ id: uid("log"), at: addDays(t, -2), type: "email", text: "Invitation à un entretien reçue (exemple)" }],
     },
@@ -2548,7 +3046,7 @@ function Btn({ variant = "soft", size = "md", icon: Icon, loading, children, cla
   );
 }
 
-function IconBtn({ icon: Icon, label, onClick, className = "", active, small, ...rest }) {
+function IconBtn({ icon: Icon, label, onClick, className = "", active, ...rest }) {
   const T = useT();
   return (
     <button
@@ -2557,9 +3055,9 @@ function IconBtn({ icon: Icon, label, onClick, className = "", active, small, ..
       title={label}
       onClick={onClick}
       {...rest}
-      className={`inline-flex items-center justify-center shrink-0 ${small ? "w-7 h-7 rounded-lg" : "w-9 h-9 rounded-xl"} transition-colors duration-200 disabled:opacity-40 ${active ? T.accentSoft : T.btnGhost} ${T.ring} ${className}`}
+      className={`inline-flex items-center justify-center w-9 h-9 rounded-xl transition-colors duration-200 ${active ? T.accentSoft : T.btnGhost} ${T.ring} ${className}`}
     >
-      <Icon className={small ? "w-3.5 h-3.5" : "w-4 h-4"} aria-hidden="true" />
+      <Icon className="w-4 h-4" aria-hidden="true" />
     </button>
   );
 }
@@ -2791,22 +3289,26 @@ function Modal({ open, onClose, title, children, footer, wide }) {
   );
 }
 
-function Drawer({ open, onClose, title, subtitle, children, headerExtra }) {
+function Drawer({ open, onClose, title, subtitle, children, headerExtra, expandable }) {
   const T = useT();
   const ref = useRef(null);
+  const [wide, setWide] = useState(false);
   useFocusTrap(open, ref, onClose);
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-label={title}>
       <div className="absolute inset-0" style={{ background: "rgba(12,10,9,0.25)" }} onClick={onClose} />
-      <aside ref={ref} className={`absolute right-0 top-0 h-full w-full sm:max-w-2xl flex flex-col ${T.app}`} style={T.shadow}>
+      <aside ref={ref} className={`absolute right-0 top-0 h-full w-full ${wide ? "sm:max-w-5xl" : "sm:max-w-2xl"} flex flex-col ${T.app}`} style={{ ...T.shadow, transition: "max-width .2s" }}>
         <div className={`flex items-start justify-between gap-4 px-6 pt-6 pb-4 border-b ${T.line}`}>
           <div className="min-w-0">
             <h2 className="text-xl font-light tracking-tight leading-snug">{title}</h2>
             {subtitle && <div className={`text-sm mt-1 ${T.muted}`}>{subtitle}</div>}
             {headerExtra}
           </div>
-          <IconBtn icon={X} label="Fermer" onClick={onClose} />
+          <div className="flex shrink-0 gap-1">
+            {expandable && <IconBtn icon={wide ? Minimize2 : Maximize2} label={wide ? "Réduire le panneau" : "Agrandir le panneau"} onClick={() => setWide((w) => !w)} className="hidden sm:inline-flex" />}
+            <IconBtn icon={X} label="Fermer" onClick={onClose} />
+          </div>
         </div>
         <div className="flex-1 overflow-y-auto px-6 py-6">{children}</div>
       </aside>
@@ -2814,10 +3316,10 @@ function Drawer({ open, onClose, title, subtitle, children, headerExtra }) {
   );
 }
 
-function Tabs({ tabs, value, onChange }) {
+function Tabs({ tabs, value, onChange, compact }) {
   const T = useT();
   return (
-    <div role="tablist" className={`inline-flex flex-wrap gap-1 p-1 rounded-2xl ${T.sub}`}>
+    <div role="tablist" className={`inline-flex ${compact ? "" : "flex-wrap"} gap-1 p-1 rounded-2xl ${T.sub}`}>
       {tabs.map((t) => (
         <button
           key={t.id}
@@ -2825,7 +3327,7 @@ function Tabs({ tabs, value, onChange }) {
           type="button"
           aria-selected={value === t.id}
           onClick={() => onChange(t.id)}
-          className={`px-3 h-8 rounded-xl text-sm transition-colors duration-150 ${value === t.id ? `${T.navActive} font-medium` : T.muted} ${T.ring}`}
+          className={`${compact ? "px-2.5 whitespace-nowrap" : "px-3"} h-8 rounded-xl text-sm transition-colors duration-150 ${value === t.id ? `${T.navActive} font-medium` : T.muted} ${T.ring}`}
           style={value === t.id ? T.shadow : undefined}
         >
           {t.label}
@@ -2940,6 +3442,8 @@ function usePrefersDark() {
 export default function RadarApp() {
   const [loaded, setLoaded] = useState(false);
   const [storageState, setStorageState] = useState({ ok: true, readOnly: false, message: null });
+  const [bootMsg, setBootMsg] = useState(null);
+  const [recovery, setRecovery] = useState(null);
   const [saveState, setSaveState] = useState("idle");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [profile, setProfile] = useState(DEFAULT_PROFILE);
@@ -2949,8 +3453,7 @@ export default function RadarApp() {
   const [apps, setApps] = useState([]);
   const [contacts, setContacts] = useState([]);
   const [ratings, setRatings] = useState({});
-  const [media, setMedia] = useState({});
-  const [inbox, setInbox] = useState({ replies: [], untracked: [] });
+  const [briefs, setBriefs] = useState({});
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -2968,10 +3471,13 @@ export default function RadarApp() {
   const [todayAI, setTodayAI] = useState(null);
   const [offerPreset, setOfferPreset] = useState(null);
   const [dupeProposals, setDupeProposals] = useState(null);
-  const [replyOpen, setReplyOpen] = useState(false);
+  const [dupePending, setDupePending] = useState(null);
+  const [lastBulk, setLastBulk] = useState(null);
+  const [visitPrev, setVisitPrev] = useState(null);
+  const [replyProposals, setReplyProposals] = useState(null);
+  const [genStatus, setGenStatus] = useState({});
   const [studio, setStudio] = useState(null);
-  const [exportFor, setExportFor] = useState(null);
-  const [compare, setCompare] = useState(null);
+  const [spontOpen, setSpontOpen] = useState(false);
   const [veille, setVeille] = useState({ routine: null, status: null, configSig: null, configLoaded: false });
   const veilleRef = useRef(veille);
   veilleRef.current = veille;
@@ -2982,7 +3488,7 @@ export default function RadarApp() {
 
   /* Référence toujours à jour pour les traitements asynchrones longs. */
   const R = useRef({});
-  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, media, inbox };
+  R.current = { settings, profile, criteria, sources, offers, apps, contacts, ratings, briefs };
   const busyRef = useRef({});
 
   /* ── Chargement initial ─────────────────────────────────────────── */
@@ -3011,26 +3517,59 @@ export default function RadarApp() {
       try {
         let existing = null;
         try { existing = await storage.list("radar:"); } catch { existing = null; }
-        // Lecture des collections en parallèle (démarrage plus rapide, surtout en page publiée).
-        const out = Object.fromEntries(await Promise.all(Object.entries(KEYS).map(async ([name, key]) => {
-          if (existing && !existing.includes(key)) return [name, null];
-          try {
-            return [name, await storage.get(key)];
-          } catch (e) {
-            if (existing || RT.mode === "published") throw e; // lecture en échec : on n'écrase rien
-            return [name, null]; // sans liste, une erreur signifie le plus souvent « clé absente »
+        const out = {};
+        const repaired = [];
+        /* Collection illisible : copie brute mise de côté, puis récupération élément par élément (ou valeurs par défaut). */
+        const recover = async (name, key, e) => {
+          const items = SALVAGE[name] ? salvageArray(e.raw, SALVAGE[name]) : null;
+          // Offres publiées : les tranches v1 restent en place et servent de copie brute.
+          if (!(RT.mode === "published" && name === "offers")) {
+            try { await storage.set(`radar:backup:${name}`, String(e.raw || "")); } catch { /* sauvegarde best effort */ }
           }
-        })));
+          repaired.push({ name, count: items ? items.length : null, at: nowISO() });
+          return items;
+        };
+        for (const [name, key] of Object.entries(KEYS)) {
+          if (RT.mode === "published" && name === "offers") {
+            setBootMsg("Lecture des offres…");
+            let list = await offerStore.load();
+            if (list === null) {
+              // Première ouverture depuis le format v1 : migration vers un document par offre.
+              try { list = await storage.get(key); } catch (e) { if (!(e instanceof StoreCorrupt)) throw e; list = await recover(name, key, e); }
+              if (Array.isArray(list) && list.length) {
+                setBootMsg(`Migration de ${list.length} offres vers le nouveau format (une seule fois)…`);
+                try { await offerStore.writeAll(list, { migratedFrom: "v1" }); }
+                catch { offerStore.pendingMigration = true; }
+              }
+            }
+            out[name] = list;
+            continue;
+          }
+          if (existing && !existing.includes(key)) { out[name] = null; continue; }
+          try {
+            out[name] = await storage.get(key);
+          } catch (e) {
+            if (e instanceof StoreCorrupt) { out[name] = await recover(name, key, e); continue; }
+            if (existing || RT.mode === "published") throw e; // lecture en échec (réseau) : on n'écrase rien
+            out[name] = null; // sans liste, une erreur signifie le plus souvent « clé absente »
+          }
+        }
+        if (repaired.length) setRecovery(repaired);
         const first = Object.values(out).every((v) => v === null || v === undefined);
         if (first) {
           applyDefaults();
         } else {
           const s = out.settings || {};
+          // Visite : la « dernière visite » n'avance que si la précédente date de plus de 2 h.
+          const lastV = s.lastVisitAt ? new Date(s.lastVisitAt).getTime() : 0;
+          const prevV = lastV && Date.now() - lastV > 2 * 36e5 ? s.lastVisitAt : s.visitPrevAt || s.lastVisitAt || null;
+          setVisitPrev(prevV);
           setSettings({
             ...DEFAULT_SETTINGS, ...s,
             mcp: { ...DEFAULT_SETTINGS.mcp, ...(s.mcp || {}) },
             mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(s.mcpTools || {}) },
             followUp: { ...DEFAULT_SETTINGS.followUp, ...(s.followUp || {}) },
+            visitPrevAt: prevV, lastVisitAt: nowISO(),
           });
           if (out.profile) setProfile({ ...DEFAULT_PROFILE, ...out.profile });
           setCriteria(out.criteria?.versions?.length ? out.criteria : makeCriteriaState());
@@ -3041,17 +3580,29 @@ export default function RadarApp() {
             if (missing.length) setSettings((x) => ({ ...x, sourcesPack: 2 }));
           }
           const closedOffers = new Set((out.apps || []).filter((a) => a.stage === "closed").map((a) => a.offerId));
-          setOffers((out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o)));
+          let list = (out.offers || []).map((o) => (closedOffers.has(o.id) && o.status !== "closed" ? { ...o, status: "closed" } : o));
+          // Tri systématique à chaque ouverture : doublons fusionnés, puis règles (âge, date limite, intitulé, trajet…).
+          const merged = s.autoDedupe === false ? 0 : (() => { const d = dedupeLocal(list, out.apps); list = d.list; return d.merged; })();
+          const crit0 = out.criteria?.versions?.length ? activeVersion(out.criteria) : null;
+          const ruled = crit0 ? applyRules(list, crit0, rulesOf(s)) : { list, prev: [], counts: {} };
+          list = ruled.list;
+          setOffers(list);
+          if (ruled.prev.length || merged) {
+            setLastBulk({
+              label: `À l'ouverture : ${merged ? `${merged} doublon(s) fusionné(s)` : ""}${merged && ruled.prev.length ? " · " : ""}${ruled.prev.length ? `${ruled.prev.length} offre(s) triée(s) automatiquement (${Object.entries(ruled.counts).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(", ")})` : ""}`,
+              prev: ruled.prev, at: nowISO(), undoable: ruled.prev.length > 0,
+            });
+          }
           if (out.ratings) setRatings(out.ratings);
-          if (out.media) setMedia(out.media);
-          if (out.inbox) setInbox({ replies: [], untracked: [], ...out.inbox });
+          if (out.briefs) setBriefs(out.briefs);
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
       } catch (e) {
-        setStorageState({ ok: false, readOnly: true, message: `Lecture des données impossible (${e.message}). L'enregistrement est suspendu pour ne rien écraser. Rechargez l'artefact.` });
+        setStorageState({ ok: false, readOnly: true, retry: true, message: `Connexion au stockage impossible (${e?.message || e?.code || e}). Vos données ne sont pas touchées : l'enregistrement reste suspendu tant que la lecture n'a pas réussi.` });
         applyDefaults();
       } finally {
+        setBootMsg(null);
         setLoaded(true);
       }
     })();
@@ -3078,9 +3629,7 @@ export default function RadarApp() {
   usePersist(KEYS.apps, apps, persistOn, setSaveState);
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
-  usePersist(KEYS.media, media, persistOn, setSaveState);
-  usePersist(KEYS.inbox, inbox, persistOn, setSaveState);
-  useEffect(() => { HOME_LABEL = str(profile.home) || "Ohain (Brabant wallon)"; }, [profile.home]);
+  usePersist(KEYS.briefs, briefs, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -3106,59 +3655,129 @@ export default function RadarApp() {
 
   const patchOffer = (id, patch) => setOffers((l) => l.map((o) => (o.id === id ? { ...o, ...(typeof patch === "function" ? patch(o) : patch) } : o)));
   const patchSource = (id, patch) => setSources((l) => l.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  /* Texte complet de l'annonce (base de l'analyse ATS) : mis à jour aussi dans la référence courante pour une génération immédiate. */
+  const patchOfferNow = (offerId, patch) => {
+    R.current.offers = R.current.offers.map((o) => (o.id === offerId ? { ...o, ...patch } : o));
+    patchOffer(offerId, patch);
+  };
+  const setOfferAdText = (offerId, text) => patchOfferNow(offerId, { fullText: String(text || "").trim().slice(0, 20000) || null });
+
+  /* Candidature spontanée (entreprise ciblée, sans offre) ou CV de base (ni offre ni entreprise) : une « cible » rédigée comme une offre,
+     hors veille, scoring et statistiques. La candidature spontanée entre dans le pipeline ; le CV de base reste dans l'Assistant. */
+  const createSpontaneous = (d) => {
+    const t = nowISO();
+    const base = d.mode === "base";
+    const site = str(d.website);
+    const offer = {
+      id: uid("off"), spontaneous: base ? "base" : "company",
+      title: str(d.role) || "Rôle à préciser", company: base ? null : str(d.company), location: str(d.location),
+      commute: base ? null : estimateCommute(d.location), contract: null, seniority: null, salary: null, remote: null,
+      language: /^(fr|nl|en)$/.test(d.language) ? d.language : "fr", publishedAt: null,
+      description: str(d.context), fullText: str(d.context) ? String(d.context).trim().slice(0, 20000) : null, contactName: str(d.contactName),
+      collectedAt: t, lastSeenAt: t,
+      sources: [{ name: SPONT_LABEL[base ? "base" : "company"], url: site ? (/^https?:\/\//i.test(site) ? site : `https://${site}`) : null, collectedAt: t, via: "manuel", verified: null }],
+      status: "pipeline", score: null, demo: false,
+    };
+    const app = {
+      id: uid("app"), offerId: offer.id, kind: base ? "base" : "spontaneous", stage: "prep", createdAt: t, updatedAt: t, sentAt: null, closed: null,
+      docs: {}, prep: null, contactIds: [], interviews: [], followUps: [], demo: false,
+      log: [{ id: uid("log"), at: t, type: "stage", text: base ? `CV de base créé : ${offer.title}` : `Candidature spontanée créée : ${offer.title} — ${offer.company || NC}` }],
+    };
+    R.current.offers = [offer, ...R.current.offers];
+    R.current.apps = [app, ...R.current.apps];
+    setOffers((l) => [offer, ...l]);
+    setApps((l) => [app, ...l]);
+    setStudio({ appId: app.id, type: "cv" });
+    return app.id;
+  };
   const addLogEntry = (a, type, text) => ({ ...a, updatedAt: nowISO(), log: [...(a.log || []), { id: uid("log"), at: nowISO(), type, text }] });
   const patchApp = (id, fn) => setApps((l) => l.map((a) => (a.id === id ? fn(a) : a)));
   const logApp = (id, type, text) => patchApp(id, (a) => addLogEntry(a, type, text));
+  /* Arrivée d'offres : fusion des doublons, puis règles de tri appliquées aux nouvelles ; le scoring et la
+     détection IA des doublons suivent automatiquement (effets plus bas). */
   const applyIncoming = (incoming) => {
     const { list, added, merged } = mergeOffers(R.current.offers, incoming);
-    R.current.offers = list;
-    setOffers(list);
-    return { added, merged };
+    const ver = activeVersion(R.current.criteria);
+    const ruled = applyRules(list, ver, rulesOf(R.current.settings), new Set(added));
+    R.current.offers = ruled.list;
+    setOffers(ruled.list);
+    const filtered = ruled.prev.length;
+    if (added.length) arrivalsRef.current += added.length - filtered;
+    return { added, merged, filtered, kept: added.filter((id) => !ruled.prev.some((o) => o.id === id)) };
   };
+  const arrivalsRef = useRef(0);
 
   /* ── Scoring ────────────────────────────────────────────────────── */
-  const scoreOffers = (ids) => withBusy("score", async () => {
+  const autoScoreRef = useRef({ failed: new Set(), done: 0, off: false });
+  const scoreOffers = (ids, { auto = false } = {}) => withBusy("score", async () => {
     const { settings: s, profile: p, criteria: c } = R.current;
     const ver = activeVersion(c);
-    const targets = R.current.offers.filter((o) => ids.includes(o.id));
+    const targets = R.current.offers.filter((o) => ids.includes(o.id) && !o.spontaneous);
     if (!targets.length) return;
-    setProgress({ label: "Scoring", done: 0, total: targets.length });
-    let ok = 0, failed = 0;
-    const context = P.scoreContext(p, ver, ver.label);
-    const runBatch = async (batch) => {
+    setProgress({ label: auto ? "Scoring automatique" : "Scoring", done: 0, total: targets.length });
+    let ok = 0, failed = 0, dismissed = 0;
+    const rules = rulesOf(s);
+    await pool(chunk(targets, 5), 2, async (batch) => {
       try {
-        const { data } = await askJSON(s, { system: SYSTEM_BASE, context, prompt: P.score(batch), maxTokens: 16000, tier: "deep", effort: "medium" });
-        const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).map((x) => [x.id, x]));
+        const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.score(batch, p, ver, ver.label), maxTokens: 14000 });
+        const byId = Object.fromEntries((Array.isArray(data?.scores) ? data.scores : []).filter((x) => x && x.id).map((x) => [x.id, x]));
         const got = batch.filter((o) => byId[o.id]).length;
         ok += got;
         failed += batch.length - got;
-        setOffers((l) => l.map((o) => (byId[o.id] ? { ...o, score: finalizeScore(byId[o.id], ver.id) } : o)));
+        batch.filter((o) => !byId[o.id]).forEach((o) => autoScoreRef.current.failed.add(o.id));
+        const at = nowISO();
+        const next = R.current.offers.map((o) => {
+          if (!byId[o.id]) return o;
+          const n = { ...o, score: finalizeScore(byId[o.id], ver) };
+          const v = ruleVerdict(n, ver, rules);
+          if (v) { dismissed++; return applyVerdict(n, v, at); }
+          return n;
+        });
+        R.current.offers = next;
+        setOffers(next);
       } catch (e) {
         failed += batch.length;
+        batch.forEach((o) => autoScoreRef.current.failed.add(o.id));
+        if (/refusé|not_granted|désactivé|disponible/i.test(e.message || "")) autoScoreRef.current.off = true;
         toast(`Scoring : ${e.message}`, "danger");
       } finally {
         setProgress((pr) => pr && { ...pr, done: Math.min(pr.total, pr.done + batch.length) });
       }
-    };
-    // Premier lot seul : il écrit le cache du contexte, que les lots suivants (en parallèle) relisent.
-    const batches = chunk(targets, 5);
-    await runBatch(batches[0]);
-    await pool(batches.slice(1), 3, runBatch);
+    });
     setProgress(null);
-    toast(`${ok} offre(s) scorée(s)${failed ? ` · ${failed} non scorée(s)` : ""}`, failed ? "warn" : "ok");
+    if (auto) autoScoreRef.current.done += ok;
+    toast(`${ok} offre(s) scorée(s)${dismissed ? ` · ${dismissed} écartée(s) (score < ${rules.dismissBelow})` : ""}${failed ? ` · ${failed} non scorée(s)` : ""}`, failed ? "warn" : "ok");
   });
 
   const staleIds = useMemo(() => {
     const vid = activeVersion(criteria)?.id;
-    return offers.filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid)).map((o) => o.id);
+    return offers.filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && isStale(o, vid)).map((o) => o.id);
   }, [offers, criteria]);
+
+  /* Scoring systématique : toute offre à traiter sans score à jour est scorée automatiquement (par lots, plafonné par session). */
+  useEffect(() => {
+    if (!loaded || storageState.readOnly || !settings.autoScore || RT.mode === "none" || (RT.mode === "published" && !RT.sample)) return undefined;
+    const a = autoScoreRef.current;
+    if (a.off || a.done >= (settings.autoScoreMax || 60) * 2) return undefined;
+    const t = setTimeout(() => {
+      if (busyRef.current.score) return;
+      const vid = activeVersion(R.current.criteria)?.id;
+      const ids = R.current.offers
+        .filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && isStale(o, vid) && !a.failed.has(o.id))
+        .sort((x, y) => (x.status === "pipeline" ? -1 : 0) - (y.status === "pipeline" ? -1 : 0) || new Date(y.collectedAt) - new Date(x.collectedAt))
+        .slice(0, settings.autoScoreMax || 60)
+        .map((o) => o.id);
+      if (ids.length) scoreOffers(ids, { auto: true });
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [loaded, staleIds.length, settings.autoScore, busy.score]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rescoreStale = () => {
     const vid = activeVersion(R.current.criteria)?.id;
     const ids = R.current.offers
-      .filter((o) => !o.demo && isActiveOffer(o) && isStale(o, vid))
+      .filter((o) => !o.demo && ["new", "pipeline"].includes(o.status) && isStale(o, vid))
       .sort((a, b) => new Date(b.collectedAt) - new Date(a.collectedAt))
-      .slice(0, 40)
+      .slice(0, 80)
       .map((o) => o.id);
     if (!ids.length) { toast("Tous les scores sont à jour.", "ok"); return undefined; }
     return scoreOffers(ids);
@@ -3195,7 +3814,7 @@ export default function RadarApp() {
     const list = R.current.sources.filter((x) => (sourceIds ? sourceIds.includes(x.id) : x.enabled) && x.kind !== "email");
     if (!list.length) throw new Error("Aucune source web active. Activez des sources dans « Sources & collecte ».");
     const newIds = [];
-    let merged = 0, errors = 0;
+    let merged = 0, errors = 0, filteredN = 0;
     setProgress({ label: "Veille", done: 0, total: list.length });
     await pool(list, 3, async (src) => {
       try {
@@ -3214,7 +3833,8 @@ export default function RadarApp() {
           .map((r) => normalizeOffer(r, { sourceName: src.name, via: "web_search", verifiedUrls: res.urls }))
           .filter((o) => o && (o.sources[0].verified || !res.urls.length || onSource(o.sources[0].url)));
         const r = applyIncoming(norm);
-        newIds.push(...r.added);
+        newIds.push(...r.kept);
+        filteredN += r.filtered;
         merged += r.merged.length;
         patchSource(src.id, { lastRunAt: nowISO(), lastCount: norm.length, lastError: null, lastNote: str(res.data?.notes) });
       } catch (e) {
@@ -3226,7 +3846,7 @@ export default function RadarApp() {
     });
     setProgress(null);
     setSettings((x) => ({ ...x, lastWatchAt: nowISO() }));
-    toast(`Veille terminée : ${newIds.length} nouvelle(s) offre(s), ${merged} fusion(s)${errors ? `, ${errors} source(s) en erreur` : ""}`, errors ? "warn" : "ok");
+    toast(`Veille terminée : ${newIds.length} nouvelle(s) offre(s) retenue(s), ${filteredN} écartée(s) par les règles, ${merged} fusion(s)${errors ? `, ${errors} source(s) en erreur` : ""}`, errors ? "warn" : "ok");
     if (newIds.length) await scoreOffers(newIds);
   });
 
@@ -3237,7 +3857,6 @@ export default function RadarApp() {
       prompt: P.gmail(days || s.gmailDays),
       mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }],
       maxTokens: 16000,
-      tier: "balanced",
     });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) {
       toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}). Vérifiez votre boîte.`, "danger");
@@ -3248,8 +3867,8 @@ export default function RadarApp() {
     const r = applyIncoming(norm);
     setSettings((x) => ({ ...x, lastGmailImportAt: nowISO() }));
     setSources((l) => l.map((x) => (x.kind === "email" ? { ...x, lastRunAt: nowISO(), lastCount: norm.length, lastError: null } : x)));
-    toast(`Gmail : ${res.data?.messagesRead ?? "?"} e-mail(s) lu(s), ${r.added.length} nouvelle(s) offre(s), ${r.merged.length} fusion(s)`, "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(`Gmail : ${res.data?.messagesRead ?? "?"} e-mail(s) lu(s), ${r.kept.length} nouvelle(s) offre(s), ${r.filtered} écartée(s) par les règles, ${r.merged.length} fusion(s)`, "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
   });
 
   const importManual = ({ text, url }) => withBusy("manual", async () => {
@@ -3261,8 +3880,6 @@ export default function RadarApp() {
       prompt: P.structure({ text: str(text), url: cleanUrl }),
       web: cleanUrl && !str(text) ? { maxUses: 4 } : null,
       maxTokens: 6000,
-      tier: "balanced",
-      effort: "low",
     });
     if (!res.data?.found || !res.data.offer) throw new Error(`Annonce non retrouvée${res.data?.reason ? ` (${res.data.reason})` : ""}. Collez plutôt le texte de l'annonce.`);
     const o = normalizeOffer(
@@ -3271,9 +3888,10 @@ export default function RadarApp() {
     );
     if (!o) throw new Error("Impossible de structurer cette annonce (intitulé manquant).");
     if (o.sources[0].url) o.sources[0].verified = cleanUrl ? true : (text || "").includes(o.sources[0].url);
+    if (str(text)) o.fullText = str(text).slice(0, 20000);
     const r = applyIncoming([o]);
-    toast(r.added.length ? "Annonce importée et structurée" : "Annonce déjà connue : sources fusionnées", "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(r.added.length ? (r.filtered ? "Annonce importée, mais écartée par vos règles (voir l'onglet Écartées)" : "Annonce importée et structurée") : "Annonce déjà connue : sources fusionnées", r.filtered ? "warn" : "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
     return r.added[0] || r.merged[0];
   });
 
@@ -3285,24 +3903,25 @@ export default function RadarApp() {
     const norm = raw.map((r) => normalizeOffer(r, { sourceName: str(r?.sourceName) || str(r?.source) || "Import JSON", via: "import JSON" })).filter(Boolean);
     const skipped = raw.length - norm.length;
     const r = applyIncoming(norm);
-    toast(`Import JSON : ${r.added.length} nouvelle(s), ${r.merged.length} fusion(s)${skipped ? `, ${skipped} ignorée(s) (intitulé ou URL manquant)` : ""}`, skipped ? "warn" : "ok");
-    if (r.added.length) await scoreOffers(r.added);
+    toast(`Import JSON : ${r.kept.length} nouvelle(s), ${r.filtered} écartée(s) par les règles, ${r.merged.length} fusion(s)${skipped ? `, ${skipped} ignorée(s) (intitulé ou URL manquant)` : ""}`, skipped ? "warn" : "ok");
+    if (r.kept.length) await scoreOffers(r.kept);
     return true;
   });
 
   /* ── Doublons : détection IA, fusion validée, annulable ──────────── */
   const inPipeline = (oid) => R.current.apps.some((a) => a.offerId === oid);
-  const detectDuplicates = () => withBusy("dedupe", async () => {
+  const detectDuplicates = ({ auto = false } = {}) => withBusy("dedupe", async () => {
     const pool0 = R.current.offers
-      .filter((o) => !o.demo && isActiveOffer(o))
-      .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || normText(a.title).localeCompare(normText(b.title)))
-      .slice(0, 180);
-    if (pool0.length < 2) { toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
+      .filter((o) => !o.demo && ["new", "pipeline"].includes(o.status))
+      .sort((a, b) => companyKey(a.company).localeCompare(companyKey(b.company)) || cleanTitle(a.title).localeCompare(cleanTitle(b.title)))
+      .slice(0, 240);
+    setSettings((x) => ({ ...x, lastAiDedupeAt: nowISO() }));
+    if (pool0.length < 2) { if (!auto) toast("Pas assez d'offres pour rechercher des doublons.", "neutral"); return; }
     const known = new Set(pool0.map((o) => o.id));
     const used = new Set();
     const groups = [];
     for (const batch of chunk(pool0, 60)) {
-      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000, tier: "fast", effort: "low" });
+      const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.dedupe(batch), maxTokens: 6000 });
       for (const g of Array.isArray(data?.groups) ? data.groups : []) {
         const ids = [...new Set((g.ids || []).filter((id) => known.has(id) && !used.has(id)))];
         if (ids.length < 2) continue;
@@ -3311,25 +3930,23 @@ export default function RadarApp() {
         groups.push({ id: uid("dup"), ids, confidence: g.confidence === "haute" ? "haute" : "moyenne", reason: str(g.reason), accept: g.confidence === "haute" });
       }
     }
-    if (!groups.length) { toast("Aucun doublon détecté.", "ok"); return; }
-    setDupeProposals(groups);
+    if (!groups.length) { if (!auto) toast("Aucun doublon détecté.", "ok"); return; }
+    if (!auto) { setDupeProposals(groups); return; }
+    // Automatique : confiance haute fusionnée directement (annulable), le reste attend votre validation.
+    let n = 0;
+    groups.filter((g) => g.confidence === "haute").forEach((g) => { if (mergeGroup(g.ids, g.reason, "IA automatique (confiance haute)")) n++; });
+    const rest = groups.filter((g) => g.confidence !== "haute");
+    if (rest.length) setDupePending(rest);
+    if (n || rest.length) toast(`Doublons : ${n} fusion(s) automatique(s)${rest.length ? ` · ${rest.length} à valider (page Offres)` : ""}`, "ok");
   });
 
-  const mergeGroup = (ids, reason) => {
+  const mergeGroup = (ids, reason, origin = "IA validée") => {
     const list = R.current.offers;
     const members = ids.map((id) => list.find((o) => o.id === id)).filter(Boolean);
     if (members.length < 2) return false;
-    const primary = members.find((o) => inPipeline(o.id))
-      || [...members].sort((a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || new Date(a.collectedAt) - new Date(b.collectedAt))[0];
+    const primary = pickPrimary(members, new Set(R.current.apps.map((a) => a.offerId)));
     const absorbed = members.filter((o) => o.id !== primary.id);
-    const before = { sources: primary.sources, description: primary.description, ...Object.fromEntries(FILLABLE.map((k) => [k, primary[k]])) };
-    const merged = { ...primary, sources: [...(primary.sources || [])] };
-    for (const o of absorbed) {
-      for (const src of o.sources || []) if (!merged.sources.some((x) => canonicalUrl(x.url) === canonicalUrl(src.url) && x.name === src.name)) merged.sources.push(src);
-      for (const k of FILLABLE) if ((merged[k] === null || merged[k] === undefined || merged[k] === "") && o[k]) merged[k] = o[k];
-      if (o.description && (!merged.description || o.description.length > merged.description.length)) merged.description = o.description;
-    }
-    merged.mergeHistory = [...(primary.mergeHistory || []), { id: uid("merge"), at: nowISO(), reason: str(reason), origin: "IA validée", before, absorbed }];
+    const merged = mergeMembers(primary, absorbed, reason, origin);
     const absorbedIds = new Set(absorbed.map((o) => o.id));
     const next = list.filter((o) => !absorbedIds.has(o.id)).map((o) => (o.id === primary.id ? merged : o));
     R.current.offers = next;
@@ -3340,7 +3957,84 @@ export default function RadarApp() {
     let n = 0;
     groups.filter((g) => g.accept).forEach((g) => { if (mergeGroup(g.ids, g.reason)) n++; });
     setDupeProposals(null);
+    setDupePending(null);
     toast(n ? `${n} fusion(s) effectuée(s) — annulables depuis la fiche de l'offre` : "Aucune fusion appliquée", n ? "ok" : "neutral");
+  };
+  /* Dédoublonnage IA systématique après chaque arrivée d'offres (au plus toutes les 6 h, sauf grosse arrivée). */
+  useEffect(() => {
+    if (!loaded || storageState.readOnly || !settings.autoDedupeAI || RT.mode === "none" || (RT.mode === "published" && !RT.sample)) return undefined;
+    const t = setTimeout(() => {
+      const n = arrivalsRef.current;
+      const last = R.current.settings.lastAiDedupeAt ? new Date(R.current.settings.lastAiDedupeAt).getTime() : 0;
+      if (!n || busyRef.current.dedupe || busyRef.current.score) return;
+      if (n < 5 && Date.now() - last < 6 * 36e5) return;
+      arrivalsRef.current = 0;
+      detectDuplicates({ auto: true });
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [loaded, offers.length, busy.score]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Actions de masse (annulables) ──────────────────────────────── */
+  const bulkOffers = (ids, fn, label) => {
+    const want = new Set(ids);
+    const prev = [];
+    const next = [];
+    for (const o of R.current.offers) {
+      if (!want.has(o.id)) { next.push(o); continue; }
+      const n = fn(o);
+      if (n === o) { next.push(o); continue; }
+      prev.push(o);
+      if (n) next.push(n);
+    }
+    if (!prev.length) { toast("Aucune offre modifiée.", "neutral"); return 0; }
+    R.current.offers = next;
+    setOffers(next);
+    setLastBulk({ label: `${label} : ${prev.length} offre(s)`, prev, at: nowISO(), undoable: true });
+    return prev.length;
+  };
+  const undoBulk = () => {
+    const lb = lastBulk;
+    if (!lb?.prev?.length) { setLastBulk(null); return; }
+    const byId = new Map(lb.prev.map((o) => [o.id, o]));
+    const present = new Set(R.current.offers.map((o) => o.id));
+    const next = [...R.current.offers.map((o) => byId.get(o.id) || o), ...lb.prev.filter((o) => !present.has(o.id))];
+    R.current.offers = next;
+    setOffers(next);
+    setLastBulk(null);
+    toast(`Annulé : ${lb.prev.length} offre(s) restaurée(s)`, "ok");
+  };
+  const BULK = {
+    dismiss: (o) => (o.status === "pipeline" || o.status === "closed" ? o : { ...o, status: "dismissed", dismissedAt: nowISO(), dismissedBy: "user", autoReason: undefined, autoRule: undefined, seenAt: o.seenAt || nowISO() }),
+    expire: (o) => (o.status === "pipeline" || o.status === "closed" ? o : { ...o, status: "expired", expiredAt: nowISO(), expiredBy: "user", autoReason: undefined, autoRule: undefined, seenAt: o.seenAt || nowISO() }),
+    seen: (o) => (o.seenAt ? o : { ...o, seenAt: nowISO() }),
+    unseen: (o) => (o.seenAt ? { ...o, seenAt: undefined } : o),
+    restore: (o) => (["dismissed", "expired"].includes(o.status) ? { ...o, status: "new", userKept: true, autoReason: undefined, autoRule: undefined, dismissedBy: undefined, expiredBy: undefined } : o),
+    remove: (o) => (o.status === "pipeline" || R.current.apps.some((a) => a.offerId === o.id) ? o : null),
+  };
+  const bulkAction = (kind, ids) => {
+    const labels = { dismiss: "Écartées", expire: "Marquées expirées / pourvues", seen: "Marquées comme lues", unseen: "Marquées non lues", restore: "Remises à traiter", remove: "Supprimées" };
+    if (BULK[kind]) return bulkOffers(ids, BULK[kind], labels[kind]);
+    if (kind === "pipeline") { ids.forEach((id) => { if (!inPipeline(id)) addToPipeline(id, "new", { quiet: true }); }); toast(`${ids.length} offre(s) ajoutée(s) au pipeline`, "ok"); return ids.length; }
+    if (kind === "score") return scoreOffers(ids);
+    if (kind === "verify") return requestVerify(ids);
+    if (kind === "merge") { if (mergeGroup(ids, "fusion manuelle", "manuelle")) toast(`${ids.length} offres fusionnées en une (annulable depuis sa fiche)`, "ok"); return 1; }
+    return 0;
+  };
+  const runRules = (onlyIds) => {
+    const ver = activeVersion(R.current.criteria);
+    const r = applyRules(R.current.offers, ver, rulesOf(R.current.settings), onlyIds ? new Set(onlyIds) : null);
+    if (!r.prev.length) { toast("Les règles ne trouvent rien à trier.", "ok"); return 0; }
+    R.current.offers = r.list;
+    setOffers(r.list);
+    setLastBulk({ label: `Règles appliquées : ${r.prev.length} offre(s) (${Object.entries(r.counts).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(", ")})`, prev: r.prev, at: nowISO(), undoable: true });
+    return r.prev.length;
+  };
+  const dedupeNow = () => {
+    const d = dedupeLocal(R.current.offers, R.current.apps);
+    if (!d.merged) { toast("Aucun doublon évident (URL, identifiant ou entreprise + intitulé).", "ok"); return; }
+    R.current.offers = d.list;
+    setOffers(d.list);
+    toast(`${d.merged} doublon(s) fusionné(s) — annulable depuis la fiche de l'offre`, "ok");
   };
   const undoMerge = (offerId) => {
     const list = R.current.offers;
@@ -3354,112 +4048,90 @@ export default function RadarApp() {
     toast(`Fusion annulée : ${last.absorbed.length} offre(s) restaurée(s)`, "ok");
   };
 
-  /* ── Surveillance Gmail du pipeline : lecture seule, incrémentale, toujours validée ── */
+  /* ── Réponses des recruteurs (Gmail, lecture seule) ──────────────── */
   const replyKey = (r) => `${r.date || ""}|${normText(r.from)}|${normText(r.subject)}`;
-  const monitoredApps = () => R.current.apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage)));
-  const setInboxNow = (next) => { R.current.inbox = next; setInbox(next); };
-  const checkReplies = ({ auto = false } = {}) => withBusy("replies", async () => {
-    const { settings: s, offers: O, contacts: C } = R.current;
-    const active = monitoredApps();
-    if (!active.length) { if (!auto) toast("Aucune candidature à surveiller (préparation, envoyée ou au-delà).", "neutral"); return; }
-    // Fenêtre incrémentale : depuis la dernière vérification (1 jour de marge), sans remonter avant la plus ancienne candidature.
-    const oldest = active.reduce((m, a) => Math.min(m, new Date(a.sentAt || a.createdAt).getTime()), Date.now());
-    const last = s.lastReplyWindowAt ? new Date(s.lastReplyWindowAt).getTime() - 864e5 : 0;
-    const after = new Date(Math.max(oldest - 864e5, last, Date.now() - 120 * 864e5)).toISOString().slice(0, 10);
+  const checkReplies = () => withBusy("replies", async () => {
+    const { settings: s, apps: A, offers: O, contacts: C } = R.current;
+    const active = A.filter((a) => !a.demo && a.sentAt && a.stage !== "closed");
+    if (!active.length) { toast("Aucune candidature envoyée à surveiller.", "neutral"); return; }
     const items = active.map((a) => {
       const o = O.find((x) => x.id === a.offerId);
       return {
-        appId: a.id, title: o?.title || null, company: o?.company || null, stage: a.stage, sentAt: a.sentAt ? a.sentAt.slice(0, 10) : null,
+        appId: a.id, title: o?.title || null, company: o?.company || null,
         sites: [...new Set((o?.sources || []).map((x) => hostOf(x.url)).filter(Boolean))],
         contacts: C.filter((c) => (a.contactIds || []).includes(c.id)).map((c) => ({ name: c.name, email: c.email || null, company: c.company || null })),
+        since: a.sentAt.slice(0, 10),
       };
     });
-    const companies = [...new Set(items.map((i) => i.company).filter((c) => c && !/confidenti|non communiqu|anonyme/i.test(c)))].slice(0, 20);
-    const emails = [...new Set(items.flatMap((i) => i.contacts.map((c) => c.email)).filter(Boolean))].slice(0, 15);
-    const query = `after:${after.replace(/-/g, "/")} -category:promotions (${[
-      ...companies.map((c) => `"${c.replace(/"/g, "")}"`),
-      ...emails.map((e) => `from:${e}`),
-      `from:(${ATS_SENDERS.join(" OR ")})`,
-      "subject:(candidature OR application OR sollicitatie OR bewerbung OR entretien OR interview OR gesprek OR sollicitatiegesprek)",
-    ].join(" OR ")})`;
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items, { after, query }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000, tier: "balanced" });
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.replies(items), mcp: [{ server: "gmail", allow: s.mcpTools.gmailRead }], maxTokens: 12000 });
     if (res.toolCalls.some((n) => /send|trash|delete|modify|label|forward|reply|spam/i.test(n))) toast(`Attention : outil Gmail inattendu appelé (${res.toolCalls.join(", ")}).`, "danger");
     if (!res.toolCalls.length) throw new Error("Gmail n'a pas été consulté : vérifiez que le connecteur Gmail est activé pour cet artefact.");
-    const now = nowISO();
-    setSettings((x) => ({ ...x, lastReplyCheckAt: now, lastReplyWindowAt: now }));
+    setSettings((x) => ({ ...x, lastReplyCheckAt: nowISO() }));
     const hay = normText(res.toolText);
-    const thread = (t) => (str(t) && hay.includes(normText(t)) ? str(t) : null);
-    const day = (d) => (str(d) && !isNaN(new Date(d).getTime()) ? String(d).slice(0, 10) : null);
-    const seen = new Set([...R.current.apps.flatMap((a) => a.seenReplies || []), ...R.current.inbox.replies.map(replyKey)]);
     const found = (Array.isArray(res.data?.replies) ? res.data.replies : [])
       .filter((r) => r && active.some((a) => a.id === r.appId) && str(r.subject))
       .map((r) => ({
-        id: uid("rep"), appId: r.appId, threadId: thread(r.threadId), date: day(r.date), from: str(r.from), subject: str(r.subject),
+        id: uid("rep"), appId: r.appId, date: str(r.date), from: str(r.from), subject: str(r.subject),
         kind: REPLY_KINDS[r.kind] ? r.kind : "autre", summary: str(r.summary),
         interviewAt: str(r.interviewAt) && !isNaN(new Date(r.interviewAt).getTime()) ? new Date(r.interviewAt).toISOString() : null,
-        action: ["sent", "interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
-        verified: hay.includes(normText(r.subject)), at: now,
+        action: ["interview", "closed", "offer"].includes(r.proposedStage) ? r.proposedStage : "log",
+        verified: hay.includes(normText(r.subject)),
       }))
-      .filter((r) => !seen.has(replyKey(r)));
-    const seenU = new Set([...(s.seenUntracked || []), ...R.current.inbox.untracked.map(replyKey)]);
-    const untracked = (Array.isArray(res.data?.untracked) ? res.data.untracked : [])
-      .filter((u) => u && str(u.subject) && str(u.company))
-      .map((u) => ({ id: uid("unt"), company: str(u.company), title: str(u.title), threadId: thread(u.threadId), date: day(u.date), from: str(u.from), subject: str(u.subject), kind: REPLY_KINDS[u.kind] ? u.kind : "autre", summary: str(u.summary), verified: hay.includes(normText(u.subject)), at: now }))
-      .filter((u) => !seenU.has(replyKey(u)));
-    setInboxNow({ replies: [...R.current.inbox.replies, ...found], untracked: [...R.current.inbox.untracked, ...untracked] });
-    if (found.length || untracked.length) {
-      toast(`Gmail : ${found.length} réponse(s)${untracked.length ? ` et ${untracked.length} candidature(s) non suivie(s)` : ""} à valider.`, "ok");
-      if (!auto) setReplyOpen(true);
-    } else if (!auto) toast(`Aucune nouvelle réponse depuis le ${fmtDate(after)} (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok");
+      .filter((r) => !(active.find((a) => a.id === r.appId)?.seenReplies || []).includes(replyKey(r)));
+    if (!found.length) { toast(`Aucune nouvelle réponse (${res.data?.messagesRead ?? "?"} e-mail(s) lu(s)).`, "ok"); return; }
+    setReplyProposals(found);
   });
   const resolveReply = (r, apply) => {
     patchApp(r.appId, (a) => {
       const n = { ...a, seenReplies: [...(a.seenReplies || []), replyKey(r)] };
-      if (!apply) return n;
-      const mail = { id: uid("mail"), date: r.date, from: r.from, subject: r.subject, kind: r.kind, summary: r.summary, threadId: r.threadId, at: nowISO() };
-      return addLogEntry({ ...n, emails: [...(n.emails || []), mail] }, "email", `E-mail reçu (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`);
+      return apply ? addLogEntry(n, "email", `Réponse reçue (${REPLY_KINDS[r.kind]}) de ${r.from || NC} : « ${r.subject} »${r.summary ? ` — ${r.summary}` : ""}`) : n;
     });
     if (apply) {
-      const cur = R.current.apps.find((a) => a.id === r.appId);
-      if (r.action === "sent") {
-        const sentAt = r.date ? new Date(`${r.date}T09:00:00`).toISOString() : undefined;
-        if (cur && STAGE_INDEX[cur.stage] < STAGE_INDEX.sent) moveApp(r.appId, "sent", { sentAt });
-        else if (cur && !cur.sentAt && sentAt) patchApp(r.appId, (a) => ({ ...a, sentAt }));
-      } else if (r.action === "interview") {
+      if (r.action === "interview") {
         if (r.interviewAt) addInterview(r.appId, { at: r.interviewAt, type: "À préciser", location: "", notes: `Selon l'e-mail « ${r.subject} »` });
         else moveApp(r.appId, "interview");
       } else if (r.action === "closed") moveApp(r.appId, "closed", { outcome: "refused", reason: r.summary || "Réponse négative reçue par e-mail" });
       else if (r.action === "offer") moveApp(r.appId, "offer");
     }
-    setInboxNow({ ...R.current.inbox, replies: R.current.inbox.replies.filter((x) => x.id !== r.id) });
+    setReplyProposals((l) => { const rest = (l || []).filter((x) => x.id !== r.id); return rest.length ? rest : null; });
   };
-  const resolveUntracked = (u, create) => {
-    if (create) {
-      const t = nowISO();
-      const sentAt = u.date ? new Date(`${u.date}T09:00:00`).toISOString() : t;
-      const stage = u.kind === "invitation_entretien" ? "interview" : u.kind === "refus" ? "closed" : "sent";
-      const off = {
-        id: uid("off"), title: u.title || "Candidature détectée dans Gmail", company: u.company, location: null, commute: null, contract: null, seniority: null, salary: null, remote: null,
-        language: null, publishedAt: null, description: u.summary || null, collectedAt: t, lastSeenAt: t, status: stage === "closed" ? "closed" : "pipeline", score: null, demo: false,
-        sources: [{ name: "Gmail", url: null, collectedAt: t, via: "surveillance Gmail", verified: null, emailSubject: u.subject }],
-      };
-      const rules = R.current.settings.followUp;
-      const app = {
-        id: uid("app"), offerId: off.id, stage, reached: STAGE_INDEX[stage === "closed" ? "sent" : stage], createdAt: t, updatedAt: t, sentAt,
-        closed: stage === "closed" ? { outcome: "refused", reason: u.summary, at: t } : null, docs: {}, prep: null, contactIds: [], interviews: [], demo: false,
-        followUps: stage === "sent" ? rules.afterSend.map((d, i) => ({ id: uid("fu"), kind: i === 0 ? "relance1" : i === 1 ? "relance2" : "custom", due: addDays(sentAt, d), status: "pending", draft: null })) : [],
-        emails: [{ id: uid("mail"), date: u.date, from: u.from, subject: u.subject, kind: u.kind, summary: u.summary, threadId: u.threadId, at: t }],
-        log: [{ id: uid("log"), at: t, type: "email", text: `Candidature détectée dans Gmail : « ${u.subject} »` }],
-      };
-      R.current.offers = [off, ...R.current.offers];
-      setOffers((l) => [off, ...l]);
-      R.current.apps = [app, ...R.current.apps];
-      setApps((l) => [app, ...l]);
-      toast(`Ajoutée au pipeline : ${u.company} (${STAGE_LABEL[stage]})`, "ok");
+
+  /* ── Fiches entreprise (pourquoi eux) : web_search (API), Routine (page publiée) ou source collée. ── */
+  const requestBrief = (company, context) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name || /confidenti|non communiqu|anonyme|\[à compléter/i.test(name)) throw new Error("Entreprise non identifiée.");
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La recherche passe par la veille planifiée, qui n'est pas reliée à cette page. Ajoutez une source à la main.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « fiche entreprise » uniquement : ${JSON.stringify({ task: "brief", companies: [name] })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      toast(`Fiche demandée pour ${name} : elle s'affichera d'ici quelques minutes.`, "ok");
+      return null;
     }
-    setSettings((x) => ({ ...x, seenUntracked: [...(x.seenUntracked || []), replyKey(u)].slice(-300) }));
-    setInboxNow({ ...R.current.inbox, untracked: R.current.inbox.untracked.filter((x) => x.id !== u.id) });
-  };
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.companyBrief(name, context), web: { maxUses: 6 }, maxTokens: 5000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: res.data?.facts, origin: "web", verifiedUrls: res.urls });
+    const dropped = (res.data?.facts || []).length - b.facts.length;
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) sourcé(s) sur ${name}${dropped > 0 ? ` · ${dropped} écarté(s) faute d'URL vérifiée` : ""}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const addManualBrief = (company, url, text) => withBusy(`brief:${briefKey(company)}`, async () => {
+    const name = str(company);
+    if (!name) throw new Error("Entreprise non identifiée.");
+    if (!isHttp(url)) throw new Error("Indiquez l'URL de la source : un fait sans source vérifiable est exclu.");
+    if (String(text || "").trim().length < 80) throw new Error("Collez le texte de la source (au moins quelques phrases).");
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.briefFromText(name, url, text), maxTokens: 3000 });
+    const b = makeBrief({ company: name, summary: res.data?.summary, facts: (res.data?.facts || []).map((f) => ({ text: f?.text, url })), origin: "manuel" });
+    setBriefs((cur) => ({ ...cur, [briefKey(name)]: mergeBriefs(cur[briefKey(name)], b) }));
+    toast(`${b.facts.length} fait(s) ajouté(s) à la fiche ${name}`, b.facts.length ? "ok" : "warn");
+    return b;
+  });
+  const removeBriefFact = (company, factId) => setBriefs((cur) => {
+    const k = briefKey(company);
+    if (!cur[k]) return cur;
+    return { ...cur, [k]: { ...cur[k], facts: cur[k].facts.filter((f) => f.id !== factId) } };
+  });
+  const setAppMotivation = (appId, patch) => patchApp(appId, (a) => ({ ...a, motivation: { ...appMotivOf(a), ...patch } }));
 
   /* ── Notes employeur (avis publics type Glassdoor) ───────────────── */
   const requestRatings = (companies) => withBusy("ratings", async () => {
@@ -3473,7 +4145,7 @@ export default function RadarApp() {
       toast(`Notes demandées pour ${list.length} entreprise(s) : elles s'afficheront d'ici quelques minutes.`, "ok");
       return;
     }
-    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000, tier: "balanced", effort: "low" });
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.ratings(list), web: { maxUses: Math.min(10, list.length * 2) }, maxTokens: 6000 });
     const next = {};
     (res.data?.ratings || []).forEach((r) => {
       if (!r?.company) return;
@@ -3486,6 +4158,105 @@ export default function RadarApp() {
     toast(`${Object.values(next).filter((x) => x.rating).length} note(s) trouvée(s) sur ${list.length}`, "ok");
   });
 
+  /* ── Vérification des liens (annonce encore ouverte ?) ─────────────
+     Page publiée : la Routine ouvre les annonces (ou les recherche) et dépose ses résultats dans veille_verify.
+     Elle traite aussi, à chaque passage planifié, la file veille/verify_queue entretenue par la page. */
+  const verifyTargets = (ids) => R.current.offers
+    .filter((o) => ids.includes(o.id) && !o.spontaneous && (o.sources || []).some((x) => x.url))
+    .slice(0, 40)
+    .map((o) => ({ id: o.id, url: (o.sources || []).find((x) => x.url)?.url, title: o.title, company: o.company || null }));
+  const applyVerifyResults = (results, at, method) => {
+    const by = new Map((results || []).filter((r) => r && r.id).map((r) => [r.id, r]));
+    if (!by.size) return { closed: 0, open: 0 };
+    const ver = activeVersion(R.current.criteria);
+    const rules = rulesOf(R.current.settings);
+    let closed = 0, open = 0, pipeClosed = 0;
+    const next = R.current.offers.map((o) => {
+      const r = by.get(o.id);
+      if (!r) return o;
+      const state = ["open", "closed", "unknown"].includes(r.state) ? r.state : "unknown";
+      let n = { ...o, link: { state, evidence: str(r.evidence), at: str(r.checkedAt) || at, method: str(r.method) || method } };
+      const pub = isoDay(r.publishedAt), dl = isoDay(r.deadline);
+      if (pub && (!n.publishedAt || n.publishedApprox)) { n.publishedAt = pub; delete n.publishedApprox; }
+      if (dl && !n.deadline) n.deadline = dl;
+      if (state === "closed") { closed++; if (n.status === "pipeline") pipeClosed++; }
+      if (state === "open") open++;
+      const v = ruleVerdict(n, ver, rules);
+      return v ? applyVerdict(n, v, at) : n;
+    });
+    R.current.offers = next;
+    setOffers(next);
+    if (pipeClosed) toast(`${pipeClosed} offre(s) de votre pipeline semblent clôturées : vérifiez-les.`, "warn");
+    return { closed, open };
+  };
+  const requestVerify = (ids) => withBusy("verify", async () => {
+    const items = verifyTargets(ids);
+    if (!items.length) { toast("Aucune offre avec lien à vérifier.", "neutral"); return; }
+    const mark = (state) => { const set = new Set(items.map((x) => x.id)); setOffers((l) => l.map((o) => (set.has(o.id) ? { ...o, link: { ...(o.link || {}), state, requestedAt: nowISO() } } : o))); };
+    if (RT.mode === "published") {
+      const trig = veilleRef.current.routine?.triggerId;
+      if (!trig || !RT.mcp) throw new Error("La vérification passe par la veille planifiée, qui n'est pas reliée à cette page.");
+      await RT.mcp.callTool("Claude Code Remote", "fire_trigger", { trigger_id: trig, text: `Tâche « vérification des liens » uniquement : ${JSON.stringify({ task: "verify", offers: items })}` })
+        .catch((e) => { throw new Error(`Lancement impossible (${e?.message || e?.code}).`); });
+      mark("pending");
+      setSettings((x) => ({ ...x, lastVerifyAt: nowISO() }));
+      toast(`Vérification demandée pour ${items.length} offre(s) : résultats d'ici 5 à 15 minutes. Les annonces clôturées passeront en « Expirées ».`, "ok");
+      return;
+    }
+    const res = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.verify(items), web: { maxUses: Math.min(20, items.length * 2) }, maxTokens: 8000 });
+    const r = applyVerifyResults(res.data?.results, nowISO(), "recherche web");
+    setSettings((x) => ({ ...x, lastVerifyAt: nowISO() }));
+    toast(`Vérification : ${r.closed} clôturée(s), ${r.open} ouverte(s), le reste indéterminé.`, "ok");
+  });
+  const ingestVerify = (snapDoc) => {
+    if ((R.current.settings.importedVerify || []).includes(snapDoc.id)) return;
+    const d = snapDoc.data() || {};
+    R.current.settings = { ...R.current.settings, importedVerify: [...(R.current.settings.importedVerify || []), snapDoc.id] };
+    setSettings((x) => ({ ...x, importedVerify: [...(x.importedVerify || []), snapDoc.id].slice(-200) }));
+    const r = applyVerifyResults(d.results, str(d.createdAt) || nowISO(), str(d.method) || "veille");
+    if (r.closed || r.open) toast(`Liens vérifiés : ${r.closed} annonce(s) clôturée(s) (passées en « Expirées »), ${r.open} confirmée(s) ouverte(s).`, "ok");
+  };
+  /* File de vérification lue par la Routine : offres à traiter ou en pipeline, jamais vérifiées ou vérifiées il y a plus de 5 jours. */
+  const verifyQueue = useMemo(() => {
+    const due = (o) => !o.link?.at || Date.now() - new Date(o.link.at).getTime() > 5 * DAY;
+    const items = offers
+      .filter((o) => !o.demo && !o.spontaneous && ["new", "pipeline"].includes(o.status) && due(o) && (o.sources || []).some((x) => x.url))
+      .sort((a, b) => (b.score?.value ?? 50) - (a.score?.value ?? 50))
+      .slice(0, 40)
+      .map((o) => ({ id: o.id, url: (o.sources || []).find((x) => x.url)?.url, title: o.title, company: o.company || null }));
+    return { items, sig: items.map((x) => x.id).join(",") };
+  }, [offers]);
+  const queueSig = useRef(null);
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db || storageState.readOnly || !settings.autoVerify || queueSig.current === verifyQueue.sig) return undefined;
+    const t = setTimeout(() => {
+      queueSig.current = verifyQueue.sig;
+      RT.db.doc("veille/verify_queue").set({ offers: verifyQueue.items, updatedAt: nowISO() }).catch(() => {});
+    }, 4000);
+    return () => clearTimeout(t);
+  }, [loaded, verifyQueue.sig, settings.autoVerify]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* File des fiches entreprise lue par la Routine : entreprises des candidatures actives sans fiche à jour (5 au plus). */
+  const briefQueue = useMemo(() => {
+    const names = [];
+    apps.filter((a) => !a.demo && a.kind !== "base" && a.stage !== "closed").forEach((a) => {
+      const o = offers.find((x) => x.id === a.offerId);
+      const c = str(o?.company);
+      if (c && !briefFresh(briefs[briefKey(c)]) && !names.some((n) => briefKey(n) === briefKey(c))) names.push(c);
+    });
+    const items = names.slice(0, 5);
+    return { items, sig: items.map(briefKey).join(",") };
+  }, [apps, offers, briefs]);
+  const briefSig = useRef(null);
+  useEffect(() => {
+    if (!loaded || RT.mode !== "published" || !RT.db || storageState.readOnly || briefSig.current === briefQueue.sig) return undefined;
+    const t = setTimeout(() => {
+      briefSig.current = briefQueue.sig;
+      RT.db.doc("veille/brief_queue").set({ companies: briefQueue.items, updatedAt: nowISO() }).catch(() => {});
+    }, 4500);
+    return () => clearTimeout(t);
+  }, [loaded, briefQueue.sig]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* ── Tri rapide des offres ──────────────────────────────────────── */
   const nextOfferId = (id) => {
     const q = offerQueue.length ? offerQueue : R.current.offers.filter(isActiveOffer).map((o) => o.id);
@@ -3494,7 +4265,7 @@ export default function RadarApp() {
   };
   const triageOffer = (id, patch) => {
     const nxt = nextOfferId(id);
-    patchOffer(id, patch);
+    patchOffer(id, (o) => ({ ...patch, seenAt: o.seenAt || nowISO(), autoReason: undefined, autoRule: undefined, ...(patch.status === "dismissed" ? { dismissedBy: "user" } : patch.status === "expired" ? { expiredBy: "user" } : {}) }));
     if (R.current.settings.autoNext && nxt) setOfferSel(nxt);
     else setOfferSel(null);
   };
@@ -3502,25 +4273,11 @@ export default function RadarApp() {
   /* ── Critères ───────────────────────────────────────────────────── */
   const saveCriteriaVersion = (label) => {
     const c = R.current.criteria;
-    const prev = activeVersion(c);
     const v = { id: uid("crit"), label: label || `v${c.versions.length + 1} — ${fmtDate(nowISO())}`, createdAt: nowISO(), ...deepClone(c.draft) };
     const next = { ...c, versions: [...c.versions, v] };
     R.current.criteria = next;
     setCriteria(next);
     toast(`Version enregistrée : ${v.label}`, "ok");
-    if (prev && onlyWeightsChanged(criteriaBody(prev), criteriaBody(v))) {
-      let n = 0;
-      const list = R.current.offers.map((o) => {
-        if (o.score?.criteriaVersionId !== prev.id) return o;
-        const ns = reweightScore(o.score, prev.wishes || [], v.wishes || [], v.id);
-        if (!ns) return o;
-        n += 1;
-        return { ...o, score: ns };
-      });
-      R.current.offers = list;
-      setOffers(list);
-      if (n) toast(`${n} score(s) recalculé(s) localement : seules les pondérations ont changé, aucun appel IA.`, "ok");
-    }
     if (R.current.settings.autoRescore) setTimeout(() => rescoreStale(), 50);
   };
   const restoreVersion = (vid) => {
@@ -3534,7 +4291,7 @@ export default function RadarApp() {
     saveCriteriaVersion(`Restauration de « ${label} »`);
   };
   const generateKeywords = () => withBusy("keywords", async () => {
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000, tier: "fast", effort: "low" });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.keywords(R.current.criteria.draft), maxTokens: 3000 });
     setCriteria((c) => {
       const kw = { ...c.draft.keywords };
       ["fr", "nl", "en"].forEach((l) => {
@@ -3550,7 +4307,7 @@ export default function RadarApp() {
   const openApp = (id, tab = "track") => setAppSel({ id, tab });
   const openOffer = (id) => setOfferSel(id);
 
-  const addToPipeline = (oid, stage = "retained") => {
+  const addToPipeline = (oid, stage = "retained", { quiet = false } = {}) => {
     const existing = R.current.apps.find((a) => a.offerId === oid);
     if (existing) { openApp(existing.id); return existing.id; }
     const app = {
@@ -3560,8 +4317,8 @@ export default function RadarApp() {
     };
     R.current.apps = [app, ...R.current.apps];
     setApps((l) => [app, ...l]);
-    patchOffer(oid, { status: "pipeline" });
-    toast(`Ajoutée au pipeline (${STAGE_LABEL[stage]})`, "ok");
+    patchOffer(oid, (o) => ({ status: "pipeline", seenAt: o.seenAt || nowISO() }));
+    if (!quiet) toast(`Ajoutée au pipeline (${STAGE_LABEL[stage]})`, "ok");
     return app.id;
   };
 
@@ -3638,7 +4395,7 @@ export default function RadarApp() {
         toast("Brouillon créé dans Gmail — non envoyé", "ok");
         return;
       }
-      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000, tier: "balanced", effort: "low" });
+      const res = await askJSON(s, { system: SYSTEM_TOOLS, prompt: P.gmailDraft({ to, subject, body }), mcp: [{ server: "gmail", allow: s.mcpTools.gmailDraft }], maxTokens: 4000 });
       if (res.toolCalls.some((n) => /send/i.test(n))) toast("Alerte : un outil d'envoi a été appelé. Vérifiez vos e-mails envoyés.", "danger");
       if (!res.toolCalls.length) throw new Error("Le connecteur Gmail n'a pas été appelé : aucun brouillon créé. Vérifiez l'activation du connecteur.");
       if (!res.data?.created) throw new Error(`Brouillon non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -3669,8 +4426,6 @@ export default function RadarApp() {
         prompt: P.calendarEvent({ title, start: toLocalInput(start) + ":00", end: toLocalInput(end) + ":00", description, reminder }),
         mcp: [{ server: "gcal", allow: s.mcpTools.gcal }],
         maxTokens: 3000,
-        tier: "balanced",
-        effort: "low",
       });
       if (!res.toolCalls.length) throw new Error("Le connecteur Google Calendar n'a pas été appelé : aucun événement créé.");
       if (!res.data?.created) throw new Error(`Événement non créé : ${res.data?.error || res.toolErrors[0] || "raison inconnue"}`);
@@ -3683,87 +4438,225 @@ export default function RadarApp() {
   const calTitle = (what, company) => (R.current.settings.discreetCalendarTitles ? `Perso · ${what}` : `${what} – ${company || "entreprise"}`);
 
   /* ── Dossier de candidature ─────────────────────────────────────── */
-  const generateDocs = (appId, types, instruction, langOverride) => withBusy(`dossier:${appId}`, async () => {
-    const { settings: s, profile: p } = R.current;
+  const setGen = (appId, st) => setGenStatus((g) => { const n = { ...g }; if (st) n[appId] = st; else delete n[appId]; return n; });
+  const appAndOffer = (appId) => {
     const app = R.current.apps.find((a) => a.id === appId);
-    const offer0 = R.current.offers.find((o) => o.id === app?.offerId);
-    if (!app || !offer0) throw new Error("Candidature introuvable.");
-    const offer = langOverride ? { ...offer0, language: langOverride } : offer0;
-    const proParts = types.filter((t) => t === "cv" || t === "letter");
-    const otherParts = types.filter((t) => !proParts.includes(t));
-    const [pro, rest] = await Promise.all([
-      proParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.cvPro(offer, p, proParts, instruction), maxTokens: 16000, tier: "deep" }) : null,
-      otherParts.length ? askJSON(s, { system: SYSTEM_BASE, prompt: P.dossier(offer, p, otherParts, instruction), maxTokens: 12000, tier: "balanced" }) : null,
-    ]);
-    const data = { ...(rest?.data || {}), language: pro?.data?.language || rest?.data?.language };
-    const lang = langOverride || (DOC_LANGS.includes(data.language) ? data.language : offerLang(offer));
-    const versions = {};
-    if (pro?.data) {
-      const d = pro.data;
-      const accent = cleanHex(d.accent, null);
-      const common = { accent, accentSource: accent ? str(d.accentSource) || "suggérée" : null, keywords: (d.keywords?.fromAd || []).map(String).slice(0, 30), missingInProfile: (d.keywords?.missingInProfile || []).map(String), tips: (d.tips || []).map(String) };
-      for (const t of proParts) {
-        const txt = typeof d[t] === "string" ? d[t].trim() : "";
-        if (txt) versions[t] = { text: txt, format: "markup", lang, ...common, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
-      }
-    }
-    for (const t of otherParts) {
-      const d = data?.[t];
-      if (!d) continue;
-      let v;
-      if (t === "answers") v = { text: (d.items || []).map((x) => `Q. ${x.question}\n${x.answer}`).join("\n\n") };
-      else if (t === "email") v = { subject: d.subject || "", text: d.body || "" };
-      else if (t === "cv") v = { text: d.text || "", highlights: (d.highlights || []).map(String) };
-      else v = { text: d.text || "" };
-      if (!v.text) continue;
-      versions[t] = { ...v, lang, id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction) };
-    }
-    if (!Object.keys(versions).length) throw new Error("Aucun document reçu de l'IA.");
-    patchApp(appId, (a) => {
-      const docs = { ...(a.docs || {}) };
-      for (const [t, v] of Object.entries(versions)) docs[t] = [...(docs[t] || []), v];
-      const n = { ...a, docs, docLanguage: a.docLanguage || lang };
-      if (["new", "retained"].includes(a.stage)) n.stage = "prep";
-      return addLogEntry(n, "doc", `Généré : ${Object.keys(versions).map((t) => DOC_LABEL[t]).join(", ")}`);
-    });
-    toast("Documents prêts à relire", "ok");
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    if (!app || !offer) throw new Error("Candidature introuvable.");
+    return { app, offer };
+  };
+
+  /* Analyse de l'annonce (mots-clés ATS, exigences, preuves du profil) : mise en cache tant que l'annonce et le profil ne changent pas. */
+  const analyzeAd = async (appId, { force = false } = {}) => {
+    const { settings: s, profile: p } = R.current;
+    const { app, offer } = appAndOffer(appId);
+    const adText = adTextOf(offer);
+    if (offer.spontaneous ? !str(offer.title) : adText.length < 40) throw new Error(offer.spontaneous ? "Indiquez le rôle visé." : "Annonce trop courte pour être analysée : collez son texte complet.");
+    const sig = hashStr(`${offer.spontaneous || ""}§${offer.title}§${offer.company || ""}§${offer.language || ""}§${adText}§${JSON.stringify({ ...p, motivation: undefined, motivationAnswers: undefined, writingRules: undefined })}`);
+    if (!force && app.analysis?.sig === sig) return app.analysis;
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: offer.spontaneous ? P.targetAnalysis(offer, p) : P.adAnalysis(offer, adText, p), maxTokens: 9000 });
+    const analysis = { ...normalizeAnalysis(data, offer), sig, createdAt: nowISO(), fromSummary: !offer.spontaneous && !offer.fullText, adChars: adText.length, spontaneous: offer.spontaneous || null };
+    if (!analysis.keywords.length) throw new Error("L'analyse n'a renvoyé aucun mot-clé.");
+    R.current.apps = R.current.apps.map((a) => (a.id === appId ? { ...a, analysis } : a));
+    patchApp(appId, (a) => ({ ...a, analysis }));
+    return analysis;
+  };
+  const runAnalysis = (appId) => withBusy(`analysis:${appId}`, async () => {
+    await analyzeAd(appId, { force: true });
+    toast("Analyse de l'annonce à jour", "ok");
+    return true;
   });
+
+  /* Dossier : 1) analyse de l'annonce → 2) rédaction (CV et lettre en parallèle) → 3) contrôle qualité local + corrections ciblées. */
+  const generateDocs = (appId, types, instruction, prefsIn) => withBusy(`dossier:${appId}`, async () => {
+    try {
+      const { settings: s, profile: p } = R.current;
+      const { app, offer } = appAndOffer(appId);
+      const prefs = { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}), ...(prefsIn || {}) };
+      const pro = types.filter((t) => t === "cv" || t === "letter");
+      const other = types.filter((t) => !pro.includes(t));
+      setGen(appId, { step: 1, label: offer.spontaneous ? "Analyse du rôle visé et confrontation à votre profil…" : "Analyse de l'annonce et confrontation à votre profil…" });
+      let analysis = null;
+      try { analysis = await analyzeAd(appId); } catch (e) { toast(`Analyse de l'annonce impossible (${e.message}) : rédaction à partir de l'annonce seule.`, "warn"); }
+      const lang = docLang(offer, prefs, analysis);
+      const failed = [];
+      const got = {};
+      const drafts = {};
+      const appNow = R.current.apps.find((a) => a.id === appId) || app;
+      const facts = selectedFacts(appNow, offer, R.current.briefs);
+      const extra = { facts, appBlock: appMotivationBlock(appNow, offer, p, facts), employer: employerRule(appNow, p) };
+      const qaCtx = (x) => lintCtx({ offer, analysis, prefs, lang, settings: s, profile: p, app: appNow, briefs: R.current.briefs, ...x });
+      /* Passe de correction ciblée après rédaction (points « autoFix » du contrôle qualité). */
+      const autoFix = async (t, d, extra) => {
+        d.autoFixed = 0;
+        const issues = autoFixList(analyzeDoc(d.text, t, qaCtx(extra)));
+        if (!issues.length) return;
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.fixDoc({ kind: t, text: d.text, issues, analysis, profile: p, offer }), p), maxTokens: 5000 });
+          let txt = d.text;
+          for (const e of Array.isArray(r.data?.edits) ? r.data.edits : []) {
+            if (touchesLocked(e?.before, lockedOf(p))) continue;
+            const nt = applyEdit(txt, e?.before, e?.after);
+            if (nt !== null && nt !== txt) { txt = nt; d.autoFixed++; }
+          }
+          d.text = normalizeDoc(txt, t, lang);
+        } catch { /* passe facultative : le document reste utilisable */ }
+      };
+      const restJob = other.length
+        ? askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.dossier(offer, p, other, instruction, analysis, extra), p), maxTokens: 8000 }).then((r) => { got.rest = r.data; }).catch((e) => failed.push(e?.message || String(e)))
+        : Promise.resolve();
+      /* 1) CV, puis 2) lettre écrite AVEC le CV en entrée : elle explique, le CV prouve. */
+      if (pro.includes("cv")) {
+        const master = masterOf(p, lang);
+        setGen(appId, { step: 2, label: master ? "Adaptation du CV maître…" : "Rédaction du CV…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.cvWrite(offer, p, analysis, prefs, instruction, { ...extra, master: master?.text, masterLang: lang }), p), maxTokens: 9000 });
+          const raw = r.data?.cv;
+          if (typeof raw === "string" && raw.trim()) {
+            const accent = cleanHex(r.data?.accent, null);
+            const written = normalizeDoc(raw, "cv", lang);
+            drafts.cv = { text: master ? normalizeDoc(enforceMaster(written, master.text, lockedOf(p)), "cv", lang) : written, masterAt: master?.at || null, accent, accentSource: accent ? str(r.data?.accentSource) || "suggérée" : null, tips: (r.data?.tips || []).map(String).filter(Boolean).slice(0, 4) };
+            setGen(appId, { step: 3, label: "Contrôle qualité du CV…" });
+            await autoFix("cv", drafts.cv);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
+      }
+      if (pro.includes("letter")) {
+        const cvText = drafts.cv?.text || app.drafts?.cv?.text || app.docs?.cv?.slice(-1)[0]?.text || "";
+        setGen(appId, { step: 2, label: cvText ? "Rédaction de la lettre à partir du CV (sans le répéter)…" : "Rédaction de la lettre…" });
+        try {
+          const r = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(P.letterWrite(offer, p, analysis, prefs, instruction, cvText, extra), p), maxTokens: 9000 });
+          const raw = r.data?.letter;
+          if (typeof raw === "string" && raw.trim()) {
+            drafts.letter = { text: normalizeDoc(raw, "letter", lang), accent: null, accentSource: null, tips: [], used: normalizeUsed(r.data?.used), cvText };
+            setGen(appId, { step: 3, label: "Contrôle qualité de la lettre…" });
+            await autoFix("letter", drafts.letter, { cvText });
+            drafts.letter.metrics = letterMetrics(drafts.letter.text, cvText);
+          }
+        } catch (e) { failed.push(e?.message || String(e)); }
+      }
+      await restJob;
+      const versions = {};
+      const meta = () => ({ id: uid("doc"), createdAt: nowISO(), origin: "IA", instruction: str(instruction), prefs, analysisSig: analysis?.sig || null });
+      for (const [t, d] of Object.entries(drafts)) versions[t] = { ...meta(), text: d.text, format: "markup", language: lang, accent: d.accent, accentSource: d.accentSource, tips: d.tips, autoFixed: d.autoFixed, ...(t === "letter" ? { used: d.used, metrics: d.metrics } : { masterAt: d.masterAt || null }) };
+      const rest = got.rest || {};
+      for (const t of other) {
+        const d = rest[t];
+        if (!d) continue;
+        let v;
+        if (t === "answers") v = { text: (d.items || []).map((x) => `Q. ${x.question}\n${x.answer}`).join("\n\n") };
+        else if (t === "email") v = { subject: d.subject || "", text: d.body || "" };
+        else v = { text: d.text || "" };
+        if (v.text) versions[t] = { ...meta(), ...v };
+      }
+      if (!Object.keys(versions).length) throw new Error(failed[0] || "Aucun document reçu de l'IA.");
+      patchApp(appId, (a) => {
+        const docs = { ...(a.docs || {}) };
+        const dr = { ...(a.drafts || {}) };
+        for (const [t, v] of Object.entries(versions)) { docs[t] = [...(docs[t] || []), v]; delete dr[t]; }
+        const n = { ...a, docs, drafts: dr, docPrefs: prefs, docLanguage: lang || rest.language || a.docLanguage };
+        if (["new", "retained"].includes(a.stage)) n.stage = "prep";
+        return addLogEntry(n, "doc", `Généré : ${Object.keys(versions).map((t) => DOC_LABEL[t]).join(", ")}`);
+      });
+      const fixed = Object.values(drafts).reduce((n, d) => n + (d.autoFixed || 0), 0);
+      if (failed.length) toast(`Généré partiellement : ${failed[0]}`, "warn");
+      else toast(`Documents prêts à relire${fixed ? ` · ${fixed} correction(s) appliquée(s) automatiquement` : ""}`, "ok");
+      return true;
+    } finally { setGen(appId, null); }
+  });
+
+  /* Assistance ciblée depuis le studio : relecture, corrections, réécriture de section, lignes de positionnement. */
+  const docAI = (appId, action, payload = {}) => withBusy(`docai:${appId}:${action}`, async () => {
+    const { settings: s, profile: p } = R.current;
+    const { app, offer } = appAndOffer(appId);
+    const analysis = app.analysis || null;
+    const cvText = latestCvText(app);
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const args = { cvText, facts, employer: employerRule(app, p), appBlock: appMotivationBlock(app, offer, p, facts), ...payload, analysis, profile: p, offer };
+    const prompt = { review: P.review, fix: P.fixDoc, section: P.improveSection, headlines: P.headlines }[action];
+    if (!prompt) throw new Error("Action inconnue.");
+    const { data } = await askJSON(s, { system: SYSTEM_WRITER, prompt: withRules(prompt(args), p), maxTokens: action === "headlines" ? 2500 : 6000 });
+    return data || {};
+  });
+
+  /* « J'ai cette compétence » : ajoutée au profil et marquée comme prouvée pour cette candidature. */
+  /* 6b : règles apprises de vos corrections (au moins 3 documents corrigés) ; jamais activées seules. */
+  const learnRules = () => withBusy("learn-rules", async () => {
+    const { settings: s, profile: p } = R.current;
+    const l = learningOf(p);
+    const since = l.lastLearnAt ? new Date(l.lastLearnAt).getTime() : 0;
+    const edits = l.edits.filter((e) => new Date(e.at).getTime() > since);
+    if (new Set(edits.map((e) => `${e.appId}:${e.type}`)).size < 3) throw new Error("Corrigez et enregistrez au moins 3 documents générés avant l'apprentissage.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.learnRules(edits, writingRulesOf(p)), maxTokens: 3000 });
+    const found = (Array.isArray(data?.rules) ? data.rules : []).map((r) => ({ text: str(r?.text), evidence: str(r?.evidence) })).filter((r) => r.text).slice(0, 5);
+    setProfile((pp) => {
+      const cur = writingRulesOf(pp);
+      const nid = (i) => `L${Date.now().toString(36)}${i}`;
+      const add = found.filter((r) => !cur.some((c) => normText(c.text) === normText(r.text))).map((r, i) => ({ id: nid(i), text: r.text, evidence: r.evidence, active: false, origin: "apprise", createdAt: nowISO() }));
+      return { ...pp, writingRules: [...cur, ...add], ruleLearning: { ...learningOf(pp), lastLearnAt: nowISO() } };
+    });
+    toast(found.length ? `${found.length} règle(s) proposée(s), inactives : activez celles qui vous conviennent.` : "Aucune correction récurrente détectée.", found.length ? "ok" : "neutral");
+    return found.length;
+  });
+  /* 6c / 6d : CV maître par langue et puces verrouillées. */
+  const setMasterCv = (lang, text, sourceAppId) => setProfile((p) => ({ ...p, masterCv: { ...(p.masterCv || {}), [lang]: { text, at: nowISO(), sourceAppId: sourceAppId || null } } }));
+  const clearMasterCv = (lang) => setProfile((p) => { const m = { ...(p.masterCv || {}) }; delete m[lang]; return { ...p, masterCv: m }; });
+  const toggleLockedBullet = (text) => setProfile((p) => {
+    const cur = lockedOf(p);
+    const k = bulletKey(text);
+    return { ...p, lockedBullets: cur.some((x) => bulletKey(x) === k) ? cur.filter((x) => bulletKey(x) !== k) : [...cur, String(text).replace(/^[-•*]\s*/, "").trim()] };
+  });
+
+  /* Entretien de motivation : l'IA range les réponses dans la fiche, en reformulant seulement. */
+  const draftMotivation = (answers) => withBusy("motiv-draft", async () => {
+    const { settings: s, profile: p } = R.current;
+    const filled = answers.filter((x) => str(x.a));
+    if (filled.length < 3) throw new Error("Répondez à au moins 3 questions.");
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.motivationDraft(filled, motivOf(p)), maxTokens: 6000 });
+    const d = data && typeof data === "object" ? data : {};
+    const t = (x) => (typeof x === "string" ? x.trim() : "");
+    const proposal = {
+      ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, t(d[f.id])])),
+      convictions: (Array.isArray(d.convictions) ? d.convictions : []).map((c) => t(c?.text ?? c)).filter(Boolean),
+      stories: (Array.isArray(d.stories) ? d.stories : []).map((x) => ({ title: t(x?.title), situation: t(x?.situation), action: t(x?.action), result: t(x?.result), lesson: t(x?.lesson) })).filter((x) => x.title || x.situation || x.action),
+      sectors: (Array.isArray(d.sectors) ? d.sectors : []).map(t).filter(Boolean),
+      followUps: (Array.isArray(d.followUps) ? d.followUps : []).map((f) => ({ field: t(f?.field), q: t(f?.q) })).filter((f) => f.q).slice(0, 3),
+    };
+    /* Garde-fou « rien ajouté » : tout chiffre absent des réponses est signalé. */
+    const src = new Set(sigNumbers(filled.map((x) => x.a).join("\n")));
+    const out = JSON.stringify({ ...proposal, followUps: [] });
+    proposal.inventedNumbers = sigNumbers(out).filter((n) => !src.has(n));
+    return proposal;
+  });
+
+  const declareSkill = (appId, term) => {
+    setProfile((p) => (p.skills.some((x) => normText(x) === normText(term)) ? p : { ...p, skills: [...p.skills, term] }));
+    patchApp(appId, (a) => (a.analysis ? { ...a, analysis: { ...a.analysis, keywords: a.analysis.keywords.map((k) => (k.term === term ? { ...k, status: "prouvé", evidence: "déclarée par vous (ajoutée au profil)" } : k)) } } : a));
+    toast(`« ${term} » ajouté à vos compétences`, "ok");
+  };
 
   const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
     const prev = a.docs?.[type]?.slice(-1)[0];
-    const { id: _i, createdAt: _c, origin: _o, instruction: _n, ...keep } = prev || {};
-    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition" };
-    return addLogEntry({ ...a, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, edits: _e, ...keep } = prev || {};
+    /* 6b / 7 : écart avec la dernière version IA (mesure des corrections manuelles, matière de l'apprentissage des règles). */
+    const base = [...(a.docs?.[type] || [])].reverse().find((x) => x.origin === "IA");
+    const delta = base && (type === "cv" || type === "letter") ? editDelta(base.text, text) : null;
+    if (delta && delta.hunks.length && !a.demo) {
+      setProfile((p) => {
+        const l = learningOf(p);
+        const entry = { id: uid("ed"), appId, type, lang: base.language || null, at: nowISO(), pct: delta.pct, hunks: delta.hunks };
+        return { ...p, ruleLearning: { ...l, edits: [...l.edits.filter((e) => !(e.appId === appId && e.type === type && e.baseId === base.id)), { ...entry, baseId: base.id }].slice(-40) } };
+      });
+    }
+    const v = { ...keep, ...extra, id: uid("doc"), text, subject, createdAt: nowISO(), origin: "édition", ...(delta ? { edits: { baseId: base.id, pct: delta.pct, changed: delta.changed } } : {}) };
+    const drafts = { ...(a.drafts || {}) };
+    delete drafts[type];
+    return addLogEntry({ ...a, drafts, docs: { ...a.docs, [type]: [...(a.docs?.[type] || []), v] } }, "doc", `${DOC_LABEL[type]} : nouvelle version (édition manuelle)`);
   });
-
-  /* ── Traduction des documents (structure et faits conservés) ───── */
-  const translateDoc = (appId, kind, from, to) => withBusy(`tr:${appId}:${kind}:${to}`, async () => {
-    const app = R.current.apps.find((a) => a.id === appId);
-    const offer = R.current.offers.find((o) => o.id === app?.offerId);
-    const src = latestDoc(app, offer, kind, from);
-    if (!src) throw new Error(`Aucune version ${LANG_FLAG[from]} à traduire.`);
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.translate(src.text, kind, from, to, offer), maxTokens: 12000, tier: "balanced", effort: "low" });
-    const text = typeof data?.text === "string" ? data.text.trim() : "";
-    if (!text) throw new Error("Traduction vide : réessayez.");
-    const { id: _i, createdAt: _c, origin: _o, instruction: _n, ...keep } = src;
-    const v = { ...keep, text, lang: to, from, id: uid("doc"), createdAt: nowISO(), origin: "traduction" };
-    patchApp(appId, (a) => addLogEntry({ ...a, docs: { ...a.docs, [kind]: [...(a.docs?.[kind] || []), v] } }, "doc", `${DOC_LABEL[kind]} traduit : ${LANG_FLAG[from]} → ${LANG_FLAG[to]}`));
-    return v;
-  });
-  const setAppDesign = (appId, design) => patchApp(appId, (a) => ({ ...a, design }));
-
-  /* ── Entraînement à l'entretien ─────────────────────────────────── */
-  const evaluatePractice = (appId, question, answer) => withBusy(`practice:${appId}`, async () => {
-    const app = R.current.apps.find((a) => a.id === appId);
-    const offer = R.current.offers.find((o) => o.id === app?.offerId);
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.practice(question, answer, offer, R.current.profile), maxTokens: 5000, tier: "balanced" });
-    const fb = {
-      score: clamp(Math.round(Number(data?.score) || 1), 1, 5), star: data?.star || {},
-      strengths: (data?.strengths || []).map(String).slice(0, 3), improvements: (data?.improvements || []).map(String).slice(0, 3),
-      improved: str(data?.improved), seconds: Number(data?.seconds) || Math.round((answer.split(/\s+/).length / 130) * 60),
-    };
-    patchApp(appId, (a) => ({ ...a, practice: [...(a.practice || []), { id: uid("pr"), at: nowISO(), question, answer, feedback: fb }] }));
-    return fb;
+  const saveDocDraft = (appId, type, draft) => patchApp(appId, (a) => {
+    const drafts = { ...(a.drafts || {}) };
+    if (draft) drafts[type] = { ...draft, at: nowISO() }; else delete drafts[type];
+    return { ...a, drafts };
   });
 
   /* ── Relances ───────────────────────────────────────────────────── */
@@ -3774,7 +4667,7 @@ export default function RadarApp() {
     const fu = app?.followUps.find((f) => f.id === fuId);
     const offer = O.find((o) => o.id === app?.offerId);
     const contact = C.find((c) => app?.contactIds?.includes(c.id));
-    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: P.followUp(app, offer, fu, p, contact), maxTokens: 3000, tier: "balanced", effort: "low" });
+    const { data } = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.followUp(app, offer, fu, p, contact), p), maxTokens: 3000 });
     if (!data?.body) throw new Error("Aucun texte reçu.");
     setFollowUp(appId, fuId, { draft: { subject: data.subject || "", body: data.body, createdAt: nowISO() } });
     toast("Relance rédigée — à relire", "ok");
@@ -3792,9 +4685,16 @@ export default function RadarApp() {
     const { settings: s, profile: p, apps: A, offers: O } = R.current;
     const app = A.find((a) => a.id === appId);
     const offer = O.find((o) => o.id === app?.offerId);
-    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: P.prep(offer, p), web: { maxUses: 6 }, maxTokens: 14000, tier: "deep" });
+    const brief = offer?.company ? R.current.briefs[briefKey(offer.company)] : null;
+    const facts = selectedFacts(app, offer, R.current.briefs);
+    const res = await askJSON(s, { system: SYSTEM_BASE, prompt: withRules(P.prep(offer, p, { facts: briefFresh(brief) ? brief.facts : [], appBlock: appMotivationBlock(app, offer, p, facts) }), p), web: { maxUses: briefFresh(brief) ? 3 : 6 }, maxTokens: 14000 });
     const d = res.data || {};
-    const seen = (u) => !!u && res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u));
+    const seen = (u) => !!u && (res.urls.some((x) => canonicalUrl(x) === canonicalUrl(u)) || (briefFresh(brief) && brief.facts.some((f) => canonicalUrl(f.url) === canonicalUrl(u))));
+    /* Les faits vérifiés de la préparation enrichissent la fiche entreprise (réutilisée par la lettre). */
+    if (offer?.company) {
+      const nb = makeBrief({ company: offer.company, summary: d.company?.summary, facts: (d.company?.facts || []).map((f) => ({ text: f?.text, url: f?.sourceUrl })), origin: "prep", verifiedUrls: [...res.urls, ...(briefFresh(brief) ? brief.facts.map((f) => f.url) : [])] });
+      if (nb.facts.length) setBriefs((cur) => ({ ...cur, [briefKey(offer.company)]: mergeBriefs(cur[briefKey(offer.company)], nb) }));
+    }
     const prep = {
       createdAt: nowISO(),
       summary: str(d.company?.summary),
@@ -3830,7 +4730,7 @@ export default function RadarApp() {
     const items = [];
     const th = settings.threshold;
     const offerOf = (a) => offers.find((o) => o.id === a.offerId);
-    apps.forEach((a) => {
+    apps.filter((a) => a.kind !== "base").forEach((a) => {
       const o = offerOf(a);
       const name = `${o?.title || "Poste"} · ${o?.company || NC}`;
       (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).forEach((f) => {
@@ -3839,18 +4739,16 @@ export default function RadarApp() {
       (a.interviews || []).filter((i) => { const d = daysFromToday(i.at); return d >= 0 && d <= 3; }).forEach((i) => {
         items.push({ id: `itv:${i.id}`, label: a.prep ? `Entretien ${relDay(i.at)}` : `Préparer l'entretien (${relDay(i.at)})`, detail: name, due: i.at, weight: 1, go: () => openApp(a.id, "prep"), demo: a.demo });
       });
-      if (a.stage === "retained" && !Object.keys(a.docs || {}).length) items.push({ id: `doc:${a.id}`, label: "Préparer le dossier de candidature", detail: name, weight: 2, go: () => openApp(a.id, "docs"), demo: a.demo });
+      if (a.stage === "retained" && !Object.keys(a.docs || {}).length) items.push({ id: `doc:${a.id}`, label: "Préparer le dossier de candidature", detail: name, weight: 2, go: () => setStudio({ appId: a.id, type: "cv" }), demo: a.demo });
       if (a.stage === "prep" && daysFromToday(a.updatedAt) <= -3) items.push({ id: `send:${a.id}`, label: "Finaliser et envoyer la candidature", detail: name, weight: 2, go: () => openApp(a.id, "docs"), demo: a.demo });
-      const silent = silenceDays(a);
-      if (silent !== null && silent >= (settings.ghostDays || 21)) items.push({ id: `ghost:${a.id}`, label: `Sans nouvelles depuis ${silent} j : relancer ou clôturer`, detail: name, weight: 2, go: () => openApp(a.id, "track"), demo: a.demo });
     });
-    const pendingMail = inbox.replies.length + inbox.untracked.length;
-    if (pendingMail) items.push({ id: "inbox", label: `${pendingMail} e-mail(s) détecté(s) à valider`, detail: "Réponses et candidatures trouvées dans Gmail", weight: 1, go: () => setReplyOpen(true) });
     offers
-      .filter((o) => o.status === "new" && o.score && o.score.value >= th)
-      .sort((a, b) => b.score.value - a.score.value)
-      .slice(0, 3)
-      .forEach((o) => items.push({ id: `tri:${o.id}`, label: `Trier une offre à ${o.score.value}`, detail: `${o.title} · ${o.company || NC}`, weight: 2, go: () => openOffer(o.id), demo: o.demo }));
+      .filter((o) => ["new", "pipeline"].includes(o.status) && deadlineIn(o) !== null && deadlineIn(o) >= 0 && deadlineIn(o) <= 3)
+      .forEach((o) => items.push({ id: `dl:${o.id}`, label: `Date limite ${relDay(o.deadline)}`, detail: `${o.title} · ${o.company || NC}`, due: o.deadline, weight: 1, go: () => openOffer(o.id) }));
+    const unreadGood = offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo && o.score && o.score.value >= th);
+    if (unreadGood.length) items.push({ id: "tri-good", label: `Trier ${unreadGood.length} offre(s) non lue(s) au-dessus de ${th}`, detail: unreadGood.slice(0, 2).map((o) => o.title).join(" · "), weight: 1, go: () => setView("offers") || setOfferPreset({ tab: "unread", minScore: th }) });
+    const unreadAll = offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length;
+    if (unreadAll > unreadGood.length) items.push({ id: "tri-all", label: `Trier ${unreadAll} offre(s) non lue(s)`, detail: "Sélection multiple et actions de masse disponibles", weight: 2, go: () => setView("offers") || setOfferPreset({ tab: "unread" }) });
     if (staleIds.length) items.push({ id: "stale", label: `Recalculer ${staleIds.length} score(s) obsolète(s)`, detail: "Les critères ont changé", weight: 3, go: () => rescoreStale() });
     if (apps.some((a) => !a.demo && a.sentAt && a.stage !== "closed") && (!settings.lastReplyCheckAt || (Date.now() - new Date(settings.lastReplyCheckAt)) / 36e5 > 48)) items.push({ id: "replies", label: "Vérifier les réponses des recruteurs", detail: `Dernière vérification : ${relTime(settings.lastReplyCheckAt)}`, weight: 2, go: () => checkReplies() });
     if (!settings.lastWatchAt || (Date.now() - new Date(settings.lastWatchAt)) / 36e5 > 24) items.push({ id: "watch", label: "Lancer la veille", detail: `Dernière collecte : ${relTime(settings.lastWatchAt)}`, weight: 3, go: () => runWatch() });
@@ -3858,11 +4756,11 @@ export default function RadarApp() {
     return items
       .map((it) => ({ ...it, ai: order[it.id] }))
       .sort((a, b) => (a.ai?.priority ?? a.weight) - (b.ai?.priority ?? b.weight) || new Date(a.due || 8.64e15) - new Date(b.due || 8.64e15));
-  }, [apps, offers, inbox, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, settings.ghostDays, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [apps, offers, settings.threshold, settings.lastWatchAt, settings.lastReplyCheckAt, staleIds, todayAI]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const prioritizeToday = () => withBusy("today", async () => {
     if (!todayItems.length) return;
-    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000, tier: "fast", effort: "low" });
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.today(todayItems), maxTokens: 3000 });
     const order = {};
     (data?.ordered || []).forEach((x) => { if (x?.id) order[x.id] = { priority: clamp(Number(x.priority) || 2, 1, 3), reason: str(x.reason) }; });
     setTodayAI({ order, at: nowISO() });
@@ -3870,7 +4768,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, ratings, media, inbox });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -3880,9 +4778,7 @@ export default function RadarApp() {
     setOffers(obj.offers || []);
     setApps(obj.apps || []);
     setContacts(obj.contacts || []);
-    setRatings(obj.ratings || {});
-    setMedia(obj.media || {});
-    setInbox({ replies: [], untracked: [], ...(obj.inbox || {}) });
+    if (obj.briefs && typeof obj.briefs === "object") setBriefs(obj.briefs);
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -3896,11 +4792,8 @@ export default function RadarApp() {
     setOffers([]);
     setApps([]);
     setContacts([]);
-    setRatings({});
-    setMedia({});
-    setInbox({ replies: [], untracked: [] });
+    setBriefs({});
     setTodayAI(null);
-    setOfferQueue([]);
     toast("Plateforme réinitialisée", "ok");
   };
   const clearDemo = () => {
@@ -3917,18 +4810,6 @@ export default function RadarApp() {
     toast("Exemples rechargés", "ok");
   };
   const hasDemo = offers.some((o) => o.demo) || apps.some((a) => a.demo) || contacts.some((c) => c.demo);
-  /* Allège les offres écartées ou expirées anciennes (description courte, analyse détaillée retirée). */
-  const compactOffers = (days = 90) => {
-    const lim = Date.now() - days * 864e5;
-    const old = (o) => ["dismissed", "expired"].includes(o.status) && !o.compacted && new Date(o.dismissedAt || o.expiredAt || o.lastSeenAt || o.collectedAt).getTime() < lim;
-    const n = R.current.offers.filter(old).length;
-    if (!n) { toast(`Aucune offre écartée depuis plus de ${days} jours.`, "neutral"); return; }
-    setOffers((l) => l.map((o) => (old(o) ? {
-      ...o, description: o.description ? o.description.slice(0, 280) : null, mergeHistory: undefined, compacted: true,
-      score: o.score ? { ...o.score, breakdown: [], strengths: [], gaps: [], questions: [], must: [], nice: [], missions: [] } : null,
-    } : o)));
-    toast(`${n} offre(s) allégée(s)`, "ok");
-  };
 
   /* ── Raccourcis clavier ─────────────────────────────────────────── */
   useEffect(() => {
@@ -3947,7 +4828,11 @@ export default function RadarApp() {
     const norm = raw
       .map((r) => {
         const o = normalizeOffer(r, { sourceName: str(r?.sourceName) || "Veille planifiée", via: "veille planifiée (recherche web)" });
-        if (o) o.sources[0].verified = r?.verified === true ? true : null;
+        if (o) {
+          o.sources[0].verified = r?.verified === true ? true : null;
+          const live = ["open", "closed", "unknown"].includes(r?.liveness) ? r.liveness : null;
+          if (live && live !== "unknown") o.link = { state: live, evidence: str(r.livenessEvidence), at: str(d.createdAt) || nowISO(), method: str(r.livenessMethod) || "veille" };
+        }
         return o;
       })
       .filter(Boolean);
@@ -3958,7 +4843,7 @@ export default function RadarApp() {
     setSources((l) => l.map((x) => (counts[x.name] !== undefined || (d.sourcesSearched || []).includes(x.name) ? { ...x, lastRunAt: at, lastCount: counts[x.name] || 0, lastError: null } : x)));
     setSettings((x) => ({ ...x, lastWatchAt: at, importedRuns: [...(x.importedRuns || []), snapDoc.id].slice(-300) }));
     R.current.settings = { ...R.current.settings, importedRuns: [...(R.current.settings.importedRuns || []), snapDoc.id] };
-    if (norm.length || raw.length) toast(`Veille reçue : ${r.added.length} nouvelle(s) offre(s), ${r.merged.length} fusion(s). Scorez-les depuis la vue d'ensemble.`, "ok");
+    if (norm.length || raw.length) toast(`Veille reçue : ${r.kept.length} nouvelle(s) offre(s) retenue(s), ${r.filtered} écartée(s) par vos règles, ${r.merged.length} déjà connue(s). Le scoring suit automatiquement.`, "ok");
   };
   useEffect(() => {
     if (!loaded || RT.mode !== "published" || !RT.db) return undefined;
@@ -3969,6 +4854,22 @@ export default function RadarApp() {
       subs.push(RT.db.doc("veille/status").onSnapshot((d) => setVeille((v) => ({ ...v, status: d.exists ? d.data() : null })), quiet));
       subs.push(RT.db.doc("veille/config").onSnapshot((d) => setVeille((v) => ({ ...v, configLoaded: true, configSig: d.exists ? d.data()?.sig || null : null })), quiet));
       subs.push(RT.db.collection("veille_inbox").onSnapshot((snap) => snap.docs.forEach(ingestRun), quiet));
+      subs.push(RT.db.collection("veille_verify").onSnapshot((snap) => snap.docs.forEach(ingestVerify), quiet));
+      /* Fiches entreprise déposées par la Routine (tâche « brief ») : seuls les faits avec URL sont repris. */
+      subs.push(RT.db.collection("veille_briefs").onSnapshot((snap) => {
+        setBriefs((cur) => {
+          let changed = false;
+          const next = { ...cur };
+          snap.docs.forEach((d) => {
+            const r = d.data() || {};
+            const key = briefKey(r.company || d.id);
+            if (!key || (cur[key] && cur[key].routineAt === r.createdAt)) return;
+            next[key] = { ...mergeBriefs(cur[key], makeBrief({ company: r.company || d.id, summary: r.summary, facts: r.facts, origin: "routine", createdAt: r.createdAt })), routineAt: r.createdAt };
+            changed = true;
+          });
+          return changed ? next : cur;
+        });
+      }, quiet));
       subs.push(RT.db.collection("veille_ratings").onSnapshot((snap) => {
         setRatings((cur) => {
           let changed = false;
@@ -3987,7 +4888,7 @@ export default function RadarApp() {
   }, [loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* La configuration lue par la veille planifiée suit les critères actifs et les sources (critères et domaines uniquement). */
-  const cfgNow = useMemo(() => veilleConfig(activeVersion(criteria), sources, settings), [criteria, sources, settings.lookbackDays, settings.maxPerSource]); // eslint-disable-line react-hooks/exhaustive-deps
+  const cfgNow = useMemo(() => veilleConfig(activeVersion(criteria), sources, settings), [criteria, sources, settings.lookbackDays, settings.maxPerSource, settings.rules]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (RT.mode !== "published" || !RT.db || !veille.configLoaded || veille.configSig === cfgNow.sig || storageState.readOnly) return undefined;
     const t = setTimeout(() => { RT.db.doc("veille/config").set({ ...cfgNow, updatedAt: nowISO() }).catch(() => {}); }, 1500);
@@ -4002,8 +4903,6 @@ export default function RadarApp() {
     const s = R.current.settings;
     const stale = (iso) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= (s.autoWatchHours || 24);
     const t = setTimeout(async () => {
-      const due = (iso, h) => !iso || (Date.now() - new Date(iso).getTime()) / 36e5 >= h;
-      if (s.autoReplies && due(s.lastReplyCheckAt, s.autoRepliesHours || 12) && monitoredApps().length && (RT.mode !== "published" || RT.mcp)) await checkReplies({ auto: true });
       if (s.autoGmail && stale(s.lastGmailImportAt)) await importGmail(s.gmailDays);
       if (s.autoWatch && RT.mode !== "published" && stale(s.lastWatchAt)) { toast("Veille automatique lancée (dernière collecte ancienne)", "neutral"); await runWatch(); }
     }, 1500);
@@ -4012,24 +4911,25 @@ export default function RadarApp() {
 
   const go = (v, preset) => { setView(v); setMobileNav(false); if (preset !== undefined) setOfferPreset(preset); window.scrollTo?.({ top: 0 }); };
 
+  const pApps = useMemo(() => apps.filter((a) => a.kind !== "base"), [apps]);
   const dueCount = useMemo(() => apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0), [apps]);
-  const newCount = useMemo(() => offers.filter((o) => o.status === "new").length, [offers]);
+  const unreadCount = useMemo(() => offers.filter((o) => o.status === "new" && !o.seenAt && !o.demo).length, [offers]);
 
   const ctx = {
-    T, settings, setSettings, profile, setProfile, criteria, setCriteria, sources, setSources, offers, setOffers, apps, contacts,
+    T, settings, setSettings, profile, setProfile, criteria, setCriteria, sources, setSources, offers, setOffers, apps: pApps, allApps: apps, contacts,
     busy, progress, toast, go, view, openOffer, openApp, staleIds, todayItems, todayAI, hasDemo, offerPreset, setOfferPreset,
     runWatch, importGmail, importManual, scoreOffers, rescoreStale, saveCriteriaVersion, restoreVersion, generateKeywords,
     addToPipeline, moveApp, requestMove, addInterview, patchApp, logApp, patchOffer, patchSource,
-    createGmailDraft, createCalendarEvent, calTitle, generateDocs, saveDocVersion,
+    createGmailDraft, createCalendarEvent, calTitle, generateDocs, draftMotivation, learnRules, setMasterCv, clearMasterCv, toggleLockedBullet, saveDocVersion, saveDocDraft, genStatus, runAnalysis, docAI, declareSkill,
+    openStudio: (appId, type = "cv") => setStudio({ appId, type }), setOfferAdText, patchOfferNow, createSpontaneous, setSpontOpen,
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
-    ratings, requestRatings, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
-    media, setMedia, inbox, setReplyOpen, resolveUntracked, translateDoc, setAppDesign, evaluatePractice, compactOffers,
-    openStudio: (appId, kind = "cv") => setStudio({ appId, kind }), openExport: (appId) => setExportFor(appId), openCompare: (ids) => setCompare(ids),
-    monitoredCount: apps.filter((a) => !a.demo && a.stage !== "closed" && (a.sentAt || ["prep", "sent", "followup", "interview", "offer"].includes(a.stage))).length,
+    ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
+    bulkAction, lastBulk, setLastBulk, undoBulk, runRules, dedupeNow, requestVerify, dupePending,
+    openDupePending: () => dupePending && setDupeProposals(dupePending), visitPrev, unreadCount,
   };
 
   const View = { dashboard: DashboardView, offers: OffersView, pipeline: PipelineView, assistant: AssistantView, followups: FollowupsView, contacts: ContactsView, sources: SourcesView, profile: ProfileView, privacy: PrivacyView }[view] || DashboardView;
@@ -4043,13 +4943,13 @@ export default function RadarApp() {
           <div className="flex">
             {/* Navigation latérale */}
             <aside className={`hidden md:flex flex-col sticky top-0 h-screen shrink-0 transition-all duration-200 ${collapsed ? "w-16" : "w-60"} px-2 py-5`} aria-label="Navigation principale">
-              <SidebarContent collapsed={collapsed} dueCount={dueCount} newCount={newCount} onToggle={() => setSettings((s) => ({ ...s, sidebarCollapsed: !s.sidebarCollapsed }))} />
+              <SidebarContent collapsed={collapsed} dueCount={dueCount} newCount={unreadCount} onToggle={() => setSettings((s) => ({ ...s, sidebarCollapsed: !s.sidebarCollapsed }))} />
             </aside>
             {mobileNav && (
               <div className="md:hidden fixed inset-0 z-40">
                 <div className="absolute inset-0" style={{ background: "rgba(12,10,9,0.35)" }} onClick={() => setMobileNav(false)} />
                 <aside className={`absolute left-0 top-0 h-full w-72 px-3 py-5 flex flex-col ${T.app}`} style={T.shadow} aria-label="Navigation principale">
-                  <SidebarContent collapsed={false} dueCount={dueCount} newCount={newCount} onToggle={() => setMobileNav(false)} mobile />
+                  <SidebarContent collapsed={false} dueCount={dueCount} newCount={unreadCount} onToggle={() => setMobileNav(false)} mobile />
                 </aside>
               </div>
             )}
@@ -4062,9 +4962,22 @@ export default function RadarApp() {
                 </div>
               )}
               <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-10 py-8 md:py-10">
-                {storageState.message && <Notice tone="warn" icon={AlertTriangle} className="mb-6">{storageState.message}</Notice>}
+                {storageState.message && (
+                  <Notice tone="warn" icon={AlertTriangle} className="mb-6">
+                    {storageState.message}
+                    {storageState.retry && <Btn size="sm" variant="soft" icon={RefreshCw} className="ml-2" onClick={() => window.location.reload()}>Réessayer</Btn>}
+                  </Notice>
+                )}
+                {recovery && (
+                  <Notice tone="ok" icon={CheckCircle2} className="mb-6">
+                    Données endommagées réparées : {recovery.map((r) => `${{ offers: "offres", apps: "candidatures", contacts: "contacts" }[r.name] || r.name}${r.count !== null ? ` (${r.count} récupérée(s))` : " (valeurs par défaut)"}`).join(", ")}.
+                    Une copie brute est conservée. L'enregistrement fonctionne de nouveau, au format sécurisé.
+                    <Btn size="sm" variant="ghost" className="ml-2" onClick={() => setRecovery(null)}>OK</Btn>
+                  </Notice>
+                )}
                 {!loaded ? (
                   <div className="space-y-6">
+                    {bootMsg && <p className={`text-sm ${T.muted}`} aria-live="polite">{bootMsg}</p>}
                     <Skeleton lines={2} />
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">{[0, 1, 2, 3].map((i) => <Card key={i} className="p-6"><Skeleton lines={2} /></Card>)}</div>
                     <Card className="p-6"><Skeleton lines={5} /></Card>
@@ -4078,12 +4991,11 @@ export default function RadarApp() {
 
           {offerSel && <OfferDrawer key={offerSel} id={offerSel} onClose={() => setOfferSel(null)} />}
           {appSel && <AppDrawer id={appSel.id} tab={appSel.tab} setTab={(t) => setAppSel((s) => ({ ...s, tab: t }))} onClose={() => setAppSel(null)} />}
+          {studio && <DocStudio key={studio.appId} appId={studio.appId} type={studio.type} setType={(t) => setStudio((x) => ({ ...x, type: t }))} onClose={() => setStudio(null)} />}
           <ManualImportModal open={manualOpen} onClose={() => setManualOpen(false)} />
+          <SpontaneousModal open={spontOpen} onClose={() => setSpontOpen(false)} />
           <DupeReviewModal groups={dupeProposals} setGroups={setDupeProposals} onApply={applyDupeProposals} offers={offers} apps={apps} />
-          <ReplyReviewModal open={replyOpen} onClose={() => setReplyOpen(false)} inbox={inbox} setInbox={setInbox} onResolve={resolveReply} onResolveUntracked={resolveUntracked} apps={apps} offers={offers} />
-          {studio && <Studio key={`${studio.appId}:${studio.kind}`} appId={studio.appId} initialKind={studio.kind} onClose={() => setStudio(null)} />}
-          {exportFor && <ExportModal appId={exportFor} onClose={() => setExportFor(null)} />}
-          {compare && <CompareModal ids={compare} onClose={() => setCompare(null)} />}
+          <ReplyReviewModal replies={replyProposals} setReplies={setReplyProposals} onResolve={resolveReply} apps={apps} offers={offers} />
           <StageDialog dialog={stageDialog} onClose={() => setStageDialog(null)} />
           <ConfirmExternalModal confirm={confirm} onClose={() => setConfirm(null)} />
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
@@ -4094,7 +5006,7 @@ export default function RadarApp() {
             </div>
           )}
 
-          <div className="fixed bottom-4 right-4 left-4 sm:left-auto flex flex-col gap-2 items-end" style={{ zIndex: 80 }} aria-live="polite" role="status">
+          <div className={`fixed bottom-4 left-4 flex flex-col gap-2 ${studio ? "right-4 sm:right-auto items-start" : "right-4 sm:left-auto items-end"}`} style={{ zIndex: 80 }} aria-live="polite" role="status">
             {toasts.map((t) => (
               <div key={t.id} className="max-w-sm w-full sm:w-auto rounded-2xl px-4 py-3 text-sm flex items-start gap-2" style={{ ...T.glass, ...T.shadow }}>
                 {t.tone === "danger" ? <AlertTriangle className="w-4 h-4 mt-0.5 text-rose-500 shrink-0" /> : t.tone === "ok" ? <CheckCircle2 className={`w-4 h-4 mt-0.5 shrink-0 ${T.accentText}`} /> : t.tone === "warn" ? <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-500 shrink-0" /> : <Info className={`w-4 h-4 mt-0.5 shrink-0 ${T.muted}`} />}
@@ -4207,25 +5119,19 @@ function CommandPalette({ open, onClose }) {
       { group: "Actions", label: "Lancer la veille", hint: "toutes les sources actives", icon: Play, run: run(() => app.runWatch()) },
       { group: "Actions", label: "Importer les alertes e-mail (Gmail)", icon: Mail, run: run(() => app.importGmail()) },
       { group: "Actions", label: "Importer une annonce (URL ou texte)", icon: Clipboard, run: run(() => app.setManualOpen(true)) },
+      { group: "Actions", label: "Candidature spontanée ou CV sans offre", hint: "studio", icon: Plus, run: run(() => app.setSpontOpen(true)) },
       { group: "Actions", label: "Voir les relances dues", icon: BellRing, run: run(() => app.go("followups")) },
-      { group: "Actions", label: "Vérifier Gmail (réponses, accusés, candidatures non suivies)", icon: MailCheck, run: run(() => app.checkReplies()) },
-      ...(app.inbox.replies.length + app.inbox.untracked.length ? [{ group: "Actions", label: "Valider les e-mails détectés", hint: `${app.inbox.replies.length + app.inbox.untracked.length}`, icon: Inbox, run: run(() => app.setReplyOpen(true)) }] : []),
+      { group: "Actions", label: "Vérifier les réponses des recruteurs (Gmail)", icon: MailCheck, run: run(() => app.checkReplies()) },
       { group: "Actions", label: "Détecter les doublons (IA)", icon: GitMerge, run: run(() => app.detectDuplicates()) },
       { group: "Actions", label: "Recalculer les scores obsolètes", hint: `${app.staleIds.length}`, icon: RefreshCw, run: run(() => app.rescoreStale()) },
       { group: "Actions", label: "Prioriser mes actions du jour (IA)", icon: Wand2, run: run(() => { app.go("dashboard"); app.prioritizeToday(); }) },
       { group: "Actions", label: "Exporter une sauvegarde JSON", icon: Download, run: run(() => app.go("privacy")) },
       ...NAV.map((n) => ({ group: "Navigation", label: n.label, icon: n.icon, run: run(() => app.go(n.id)) })),
       ...app.apps
-        .filter((a) => (a.docs?.cv || a.docs?.letter || []).length)
-        .map((a) => {
-          const o = app.offers.find((x) => x.id === a.offerId);
-          return { group: "Studio CV & lettre", label: `Studio : ${o?.title || "poste"}`, hint: o?.company || "", icon: Palette, run: run(() => app.openStudio(a.id, "cv")) };
-        }),
-      ...app.apps
         .filter((a) => ["new", "retained", "prep"].includes(a.stage))
         .map((a) => {
           const o = app.offers.find((x) => x.id === a.offerId);
-          return { group: "Préparer candidature", label: `Préparer : ${o?.title || "poste"}`, hint: o?.company || "", icon: Sparkles, run: run(() => app.openApp(a.id, "docs")) };
+          return { group: "Préparer candidature", label: `Préparer : ${o?.title || "poste"}`, hint: o?.company || "", icon: Sparkles, run: run(() => app.openStudio(a.id, "cv")) };
         }),
       ...app.offers
         .filter(isActiveOffer)
@@ -4235,7 +5141,7 @@ function CommandPalette({ open, onClose }) {
     const nq = normText(q);
     const filtered = nq ? list.filter((i) => normText(`${i.label} ${i.hint || ""} ${i.group}`).includes(nq)) : list.filter((i) => i.group !== "Offres");
     return filtered.slice(0, 40);
-  }, [open, q, app.apps, app.offers, app.staleIds, app.inbox]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, q, app.apps, app.offers, app.staleIds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!open) return null;
   const onKey = (e) => {
@@ -4332,17 +5238,16 @@ function weekKey(iso) {
 
 function DashboardView() {
   const T = useT();
-  const { offers, apps, settings, go, runWatch, busy, todayItems, prioritizeToday, todayAI, openOffer, profile, staleIds, rescoreStale, hasDemo } = useApp();
+  const { offers, apps, settings, go, runWatch, busy, todayItems, prioritizeToday, todayAI, openOffer, profile, staleIds, rescoreStale, hasDemo, unreadCount, visitPrev } = useApp();
   const th = settings.threshold;
 
   const k = useMemo(() => {
-    const weekAgo = Date.now() - 7 * 864e5;
     const sent = apps.filter((a) => a.sentAt);
     const responded = sent.filter((a) => ["interview", "offer"].includes(a.stage) || (a.interviews || []).length || (a.stage === "closed" && a.closed?.outcome !== "withdrawn"));
     const upcoming = apps.flatMap((a) => (a.interviews || []).filter((i) => new Date(i.at) >= startOfDay(new Date())));
     return {
-      fresh: offers.filter((o) => o.status === "new" && new Date(o.collectedAt).getTime() >= weekAgo).length,
-      above: offers.filter((o) => isActiveOffer(o) && o.score?.value >= th).length,
+      todo: offers.filter((o) => o.status === "new").length,
+      above: offers.filter((o) => o.status === "new" && o.score?.value >= th).length,
       active: apps.filter((a) => a.stage !== "closed").length,
       due: apps.reduce((n, a) => n + (a.followUps || []).filter((f) => f.status === "pending" && daysFromToday(f.due) <= 0).length, 0),
       interviews: upcoming.length,
@@ -4354,7 +5259,7 @@ function DashboardView() {
 
   const bySource = useMemo(() => {
     const m = {};
-    offers.forEach((o) => [...new Set((o.sources || []).map((s) => s.name))].forEach((n) => { m[n] = (m[n] || 0) + 1; }));
+    offers.filter((o) => !o.spontaneous).forEach((o) => [...new Set((o.sources || []).map((s) => s.name))].forEach((n) => { m[n] = (m[n] || 0) + 1; }));
     return Object.entries(m).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count).slice(0, 8);
   }, [offers]);
 
@@ -4374,7 +5279,13 @@ function DashboardView() {
     return steps.map(([id, label]) => ({ label, count: apps.filter((a) => (a.reached ?? (a.stage === "closed" ? 0 : STAGE_INDEX[a.stage])) >= STAGE_INDEX[id]).length }));
   }, [apps]);
 
-  const top = useMemo(() => offers.filter((o) => isActiveOffer(o) && !isOldOffer(o, settings.hideOlderThan) && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
+  const top = useMemo(() => offers.filter((o) => ["new", "pipeline"].includes(o.status) && o.score).sort((a, b) => b.score.value - a.score.value).slice(0, 5), [offers]);
+  const deadlines = useMemo(() => offers.filter((o) => ["new", "pipeline"].includes(o.status) && deadlineIn(o) !== null && deadlineIn(o) >= 0 && deadlineIn(o) <= 21).sort((a, b) => new Date(a.deadline) - new Date(b.deadline)).slice(0, 6), [offers]);
+  const since = useMemo(() => {
+    const ref = new Date(visitPrev || addDays(nowISO(), -3));
+    const arr = offers.filter((o) => new Date(o.collectedAt) > ref && !o.demo && !o.spontaneous);
+    return { total: arr.length, kept: arr.filter((o) => ["new", "pipeline"].includes(o.status)).length, auto: arr.filter((o) => o.dismissedBy === "auto").length, good: arr.filter((o) => o.status === "new" && o.score?.value >= th).length };
+  }, [offers, visitPrev, th]);
   const hour = new Date().getHours();
   const hello = hour < 12 ? "Bonjour" : hour < 18 ? "Bon après-midi" : "Bonsoir";
 
@@ -4397,9 +5308,24 @@ function DashboardView() {
         </Notice>
       )}
 
+      {since.total > 0 && (
+        <Card className="p-5 mb-4">
+          <div className="flex flex-col md:flex-row md:items-center gap-3">
+            <div className="flex-1 text-sm">
+              <span className="font-medium">Depuis votre dernière visite{visitPrev ? ` (${relTime(visitPrev)})` : ""} :</span>{" "}
+              {since.total} offre(s) arrivée(s) · <strong>{since.kept} retenue(s) à trier</strong>{since.good ? ` dont ${since.good} au-dessus de ${th}` : ""} · {since.auto} écartée(s) ou expirée(s) automatiquement par vos règles.
+            </div>
+            <div className="flex gap-2">
+              <Btn size="sm" variant="primary" icon={Inbox} onClick={() => go("offers", { tab: "unread" })}>Trier les non lues ({unreadCount})</Btn>
+              <Btn size="sm" icon={History} onClick={() => go("offers", { tab: "arrivals" })}>Voir les arrivées</Btn>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-4">
-        <Kpi label="Nouvelles offres" value={k.fresh} sub="7 derniers jours" icon={Inbox} onClick={() => go("offers", { status: "new" })} />
-        <Kpi label={`Au-dessus de ${th}`} value={k.above} sub="score ≥ seuil" icon={Gauge} onClick={() => go("offers", { minScore: th })} />
+        <Kpi label="Non lues" value={unreadCount} sub={`${k.todo} à traiter au total`} icon={Inbox} onClick={() => go("offers", { tab: "unread" })} />
+        <Kpi label={`Au-dessus de ${th}`} value={k.above} sub="à traiter, score ≥ seuil" icon={Gauge} onClick={() => go("offers", { tab: "todo", minScore: th })} />
         <Kpi label="Candidatures actives" value={k.active} sub="hors clôturées" icon={Columns} onClick={() => go("pipeline")} />
         <Kpi label="Relances dues" value={k.due} sub="aujourd'hui ou en retard" icon={BellRing} onClick={() => go("followups")} />
         <Kpi label="Entretiens à venir" value={k.interviews} sub={k.nextInterview ? `prochain ${relDay(k.nextInterview.at)}` : "aucun planifié"} icon={CalendarPlus} onClick={() => go("followups")} />
@@ -4448,6 +5374,28 @@ function DashboardView() {
                       <span className={`block text-xs truncate ${T.muted}`}>{show(o.company)} · {show(o.location)} · {commuteLabel(o.commute)}</span>
                     </span>
                     {o.demo && <Chip>exemple</Chip>}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="p-6 lg:col-span-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" onClick={() => go("offers", { tab: "deadlines" })}>Tout voir</Btn>}>Dates limites proches</SectionTitle>
+          {deadlines.length === 0 ? (
+            <Empty icon={CalendarClock} title="Aucune date limite dans les 3 semaines" text="Les dates limites sont extraites des annonces quand elles sont indiquées." />
+          ) : (
+            <ul className="space-y-1">
+              {deadlines.map((o) => (
+                <li key={o.id}>
+                  <button type="button" onClick={() => openOffer(o.id)} className={`w-full flex items-center gap-3 rounded-2xl px-2 py-2 text-left ${T.subHover} ${T.ring}`}>
+                    <span className="w-14 shrink-0"><DeadlineChip o={o} /></span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm font-medium truncate">{o.title}</span>
+                      <span className={`block text-xs truncate ${T.muted}`}>{show(o.company)} · limite {fmtDate(o.deadline)}{o.status === "pipeline" ? " · dans le pipeline" : ""}</span>
+                    </span>
+                    <ScorePill score={o.score} threshold={th} />
                   </button>
                 </li>
               ))}
@@ -4516,71 +5464,148 @@ function DashboardView() {
    11. OFFRES
    ════════════════════════════════════════════════════════════════════════ */
 
-const DEFAULT_FILTERS = { q: "", source: "", minScore: 0, maxCommute: 0, status: "active", sort: "score", hideOld: true, verdict: "" };
-const isFresh = (o) => o.status === "new" && Date.now() - new Date(o.collectedAt).getTime() < 48 * 36e5;
+const DEFAULT_FILTERS = { tab: "todo", q: "", source: "", minScore: 0, maxCommute: 0, pubWithin: 0, sort: "score", origin: "" };
+const OFFER_TABS = [
+  { id: "todo", label: "À traiter", hint: "Offres actives pas encore décidées" },
+  { id: "unread", label: "Non lues", hint: "À traiter, jamais ouvertes" },
+  { id: "arrivals", label: "Arrivées", hint: "Collectées depuis votre dernière visite (toutes, y compris triées automatiquement)" },
+  { id: "deadlines", label: "Échéances", hint: "Offres actives avec date limite de candidature" },
+  { id: "pipeline", label: "Pipeline" },
+  { id: "dismissed", label: "Écartées" },
+  { id: "expired", label: "Expirées" },
+  { id: "all", label: "Toutes" },
+];
+const dayLabel = (iso) => {
+  const n = -daysFromToday(iso);
+  if (n <= 0) return "Aujourd'hui";
+  if (n === 1) return "Hier";
+  if (n < 7) return new Date(iso).toLocaleDateString("fr-BE", { weekday: "long", day: "numeric", month: "short" });
+  return `Semaine du ${fmtDate(addDays(startOfDay(iso).toISOString(), -((new Date(iso).getDay() + 6) % 7)))}`;
+};
 
 function OffersView() {
   const T = useT();
-  const { offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates, setOfferQueue, ratings, requestRatings, openCompare } = useApp();
+  const {
+    offers, settings, busy, runWatch, setManualOpen, openOffer, offerPreset, setOfferPreset, staleIds, rescoreStale, criteria, detectDuplicates,
+    setOfferQueue, ratings, requestRatings, bulkAction, lastBulk, setLastBulk, undoBulk, dedupeNow, dupePending, openDupePending, visitPrev, addToPipeline, triageOffer,
+  } = useApp();
   const [f, setF] = useState(DEFAULT_FILTERS);
-  const [dense, setDense] = useState(true);
-  const [picking, setPicking] = useState(false);
-  const [picked, setPicked] = useState([]);
-  const togglePick = (id) => setPicked((l) => (l.includes(id) ? l.filter((x) => x !== id) : l.length < 4 ? [...l, id] : l));
+  const [sel, setSel] = useState(() => new Set());
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const anchor = useRef(null);
   useEffect(() => {
     if (offerPreset) { setF({ ...DEFAULT_FILTERS, ...offerPreset }); setOfferPreset(null); }
   }, [offerPreset]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const sourceNames = useMemo(() => [...new Set(offers.flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [offers]);
+  const since = useMemo(() => visitPrev || addDays(nowISO(), -3), [visitPrev]); // stable : sinon la liste se recalcule à chaque rendu
+  const realOffers = useMemo(() => offers.filter((o) => !o.spontaneous), [offers]);
+  const inTab = useMemo(() => ({
+    todo: (o) => o.status === "new",
+    unread: (o) => o.status === "new" && !o.seenAt,
+    arrivals: (o) => new Date(o.collectedAt) > new Date(since),
+    deadlines: (o) => ["new", "pipeline"].includes(o.status) && !!o.deadline,
+    pipeline: (o) => o.status === "pipeline",
+    dismissed: (o) => o.status === "dismissed",
+    expired: (o) => o.status === "expired" || o.status === "closed",
+    all: () => true,
+  }), [since]);
+  const counts = useMemo(() => Object.fromEntries(OFFER_TABS.map((t) => [t.id, realOffers.filter(inTab[t.id]).length])), [realOffers, inTab]);
+
+  const sourceNames = useMemo(() => [...new Set(realOffers.flatMap((o) => (o.sources || []).map((s) => s.name)))].sort(), [realOffers]);
   const vid = activeVersion(criteria)?.id;
   const list = useMemo(() => {
     const nq = normText(f.q);
-    let l = offers.filter((o) => {
-      if (f.status === "active" && !isActiveOffer(o)) return false;
-      if (f.status === "new" && o.status !== "new") return false;
-      if (f.status === "dismissed" && !["dismissed", "expired"].includes(o.status)) return false;
-      if (f.status === "closed" && o.status !== "closed") return false;
-      if (f.hideOld && ["active", "new"].includes(f.status) && isOldOffer(o, settings.hideOlderThan)) return false;
-      if (f.status === "pipeline" && o.status !== "pipeline") return false;
+    const l = realOffers.filter((o) => {
+      if (!inTab[f.tab](o)) return false;
+      if (f.origin === "auto" && o.dismissedBy !== "auto") return false;
+      if (f.origin === "user" && o.dismissedBy === "auto") return false;
       if (f.source && !(o.sources || []).some((s) => s.name === f.source)) return false;
       if (f.minScore && !(o.score?.value >= f.minScore)) return false;
       if (f.maxCommute && !(o.commute && o.commute.minutes <= f.maxCommute)) return false;
-      if (f.verdict && offerVerdict(o, settings.threshold)?.id !== f.verdict) return false;
+      if (f.pubWithin) { const a = ageDays(pubRef(o)); if (a === null || a > f.pubWithin) return false; }
       if (nq && !normText(`${o.title} ${o.company} ${o.location} ${o.description}`).includes(nq)) return false;
       return true;
     });
+    const t = (d) => (validDate(d) ? new Date(d).getTime() : null);
     const cmp = {
-      score: (a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1),
-      date: (a, b) => new Date(b.publishedAt || b.collectedAt) - new Date(a.publishedAt || a.collectedAt),
+      score: (a, b) => (b.score?.value ?? -1) - (a.score?.value ?? -1) || (t(b.publishedAt) ?? 0) - (t(a.publishedAt) ?? 0),
+      published: (a, b) => (t(b.publishedAt) ?? -1) - (t(a.publishedAt) ?? -1),
+      deadline: (a, b) => (t(a.deadline) ?? 8.64e15) - (t(b.deadline) ?? 8.64e15),
+      arrival: (a, b) => new Date(b.collectedAt) - new Date(a.collectedAt),
       commute: (a, b) => (a.commute?.minutes ?? 999) - (b.commute?.minutes ?? 999),
-      source: (a, b) => (a.sources?.[0]?.name || "").localeCompare(b.sources?.[0]?.name || ""),
-    }[f.sort];
+    }[f.tab === "deadlines" && f.sort === "score" ? "deadline" : f.tab === "arrivals" && f.sort === "score" ? "arrival" : f.sort] || ((a, b) => 0);
     return [...l].sort(cmp);
-  }, [offers, f, settings.hideOlderThan, settings.threshold]);
+  }, [realOffers, f, inTab]);
   useEffect(() => { setOfferQueue(list.map((o) => o.id)); }, [list]); // eslint-disable-line react-hooks/exhaustive-deps
-  const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && !/confidenti|non communiqu/i.test(c)))], [list, ratings]);
+  useEffect(() => { setSel((cur) => { const ids = new Set(list.map((o) => o.id)); const n = new Set([...cur].filter((id) => ids.has(id))); return n.size === cur.size ? cur : n; }); }, [list]);
+  const unrated = useMemo(() => [...new Set(list.map((o) => o.company).filter((c) => c && !ratings[ratingKey(c)] && realCompany(c)))], [list, ratings]);
+  const grouped = f.tab === "arrivals" || f.sort === "arrival";
+  const groups = useMemo(() => {
+    if (!grouped) return [{ key: "all", label: null, items: list }];
+    const g = [];
+    list.forEach((o) => { const k = dayLabel(o.collectedAt); const last = g[g.length - 1]; if (last && last.label === k) last.items.push(o); else g.push({ key: k, label: k, items: [o] }); });
+    return g;
+  }, [list, grouped]);
 
-  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.type === "number" || /minScore|maxCommute/.test(k) ? Number(e.target.value) : e.target.value }));
+  const set = (k) => (e) => setF((x) => ({ ...x, [k]: /minScore|maxCommute|pubWithin/.test(k) ? Number(e.target.value) : e.target.value }));
+  const toggle = (id, e) => {
+    setSel((cur) => {
+      const n = new Set(cur);
+      if (e?.shiftKey && anchor.current) {
+        const ids = list.map((o) => o.id);
+        const a = ids.indexOf(anchor.current), b = ids.indexOf(id);
+        if (a >= 0 && b >= 0) { ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach((x) => n.add(x)); return n; }
+      }
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+    anchor.current = id;
+  };
+  const allSel = list.length > 0 && list.every((o) => sel.has(o.id));
+  const act = (kind) => { const ids = [...sel]; if (!ids.length) return; bulkAction(kind, ids); if (!["score", "verify"].includes(kind)) setSel(new Set()); };
+  const selOffers = list.filter((o) => sel.has(o.id));
+  const canRestore = selOffers.some((o) => ["dismissed", "expired"].includes(o.status));
+  const canDecide = selOffers.some((o) => o.status === "new");
 
   return (
-    <div>
+    <div className="pb-24">
       <PageHeader
         title="Offres"
-        subtitle={`${list.length} offre(s) affichée(s) sur ${offers.length} · chaque offre garde ses URL sources et dates de collecte`}
+        subtitle={`${counts.todo} à traiter · ${counts.unread} non lue(s) · ${counts.arrivals} arrivée(s) depuis ${visitPrev ? relTime(visitPrev).replace("il y a ", "") : "3 jours"} · tri, score et doublons automatiques`}
         actions={
           <>
+            {dupePending?.length > 0 && <Btn icon={GitMerge} onClick={openDupePending}>{dupePending.length} doublon(s) à valider</Btn>}
             {staleIds.length > 0 && <Btn icon={RefreshCw} onClick={rescoreStale} loading={busy.score}>Scorer {staleIds.length}</Btn>}
-            {unrated.length > 0 && <Btn icon={Star} onClick={() => requestRatings(unrated)} loading={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</Btn>}
-            <Btn icon={GitMerge} onClick={detectDuplicates} loading={busy.dedupe}>Doublons (IA)</Btn>
-            {picking && picked.length >= 2 ? <Btn variant="primary" icon={Columns} onClick={() => openCompare(picked)}>Comparer ({picked.length})</Btn> : null}
-            <Btn icon={Columns} variant={picking ? "ghost" : "soft"} onClick={() => { setPicking(!picking); setPicked([]); }}>{picking ? "Annuler" : "Comparer"}</Btn>
-            <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer une annonce</Btn>
+            <Btn icon={Filter} onClick={() => setRulesOpen(true)}>Règles de tri</Btn>
+            <Btn icon={Clipboard} onClick={() => setManualOpen(true)}>Importer</Btn>
             <Btn variant="primary" icon={Play} onClick={() => runWatch()} loading={busy.watch}>Lancer la veille</Btn>
           </>
         }
       />
-      <Card className="p-4 mb-6">
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end">
+
+      <div className="flex gap-1 overflow-x-auto mb-4 -mx-4 px-4 sm:mx-0 sm:px-0" role="tablist" aria-label="Catégories d'offres">
+        {OFFER_TABS.map((t) => {
+          const active = f.tab === t.id;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              title={t.hint}
+              onClick={() => setF((x) => ({ ...x, tab: t.id, origin: "" }))}
+              className={`shrink-0 inline-flex items-center gap-2 h-9 px-3 rounded-xl text-sm transition-colors duration-150 ${active ? `${T.navActive} font-medium` : `${T.muted} ${T.subHover}`} ${T.ring}`}
+              style={active ? T.shadow : undefined}
+            >
+              {t.label}
+              <span className={`text-xs tabular-nums ${t.id === "unread" && counts.unread ? T.accentText : T.faint}`}>{counts[t.id]}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <Card className="p-4 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 items-end">
           <Field label="Recherche" className="col-span-2">
             <Input value={f.q} onChange={set("q")} placeholder="Intitulé, entreprise, lieu…" />
           </Field>
@@ -4598,12 +5623,12 @@ function OffersView() {
               <option value={85}>≥ 85</option>
             </Select>
           </Field>
-          <Field label="Verdict">
-            <Select value={f.verdict} onChange={set("verdict")} className="w-full">
-              <option value="">Tous</option>
-              <option value="apply">Postuler</option>
-              <option value="dig">À creuser</option>
-              <option value="skip">Passer</option>
+          <Field label="Publiée depuis">
+            <Select value={f.pubWithin} onChange={set("pubWithin")} className="w-full">
+              <option value={0}>Indifférent</option>
+              <option value={7}>≤ 7 jours</option>
+              <option value={14}>≤ 14 jours</option>
+              <option value={30}>≤ 30 jours</option>
             </Select>
           </Field>
           <Field label="Trajet max">
@@ -4614,106 +5639,247 @@ function OffersView() {
               <option value={60}>≤ 60 min</option>
             </Select>
           </Field>
-          <Field label="Statut">
-            <Select value={f.status} onChange={set("status")} className="w-full">
-              <option value="active">Actives</option>
-              <option value="new">Nouvelles</option>
-              <option value="pipeline">Dans le pipeline</option>
-              <option value="dismissed">Écartées / expirées</option>
-              <option value="closed">Candidatures clôturées</option>
-              <option value="all">Toutes</option>
+          <Field label="Tri">
+            <Select value={f.sort} onChange={set("sort")} className="w-full">
+              <option value="score">Score</option>
+              <option value="published">Date de publication</option>
+              <option value="deadline">Date limite</option>
+              <option value="arrival">Date d'arrivée (groupée)</option>
+              <option value="commute">Trajet</option>
             </Select>
           </Field>
-          <Field label="Tri">
-            <div className="flex gap-2">
-              <Select value={f.sort} onChange={set("sort")} className="flex-1 min-w-0">
-                <option value="score">Score</option>
-                <option value="date">Date</option>
-                <option value="commute">Trajet</option>
-                <option value="source">Source</option>
-              </Select>
-              <IconBtn icon={dense ? LayoutList : List} label={dense ? "Vue détaillée" : "Vue compacte"} onClick={() => setDense(!dense)} />
-            </div>
-          </Field>
         </div>
-        <label className={`flex items-center gap-2 text-xs mt-3 ${T.muted}`}>
-          <input type="checkbox" checked={f.hideOld} onChange={(e) => setF((x) => ({ ...x, hideOld: e.target.checked }))} />
-          Masquer les offres de plus de {settings.hideOlderThan} jours (souvent déjà pourvues)
-        </label>
+        {f.tab === "dismissed" && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {[["", "Toutes"], ["auto", "Par les règles"], ["user", "Par vous"]].map(([v, l]) => (
+              <button key={v} type="button" onClick={() => setF((x) => ({ ...x, origin: v }))} className={`h-7 px-3 rounded-lg text-xs ${f.origin === v ? T.navActive : `${T.muted} ${T.subHover}`} ${T.ring}`}>{l}</button>
+            ))}
+          </div>
+        )}
+        <div className={`flex flex-wrap items-center gap-x-4 gap-y-2 mt-3 text-xs ${T.faint}`}>
+          <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={dedupeNow}>Fusionner les doublons évidents</button>
+          <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => detectDuplicates()} disabled={busy.dedupe}>{busy.dedupe ? "Recherche IA des doublons…" : "Doublons reformulés (IA)"}</button>
+          {unrated.length > 0 && <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => requestRatings(unrated)} disabled={busy.ratings}>Noter {Math.min(25, unrated.length)} employeur(s)</button>}
+          {(f.q || f.source || f.minScore || f.maxCommute || f.pubWithin) ? <button type="button" className={`underline underline-offset-4 ${T.ring} rounded`} onClick={() => setF((x) => ({ ...DEFAULT_FILTERS, tab: x.tab, sort: x.sort }))}>Effacer les filtres</button> : null}
+        </div>
       </Card>
+
+      {lastBulk && (
+        <Notice tone="accent" icon={History} className="mb-4">
+          <span>{lastBulk.label}.</span>
+          {lastBulk.undoable && <button type="button" className="ml-2 font-medium underline underline-offset-4" onClick={undoBulk}>Annuler</button>}
+          <button type="button" className="ml-3 underline underline-offset-4 opacity-70" onClick={() => setLastBulk(null)}>Masquer</button>
+        </Notice>
+      )}
 
       {busy.watch && <Card className="p-6 mb-4"><Skeleton lines={4} /></Card>}
       {list.length === 0 && !busy.watch ? (
-        <Card><Empty icon={Search} title="Aucune offre ne correspond" text="Élargissez les filtres, lancez la veille ou importez vos alertes e-mail." action={<Btn onClick={() => setF(DEFAULT_FILTERS)}>Réinitialiser les filtres</Btn>} /></Card>
-      ) : dense ? (
-        <Card className="p-2">
-          <ul className={`divide-y ${T.divide}`}>
-            {list.map((o) => {
-              const v = offerVerdict(o, settings.threshold);
-              const fx = o.score?.facts || {};
-              return (
-              <li key={o.id} className="flex items-center">
-                {picking && <input type="checkbox" className="ml-3 shrink-0" checked={picked.includes(o.id)} disabled={!picked.includes(o.id) && picked.length >= 4} onChange={() => togglePick(o.id)} aria-label={`Comparer ${o.title}`} />}
-                <button type="button" onClick={() => openOffer(o.id)} className={`flex-1 min-w-0 flex items-center gap-4 px-3 py-3 rounded-2xl text-left transition-colors duration-150 ${T.subHover} ${T.ring}`}>
-                  <ScorePill score={o.score} threshold={settings.threshold} />
-                  <span className="flex-1 min-w-0">
-                    <span className="flex items-center gap-2">
-                      {isFresh(o) && <span className="w-2 h-2 rounded-full bg-indigo-600 shrink-0" title="Nouvelle (moins de 48 h)" aria-label="Nouvelle" />}
-                      <span className="text-sm font-medium truncate">{o.title}</span>
-                      {v && <Chip tone={v.tone} className="shrink-0">{v.label}</Chip>}
-                      {o.demo && <Chip>exemple</Chip>}
-                      {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
-                      {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">score obsolète</Chip>}
-                    </span>
-                    <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}><span className="truncate">{show(o.company)} · {show(o.location)}{fx.contract || o.contract ? ` · ${fx.contract || o.contract}` : ""}{fx.remoteDays != null ? ` · ${fx.remoteDays} j télétravail` : ""}{fmtSalary(fx, null) ? ` · ${fmtSalary(fx, null)}` : ""}</span><RatingChip company={o.company} compact /></span>
-                    {o.score?.tldr && <span className={`block text-xs mt-0.5 truncate ${T.faint}`}>{o.score.tldr}</span>}
-                  </span>
-                  <span className={`hidden md:flex items-center gap-1 text-xs w-20 ${T.muted}`}><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</span>
-                  <span className={`hidden lg:block text-xs w-32 truncate ${T.muted}`}>{o.sources?.map((s) => s.name).join(", ")}</span>
-                  <span className={`hidden sm:block text-xs w-20 text-right tabular-nums ${T.faint}`}>{fmtDate(o.publishedAt || o.collectedAt)}</span>
-                </button>
-              </li>
-              );
-            })}
-          </ul>
+        <Card>
+          <Empty
+            icon={f.tab === "unread" || f.tab === "todo" ? CheckCircle2 : Search}
+            title={f.tab === "unread" ? "Tout est lu" : f.tab === "todo" ? "Rien à traiter" : "Aucune offre ici"}
+            text={f.tab === "todo" || f.tab === "unread" ? "Les nouvelles offres arrivent avec la veille planifiée ; celles qui ne passent pas vos règles vont directement dans « Écartées » ou « Expirées »." : "Élargissez les filtres ou changez d'onglet."}
+          />
         </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {list.map((o) => (
-            <Card key={o.id} as="button" type="button" onClick={() => openOffer(o.id)} className={`p-6 text-left transition-transform duration-200 hover:-translate-y-0.5 ${T.ring}`}>
-              <div className="flex items-start gap-4">
-                <ScorePill score={o.score} threshold={settings.threshold} size="lg" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-base font-medium leading-snug">{o.title}</div>
-                  <div className={`text-sm mt-0.5 ${T.muted}`}>{show(o.company)}</div>
-                  <div className="flex flex-wrap gap-1.5 mt-3">
-                    {o.demo && <Chip>exemple</Chip>}
-                    <Chip><MapPin className="w-3 h-3" aria-hidden="true" />{show(o.location)}</Chip>
-                    <Chip><Clock className="w-3 h-3" aria-hidden="true" />{commuteLabel(o.commute)}</Chip>
-                    <Chip>{o.score?.facts?.remoteDays != null ? `${o.score.facts.remoteDays} j télétravail` : show(o.remote)}</Chip>
-                    {offerVerdict(o, settings.threshold) && <Chip tone={offerVerdict(o, settings.threshold).tone}>{offerVerdict(o, settings.threshold).label}</Chip>}
-                    {o.score && <Chip tone={o.score.confidence === "faible" ? "warn" : "neutral"}>confiance {o.score.confidence}</Chip>}
-                  </div>
-                </div>
-              </div>
-              {(o.score?.tldr || o.score?.summary) && <p className={`text-sm mt-4 ${T.muted}`}>{o.score.tldr || o.score.summary}</p>}
-              {o.score?.redFlags?.length > 0 && (
-                <div className="mt-3 text-xs text-rose-600 flex items-start gap-1.5"><Flag className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />{o.score.redFlags[0].evidence}</div>
-              )}
-              <div className={`mt-4 text-xs ${T.faint}`}>{o.sources?.map((s) => s.name).join(" · ")} · collectée {fmtDate(o.collectedAt)}</div>
-            </Card>
+        <Card className="p-2">
+          <div className={`hidden md:flex items-center gap-3 px-3 py-2 text-xs ${T.faint}`}>
+            <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? new Set() : new Set(list.map((o) => o.id)))} aria-label="Tout sélectionner" className="w-4 h-4" />
+            <span className="w-10">Score</span>
+            <span className="flex-1">Offre</span>
+            <span className="w-24">Publiée</span>
+            <span className="w-20">Limite</span>
+            <span className="w-20">Arrivée</span>
+            <span className="w-16">Trajet</span>
+            <span className="w-24 text-right">Décider</span>
+          </div>
+          <div className="md:hidden flex items-center gap-2 px-3 py-2 text-xs">
+            <input type="checkbox" checked={allSel} onChange={() => setSel(allSel ? new Set() : new Set(list.map((o) => o.id)))} aria-label="Tout sélectionner" className="w-4 h-4" />
+            <span className={T.faint}>Tout sélectionner ({list.length})</span>
+          </div>
+          {groups.map((g) => (
+            <div key={g.key}>
+              {g.label && <div className={`px-3 pt-4 pb-1 text-xs font-medium uppercase tracking-wider ${T.faint}`}>{g.label} · {g.items.length}</div>}
+              <ul className={`divide-y ${T.divide}`}>
+                {g.items.map((o) => (
+                  <OfferRow
+                    key={o.id}
+                    o={o}
+                    vid={vid}
+                    selected={sel.has(o.id)}
+                    onToggle={(e) => toggle(o.id, e)}
+                    onOpen={() => openOffer(o.id)}
+                    onKeep={() => addToPipeline(o.id, "retained")}
+                    onDismiss={() => triageOffer(o.id, { status: "dismissed", dismissedAt: nowISO() })}
+                    onExpire={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO() })}
+                  />
+                ))}
+              </ul>
+            </div>
           ))}
+        </Card>
+      )}
+
+      {sel.size > 0 && (
+        <div className="fixed bottom-4 left-4 right-4 flex justify-center" style={{ zIndex: 60 }}>
+          <div className="max-w-full flex flex-wrap items-center gap-1.5 rounded-2xl px-3 py-2" style={{ ...T.glass, ...T.shadow }} role="toolbar" aria-label="Actions sur la sélection">
+            <span className="text-sm font-medium px-2 tabular-nums">{sel.size} sélectionnée(s)</span>
+            {canDecide && <Btn size="sm" icon={X} onClick={() => act("dismiss")}>Écarter</Btn>}
+            {canDecide && <Btn size="sm" icon={Clock} onClick={() => act("expire")}>Expirées</Btn>}
+            {canRestore && <Btn size="sm" icon={RotateCcw} onClick={() => act("restore")}>Remettre à traiter</Btn>}
+            <Btn size="sm" icon={Eye} onClick={() => act("seen")}>Lues</Btn>
+            {canDecide && <Btn size="sm" icon={Plus} onClick={() => act("pipeline")}>Pipeline</Btn>}
+            <Btn size="sm" icon={Gauge} onClick={() => act("score")} loading={busy.score}>Scorer</Btn>
+            <Btn size="sm" icon={Link2} onClick={() => act("verify")} loading={busy.verify}>Vérifier les liens</Btn>
+            {sel.size >= 2 && sel.size <= 6 && <Btn size="sm" icon={GitMerge} onClick={() => act("merge")}>Fusionner</Btn>}
+            <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => act("remove")}>Supprimer</Btn>
+            <IconBtn icon={X} label="Vider la sélection" onClick={() => setSel(new Set())} />
+          </div>
         </div>
       )}
+
+      <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
     </div>
+  );
+}
+
+function FreshChip({ o, compact }) {
+  const T = useT();
+  const fr = freshness(o);
+  const color = fr.tone === "ok" ? (T.dark ? "text-emerald-200" : "text-emerald-800") : fr.tone === "warn" ? (T.dark ? "text-amber-200" : "text-amber-900") : T.muted;
+  return <span className={`text-xs tabular-nums ${color}`} title={o.publishedAt ? `Publiée le ${fmtDate(o.publishedAt)}${o.publishedApprox ? " (date de l'alerte e-mail)" : ""}` : "Date de publication inconnue"}>{compact ? fr.label.replace("il y a ", "") : fr.label}</span>;
+}
+function DeadlineChip({ o }) {
+  const T = useT();
+  const d = deadlineIn(o);
+  if (d === null) return <span className={`text-xs ${T.faint}`}>—</span>;
+  const cls = d < 0 ? "text-rose-600 line-through" : d <= 3 ? "text-rose-600 font-medium" : d <= 7 ? (T.dark ? "text-amber-200" : "text-amber-900") : T.muted;
+  return <span className={`text-xs tabular-nums ${cls}`} title={`Date limite : ${fmtDate(o.deadline)}`}>{d < 0 ? "dépassée" : d === 0 ? "aujourd'hui" : `J-${d}`}</span>;
+}
+function LinkChip({ o }) {
+  const st = o.link?.state;
+  if (st === "open") return <Chip tone="ok" title={o.link.evidence || "Annonce vérifiée ouverte"}>lien ouvert</Chip>;
+  if (st === "closed") return <Chip tone="danger" title={o.link.evidence || ""}>annonce clôturée</Chip>;
+  if (st === "pending") return <Chip>vérification…</Chip>;
+  return null;
+}
+
+function OfferRow({ o, vid, selected, onToggle, onOpen, onKeep, onDismiss, onExpire }) {
+  const T = useT();
+  const { settings } = useApp();
+  const unread = o.status === "new" && !o.seenAt && !o.demo;
+  return (
+    <li className={`flex items-center gap-3 px-3 py-2.5 rounded-2xl ${selected ? T.sub : ""}`}>
+      <input type="checkbox" checked={selected} onChange={() => {}} onClick={(e) => onToggle(e)} aria-label={`Sélectionner ${o.title}`} className="w-4 h-4 shrink-0" />
+      <button type="button" onClick={onOpen} className={`flex-1 min-w-0 flex items-center gap-3 text-left rounded-xl ${T.ring}`}>
+        <span className="relative shrink-0">
+          <ScorePill score={o.score} threshold={settings.threshold} />
+          {unread && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-indigo-600" aria-label="non lue" />}
+        </span>
+        <span className="flex-1 min-w-0">
+          <span className="flex items-center gap-2">
+            <span className={`text-sm truncate ${unread ? "font-semibold" : "font-medium"}`}>{o.title}</span>
+            {o.demo && <Chip>exemple</Chip>}
+            {o.score?.redFlags?.length > 0 && <Flag className="w-3.5 h-3.5 text-rose-500 shrink-0" aria-label="Drapeau rouge" />}
+            {isStale(o, vid) && o.score && !o.demo && <Chip tone="warn">à rescorer</Chip>}
+          </span>
+          <span className={`flex items-center gap-2 text-xs mt-0.5 ${T.muted}`}>
+            <span className="truncate">{show(o.company)} · {show(o.location)} · {(o.sources || []).map((s) => s.name).filter((v, i, a) => a.indexOf(v) === i).join(", ")}</span>
+            <RatingChip company={o.company} compact />
+          </span>
+          {(o.autoReason || o.link?.state || (o.status !== "new" && o.status !== "pipeline")) && (
+            <span className="flex flex-wrap items-center gap-1.5 mt-1">
+              {o.autoReason && <Chip tone={o.status === "expired" ? "warn" : "neutral"} title="Tri automatique — restaurable">auto : {o.autoReason}</Chip>}
+              {!o.autoReason && o.status === "dismissed" && <Chip>écartée</Chip>}
+              {!o.autoReason && o.status === "expired" && <Chip tone="warn">expirée / pourvue</Chip>}
+              {o.status === "pipeline" && <Chip tone="accent">pipeline</Chip>}
+              <LinkChip o={o} />
+            </span>
+          )}
+          <span className="flex md:hidden items-center gap-3 mt-1">
+            <FreshChip o={o} />
+            {o.deadline && <span className="inline-flex items-center gap-1 text-xs"><CalendarClock className="w-3 h-3" aria-hidden="true" /><DeadlineChip o={o} /></span>}
+            <span className={`text-xs ${T.faint}`}>arrivée {relDay(o.collectedAt)}</span>
+          </span>
+        </span>
+        <span className="hidden md:block w-24"><FreshChip o={o} /></span>
+        <span className="hidden md:block w-20"><DeadlineChip o={o} /></span>
+        <span className={`hidden md:block w-20 text-xs tabular-nums ${T.faint}`} title={fmtDate(o.collectedAt, { time: true })}>{relDay(o.collectedAt)}</span>
+        <span className={`hidden md:block w-16 text-xs ${T.muted}`}>{commuteLabel(o.commute)}</span>
+      </button>
+      <span className="hidden sm:flex w-24 justify-end gap-0.5 shrink-0">
+        {o.status === "new" && !o.demo ? (
+          <>
+            <IconBtn icon={Check} label="Retenir (pipeline)" onClick={onKeep} />
+            <IconBtn icon={X} label="Écarter" onClick={onDismiss} />
+            <IconBtn icon={Clock} label="Expirée / pourvue" onClick={onExpire} />
+          </>
+        ) : null}
+      </span>
+    </li>
+  );
+}
+
+function RulesModal({ open, onClose }) {
+  const T = useT();
+  const { settings, setSettings, offers, criteria, runRules } = useApp();
+  const rules = rulesOf(settings);
+  const setR = (k, v) => setSettings((s) => ({ ...s, rules: { ...rulesOf(s), [k]: v } }));
+  const setS = (k, v) => setSettings((s) => ({ ...s, [k]: v }));
+  const ver = activeVersion(criteria);
+  const preview = useMemo(() => {
+    if (!open) return { total: 0, by: {} };
+    const by = {};
+    let total = 0;
+    offers.forEach((o) => { const v = ruleVerdict(o, ver, rules); if (v) { total++; by[v.rule] = (by[v.rule] || 0) + 1; } });
+    return { total, by };
+  }, [open, offers, ver, settings.rules]); // eslint-disable-line react-hooks/exhaustive-deps
+  const num = (k, min, max) => (e) => setR(k, clamp(Number(e.target.value) || 0, min, max));
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      wide
+      title="Règles de tri automatique"
+      footer={<><Btn variant="ghost" onClick={onClose}>Fermer</Btn><Btn variant="primary" icon={Filter} disabled={!preview.total} onClick={() => { runRules(); onClose(); }}>Appliquer maintenant ({preview.total})</Btn></>}
+    >
+      <div className="space-y-5">
+        <Notice icon={Info}>
+          Appliquées à chaque arrivée d'offres et à chaque ouverture, uniquement aux offres « à traiter » (jamais au pipeline ni aux offres que vous avez restaurées). Les offres triées restent visibles dans « Écartées » ou « Expirées », avec la raison, et se restaurent en un clic.
+        </Notice>
+        <Toggle checked={rules.enabled} onChange={(v) => setR("enabled", v)} label="Tri automatique activé" />
+        {preview.total > 0 && (
+          <p className={`text-sm ${T.muted}`}>Aperçu sur le stock actuel : {Object.entries(preview.by).map(([k, n]) => `${n} ${RULE_LABEL[k]}`).join(" · ")}.</p>
+        )}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <Field label="Âge max (jours)" hint="depuis la publication"><Input type="number" value={rules.maxAgeDays} onChange={num("maxAgeDays", 0, 120)} /></Field>
+          <Field label="Date inconnue : max (j)" hint="depuis la collecte"><Input type="number" value={rules.unknownDateMaxDays} onChange={num("unknownDateMaxDays", 0, 120)} /></Field>
+          <Field label="Score minimum" hint="en dessous : écartée"><Input type="number" value={rules.dismissBelow} onChange={num("dismissBelow", 0, 90)} /></Field>
+          <Field label="Marge de trajet (min)" hint={`au-delà de ${ver?.maxCommute ?? 60} + marge`}><Input type="number" value={rules.commuteSlack} onChange={num("commuteSlack", 0, 120)} /></Field>
+        </div>
+        <Field label="Mots qui excluent un intitulé">
+          <ChipInput values={rules.titleExclude} onChange={(v) => setR("titleExclude", v)} placeholder="junior, stage…" ariaLabel="Mots exclus" />
+        </Field>
+        <Toggle checked={rules.requireSeniority} onChange={(v) => setR("requireSeniority", v)} label="L'intitulé doit indiquer un poste de management" description="manager, head, lead, directeur, responsable, hoofd…" />
+        {rules.requireSeniority && <ChipInput values={rules.seniorityTokens} onChange={(v) => setR("seniorityTokens", v)} placeholder="mot" ariaLabel="Mots de management" />}
+        <Toggle checked={rules.requireDomain} onChange={(v) => setR("requireDomain", v)} label="L'intitulé doit relever de votre périmètre" description="Digital, IT, CRM, transformation, process… complété automatiquement par les mots de vos postes visés." />
+        {rules.requireDomain && <ChipInput values={rules.domainTokens} onChange={(v) => setR("domainTokens", v)} placeholder="mot" ariaLabel="Mots du périmètre" />}
+        <div className={`pt-4 border-t ${T.line}`}>
+          <SectionTitle>Automatisations</SectionTitle>
+          <Toggle checked={settings.autoScore} onChange={(v) => setS("autoScore", v)} label="Scoring automatique" description={`Toute offre à traiter est scorée dès son arrivée (jusqu'à ${settings.autoScoreMax} par lot), avec la même formule.`} />
+          <Toggle checked={settings.autoDedupe} onChange={(v) => setS("autoDedupe", v)} label="Fusion automatique des doublons évidents" description="Même URL ou identifiant d'annonce, ou même entreprise + intitulé proche. Annulable depuis la fiche." />
+          <Toggle checked={settings.autoDedupeAI} onChange={(v) => setS("autoDedupeAI", v)} label="Détection IA des doublons reformulés après chaque arrivée" description="Confiance haute : fusion directe (annulable). Confiance moyenne : à valider." />
+          <Toggle checked={settings.autoVerify} onChange={(v) => setS("autoVerify", v)} label="Vérification des liens par la veille planifiée" description="À chaque passage, la Routine vérifie jusqu'à 40 offres actives ; les annonces clôturées passent en « Expirées »." />
+        </div>
+      </div>
+    </Modal>
   );
 }
 
 function OfferDrawer({ id, onClose }) {
   const T = useT();
-  const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel } = useApp();
+  const { offers, settings, setSettings, apps, addToPipeline, patchOffer, scoreOffers, busy, openApp, criteria, undoMerge, offerQueue, triageOffer, nextOfferId, setOfferSel, requestVerify } = useApp();
   const o = offers.find((x) => x.id === id);
-  const [tab, setTab] = useState("analysis");
   const queue = offerQueue.length ? offerQueue : offers.filter(isActiveOffer).map((x) => x.id);
   const pos = queue.indexOf(id);
   const prevId = pos > 0 ? queue[pos - 1] : null;
@@ -4727,6 +5893,7 @@ function OfferDrawer({ id, onClose }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [nextId, prevId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (o && !o.seenAt && !o.demo) patchOffer(o.id, { seenAt: nowISO() }); }, [o?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!o) return null;
   const mainUrl = (o.sources || []).find((x) => x.url)?.url;
   const s = o.score;
@@ -4737,7 +5904,11 @@ function OfferDrawer({ id, onClose }) {
     ["Entreprise", o.company], ["Lieu", o.location],
     ["Trajet depuis Ohain", o.commute ? `~${o.commute.minutes} min en voiture (${o.commute.basis})` : null],
     ["Contrat", o.contract], ["Séniorité", o.seniority], ["Salaire", o.salary], ["Télétravail", o.remote],
-    ["Langue", o.language ? LANG_NAME[o.language] : null], ["Publication", o.publishedAt ? fmtDate(o.publishedAt) : null], ["Collecte", fmtDate(o.collectedAt, { time: true })],
+    ["Langue", o.language ? LANG_NAME[o.language] : null],
+    ["Publication", o.publishedAt ? `${fmtDate(o.publishedAt)} (${freshness(o).label})${o.publishedApprox ? " — date de l'alerte e-mail" : ""}` : null],
+    ["Date limite de candidature", o.deadline ? `${fmtDate(o.deadline)}${deadlineIn(o) !== null ? ` (${deadlineIn(o) < 0 ? "dépassée" : `J-${deadlineIn(o)}`})` : ""}` : null],
+    ["Collecte", fmtDate(o.collectedAt, { time: true })],
+    ["Lien", o.link?.state ? `${{ open: "ouvert", closed: "clôturé", pending: "vérification demandée", unknown: "indéterminé" }[o.link.state] || o.link.state}${o.link.at ? ` · vérifié ${fmtDate(o.link.at)}` : ""}${o.link.evidence ? ` — ${o.link.evidence}` : ""}` : "non vérifié"],
   ];
   return (
     <Drawer
@@ -4756,6 +5927,9 @@ function OfferDrawer({ id, onClose }) {
           {o.demo && <Chip>exemple — donnée fictive</Chip>}
           {o.status === "expired" && <Chip tone="warn">expirée / pourvue</Chip>}
           {o.status === "closed" && <Chip>candidature clôturée</Chip>}
+          <Chip tone={freshness(o).tone === "ok" ? "ok" : freshness(o).tone === "warn" ? "warn" : "neutral"}><CalendarDays className="w-3 h-3" aria-hidden="true" />{freshness(o).days === null ? "date de publication inconnue" : `publiée ${freshness(o).label}`}</Chip>
+          {o.deadline && <Chip tone={deadlineIn(o) !== null && deadlineIn(o) <= 7 ? "danger" : "neutral"}><CalendarClock className="w-3 h-3" aria-hidden="true" />limite {fmtDate(o.deadline)}</Chip>}
+          <LinkChip o={o} />
           {pos >= 0 && <span className={`text-xs tabular-nums ${T.faint}`}>{pos + 1} / {queue.length}</span>}
           <span className="inline-flex gap-1">
             <IconBtn icon={ChevronLeft} label="Offre précédente (←)" onClick={() => prevId && setOfferSel(prevId)} disabled={!prevId} />
@@ -4774,29 +5948,55 @@ function OfferDrawer({ id, onClose }) {
           </>
         )}
         {INACTIVE.includes(o.status) && o.status !== "closed" ? (
-          <Btn variant="ghost" icon={RotateCcw} onClick={() => patchOffer(o.id, { status: "new" })}>Restaurer</Btn>
+          <Btn variant="ghost" icon={RotateCcw} onClick={() => patchOffer(o.id, { status: "new", userKept: true, autoReason: undefined, autoRule: undefined, dismissedBy: undefined, expiredBy: undefined })}>Restaurer (à traiter)</Btn>
         ) : !app && (
           <>
             <Btn variant="ghost" icon={X} onClick={() => triageOffer(o.id, { status: "dismissed", dismissedAt: nowISO() })}>Écarter</Btn>
             <Btn variant="ghost" icon={Clock} onClick={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO() })}>Expirée / pourvue</Btn>
+            <Btn variant="ghost" icon={Unlink} onClick={() => triageOffer(o.id, { status: "expired", expiredAt: nowISO(), link: { state: "closed", evidence: "lien mort / 404 signalé", at: nowISO(), method: "vous" } })}>Lien mort (404)</Btn>
           </>
         )}
+        {!o.demo && mainUrl && <Btn variant="ghost" icon={Link2} onClick={() => requestVerify([o.id])} loading={busy.verify}>Vérifier le lien</Btn>}
         {nextId && <Btn variant="ghost" icon={ArrowRight} onClick={() => setOfferSel(nextId)}>Suivante</Btn>}
         {!o.demo && <Btn variant="ghost" icon={RefreshCw} onClick={() => scoreOffers([o.id])} loading={busy.score}>{s ? "Rescorer" : "Scorer"}</Btn>}
       </div>
-      <label className={`flex items-center gap-2 text-xs mb-6 ${T.faint}`}>
+      {o.autoReason && (
+        <Notice tone={o.status === "expired" ? "warn" : "neutral"} icon={Filter} className="mb-3">
+          Triée automatiquement : {o.autoReason}. « Restaurer » la remet à traiter et la protège des règles.
+        </Notice>
+      )}
+      <label className={`flex items-center gap-2 text-xs mb-8 ${T.faint}`}>
         <input type="checkbox" checked={!!settings.autoNext} onChange={(e) => setSettings((x) => ({ ...x, autoNext: e.target.checked }))} />
         Passer automatiquement à l'offre suivante après « Écarter », « Expirée » ou « Ajouter » · flèches ← → pour naviguer
       </label>
 
-      <DecisionCard o={o} stale={stale} />
-      <div className="mb-6 overflow-x-auto"><Tabs value={tab} onChange={setTab} tabs={[{ id: "analysis", label: "Analyse" }, { id: "ad", label: "Annonce" }, { id: "sources", label: "Sources", count: o.sources?.length || 0 }]} /></div>
+      <section className="mb-8">
+        <div className="flex items-center gap-4">
+          <ScorePill score={s} threshold={settings.threshold} size="lg" />
+          <div className="flex-1">
+            {s ? (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>Confiance {s.confidence}</Chip>
+                  {stale && !o.demo && <Chip tone="warn">critères modifiés depuis</Chip>}
+                  {s.fit && <Chip tone={s.fit === "fort" ? "ok" : s.fit === "faible" ? "warn" : "neutral"}>adéquation {s.fit}</Chip>}
+                  {s.caps?.map((c) => <Chip key={c} tone="danger">{s.method === 2 ? c : `plafonné : ${c}`}</Chip>)}
+                </div>
+                {s.summary && <p className="text-sm mt-2">{s.summary}</p>}
+                {s.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
+                {s.method === 2 && <p className={`text-xs mt-1 ${T.faint}`}>Calcul systématique : 55 % souhaités pondérés{s.wishAvg !== null ? ` (${s.wishAvg})` : ""} + 45 % indispensables{s.mustAvg !== null ? ` (${s.mustAvg})` : ""}, puis plafonds et pénalités.</p>}
+              </>
+            ) : (
+              <p className={`text-sm ${T.muted}`}>Pas encore scorée.</p>
+            )}
+          </div>
+        </div>
+      </section>
 
-      {tab === "analysis" && (s ? (
+      {s && (
         <>
           <section className="mb-8">
             <SectionTitle>Décomposition par critère</SectionTitle>
-            {s.local && <p className={`text-xs mb-3 ${T.faint}`}>Score recalculé localement après un changement de pondération (aucun appel IA).</p>}
             <div className="space-y-5">
               {groups.map(([kind, label]) => {
                 const rows = s.breakdown.filter((b) => b.kind === kind);
@@ -4828,130 +6028,58 @@ function OfferDrawer({ id, onClose }) {
             <BulletList title="Drapeaux rouges" items={s.redFlags.map((r) => `${{ stress: "Pression", turnover: "Turnover", role_flou: "Rôle flou" }[r.type] || "Autre"} — ${r.evidence}`)} icon={Flag} danger empty="Aucun signal détecté dans le texte" />
           </section>
         </>
-      ) : <Empty icon={Gauge} title="Pas encore scorée" text="Le score explique l'adéquation critère par critère." action={!o.demo && <Btn icon={RefreshCw} loading={busy.score} onClick={() => scoreOffers([o.id])}>Scorer</Btn>} />)}
-
-      {tab === "ad" && (
-        <>
-          {(s?.missions?.length > 0 || s?.must?.length > 0 || s?.nice?.length > 0) && (
-            <section className="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-8">
-              <BulletList title="Missions principales" items={s.missions} icon={Briefcase} empty="Non précisées" />
-              <div className="space-y-6">
-                <BulletList title="Exigences indispensables" items={s.must} icon={Target} empty="Non précisées" />
-                <BulletList title="Atouts souhaités" items={s.nice} icon={Plus} empty="Non précisés" />
-              </div>
-            </section>
-          )}
-          <section className="mb-8">
-            <SectionTitle>Annonce (résumé collecté{o.language && o.language !== "fr" ? `, en ${LANG_NAME[o.language]}` : ""})</SectionTitle>
-            <p className={`text-sm leading-relaxed whitespace-pre-line ${o.description ? "" : T.faint}`}>{show(o.description)}</p>
-          </section>
-          <section className="mb-8">
-            <SectionTitle>Fiche normalisée</SectionTitle>
-            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
-              {meta.map(([k, v]) => (
-                <div key={k}>
-                  <dt className={`text-xs ${T.faint}`}>{k}</dt>
-                  <dd className={`text-sm ${v ? "" : T.faint}`}>{show(v)}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
-        </>
       )}
 
-      {tab === "sources" && (
-        <>
-          {o.mergeHistory?.length > 0 && (
-            <section className="mb-8">
-              <SectionTitle action={<Btn size="sm" variant="ghost" icon={Undo2} onClick={() => undoMerge(o.id)}>Annuler la dernière fusion</Btn>}>Historique des fusions</SectionTitle>
-              <ul className="space-y-2">
-                {[...o.mergeHistory].reverse().map((m) => (
-                  <li key={m.id} className={`rounded-2xl p-4 text-sm ${T.sub}`}>
-                    <div className="flex flex-wrap items-center gap-2"><GitMerge className={`w-3.5 h-3.5 ${T.muted}`} aria-hidden="true" /><span>{fmtDate(m.at, { time: true })}</span><Chip>{m.origin}</Chip></div>
-                    {m.reason && <div className={`text-xs mt-1 ${T.muted}`}>{m.reason}</div>}
-                    <ul className={`text-xs mt-2 space-y-0.5 ${T.muted}`}>{m.absorbed.map((x) => <li key={x.id}>↳ {x.title} · {show(x.company)} · {(x.sources || []).map((y) => y.name).join(", ")}</li>)}</ul>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-          <section>
-            <ul className="space-y-3">
-              {(o.sources || []).map((src, i) => (
-                <li key={i} className={`rounded-2xl p-4 ${T.sub}`}>
-                  <div className="flex flex-wrap items-center gap-2 text-sm">
-                    <span className="font-medium">{src.name}</span>
-                    <span className={`text-xs ${T.faint}`}>via {src.via} · collectée {fmtDate(src.collectedAt, { time: true })}</span>
-                    {src.verified === true && <Chip tone="ok">URL vérifiée</Chip>}
-                    {src.verified === false && <Chip tone="warn">URL à vérifier</Chip>}
-                  </div>
-                  {src.emailSubject && <div className={`text-xs mt-1 ${T.muted}`}>E-mail : {src.emailSubject}</div>}
-                  <div className="mt-1 text-sm break-all">{src.url ? <ExtLink href={src.url}>{src.url}</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        </>
-      )}
-    </Drawer>
-  );
-}
-
-/* Synthèse de décision : verdict, résumé en français, faits clés normalisés, raisons principales. */
-function DecisionCard({ o, stale }) {
-  const T = useT();
-  const { settings } = useApp();
-  const s = o.score;
-  const f = s?.facts || {};
-  const v = offerVerdict(o, settings.threshold);
-  const facts = [
-    [MapPin, "Lieu", o.location ? `${o.location}${o.commute ? ` · ~${o.commute.minutes} min` : ""}` : null],
-    [FileText, "Contrat", f.contract || o.contract],
-    [Monitor, "Télétravail", f.remoteDays != null ? `${f.remoteDays} j / semaine` : o.remote],
-    [TrendingUp, "Salaire", fmtSalary(f, o.salary)],
-    [Users, "Équipe", f.teamSize ? `${f.teamSize} personne(s)` : null],
-    [Building2, "Rattachement", f.reportsTo],
-    [Target, "Séniorité", f.seniority || o.seniority],
-    [Languages, "Langues exigées", f.languages?.length ? f.languages.map((l) => LANG_FLAG[l]).join(" · ") : null],
-    [Clock, "Publiée", o.publishedAt && !isNaN(new Date(o.publishedAt)) ? `${fmtDate(o.publishedAt)} · ${relDay(o.publishedAt)}` : null],
-  ];
-  const known = facts.filter(([, , val]) => val);
-  const unknown = facts.filter(([, , val]) => !val).map(([, l]) => l.toLowerCase());
-  return (
-    <section className={`rounded-3xl p-5 mb-6 ${T.sub}`} aria-label="Synthèse de décision">
-      <div className="flex items-start gap-4">
-        <ScorePill score={s} threshold={settings.threshold} size="lg" />
-        <div className="flex-1 min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            {v ? <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm font-semibold ${v.id === "apply" ? "bg-emerald-600 text-white" : v.id === "dig" ? (T.dark ? "bg-amber-900 text-amber-100" : "bg-amber-100 text-amber-900") : T.chip}`}>{v.label}</span> : <Chip>non scorée</Chip>}
-            {s && <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>confiance {s.confidence}</Chip>}
-            {stale && !o.demo && s && <Chip tone="warn">critères modifiés depuis</Chip>}
-            {s?.caps?.map((c) => <Chip key={c} tone="danger">plafonné : {c}</Chip>)}
-          </div>
-          {s?.tldr && <p className="text-base font-medium leading-snug mt-2">{s.tldr}</p>}
-          {s?.summary && <p className={`text-sm mt-1 ${T.muted}`}>{s.summary}</p>}
-          {s?.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
-        </div>
-      </div>
-      {known.length > 0 && (
-        <dl className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-5">
-          {known.map(([I, l, val]) => (
-            <div key={l} className={`rounded-2xl px-3 py-2 ${T.surface}`}>
-              <dt className={`flex items-center gap-1.5 text-xs ${T.faint}`}><I className="w-3.5 h-3.5" aria-hidden="true" />{l}</dt>
-              <dd className="text-sm mt-0.5">{val}</dd>
+      <section className="mb-8">
+        <SectionTitle>Fiche normalisée</SectionTitle>
+        <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
+          {meta.map(([k, v]) => (
+            <div key={k}>
+              <dt className={`text-xs ${T.faint}`}>{k}</dt>
+              <dd className={`text-sm ${v ? "" : T.faint}`}>{show(v)}</dd>
             </div>
           ))}
         </dl>
+      </section>
+
+      <section className="mb-8">
+        <SectionTitle>Annonce (résumé collecté)</SectionTitle>
+        <p className={`text-sm leading-relaxed whitespace-pre-line ${o.description ? "" : T.faint}`}>{show(o.description)}</p>
+      </section>
+
+      {o.mergeHistory?.length > 0 && (
+        <section className="mb-8">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Undo2} onClick={() => undoMerge(o.id)}>Annuler la dernière fusion</Btn>}>Historique des fusions</SectionTitle>
+          <ul className="space-y-2">
+            {[...o.mergeHistory].reverse().map((m) => (
+              <li key={m.id} className={`rounded-2xl p-4 text-sm ${T.sub}`}>
+                <div className="flex flex-wrap items-center gap-2"><GitMerge className={`w-3.5 h-3.5 ${T.muted}`} aria-hidden="true" /><span>{fmtDate(m.at, { time: true })}</span><Chip>{m.origin}</Chip></div>
+                {m.reason && <div className={`text-xs mt-1 ${T.muted}`}>{m.reason}</div>}
+                <ul className={`text-xs mt-2 space-y-0.5 ${T.muted}`}>{m.absorbed.map((a) => <li key={a.id}>↳ {a.title} · {show(a.company)} · {(a.sources || []).map((x) => x.name).join(", ")}</li>)}</ul>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
-      {unknown.length > 0 && <p className={`text-xs mt-3 ${T.faint}`}>Non précisé dans l'annonce : {unknown.join(", ")}.</p>}
-      {s && (s.strengths?.length > 0 || s.gaps?.length > 0 || s.redFlags?.length > 0) && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 mt-4 text-sm">
-          {s.strengths.slice(0, 3).map((x, i) => <div key={`s${i}`} className="flex gap-2"><Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" aria-hidden="true" />{x}</div>)}
-          {s.gaps.slice(0, 3).map((x, i) => <div key={`g${i}`} className="flex gap-2"><ArrowRight className={`w-4 h-4 mt-0.5 shrink-0 ${T.faint}`} aria-hidden="true" />{x}</div>)}
-          {s.redFlags.slice(0, 2).map((r, i) => <div key={`r${i}`} className="flex gap-2 text-rose-600"><Flag className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />{r.evidence}</div>)}
-        </div>
-      )}
-    </section>
+
+      <section>
+        <SectionTitle>Sources ({o.sources?.length || 0})</SectionTitle>
+        <ul className="space-y-3">
+          {(o.sources || []).map((src, i) => (
+            <li key={i} className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-medium">{src.name}</span>
+                <span className={`text-xs ${T.faint}`}>via {src.via} · collectée {fmtDate(src.collectedAt, { time: true })}</span>
+                {src.verified === true && <Chip tone="ok">URL vérifiée</Chip>}
+                {src.verified === false && <Chip tone="warn">URL à vérifier</Chip>}
+              </div>
+              {src.emailSubject && <div className={`text-xs mt-1 ${T.muted}`}>E-mail : {src.emailSubject}</div>}
+              <div className="mt-1 text-sm break-all">{src.url ? <ExtLink href={src.url}>{src.url}</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </Drawer>
   );
 }
 
@@ -4988,6 +6116,65 @@ function BulletList({ title, items, icon: Icon, danger, empty = "—" }) {
         </ul>
       )}
     </div>
+  );
+}
+
+const SPONT_EMPTY = { mode: "company", role: "", company: "", website: "", location: "", contactName: "", language: "fr", context: "" };
+const SPONT_MODES = [
+  ["company", "Candidature spontanée", "Vous ciblez une entreprise qui n'a pas publié d'offre. CV, lettre, message LinkedIn et e-mail ; suivi dans le pipeline (relances, contacts)."],
+  ["base", "CV de base", "Un CV prêt pour un type de rôle, sans entreprise : pour un cabinet de recrutement, un message LinkedIn, ou comme point de départ."],
+];
+
+function SpontaneousModal({ open, onClose }) {
+  const T = useT();
+  const { createSpontaneous, criteria } = useApp();
+  const roles = activeVersion(criteria)?.roles || [];
+  const [d, setD] = useState(SPONT_EMPTY);
+  useEffect(() => { if (open) setD(SPONT_EMPTY); }, [open]);
+  const set = (k, v) => setD((x) => ({ ...x, [k]: v }));
+  const base = d.mode === "base";
+  const ok = !!d.role.trim() && (base || !!d.company.trim());
+  const submit = () => { if (!ok) return; createSpontaneous(d); onClose(); };
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="CV ou lettre sans offre"
+      wide
+      footer={<><Btn variant="ghost" onClick={onClose}>Annuler</Btn><Btn variant="primary" icon={Sparkles} disabled={!ok} onClick={submit}>Créer et ouvrir le studio</Btn></>}
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" role="radiogroup" aria-label="Type de dossier">
+          {SPONT_MODES.map(([id, label, text]) => (
+            <button key={id} type="button" role="radio" aria-checked={d.mode === id} onClick={() => set("mode", id)} className={`text-left rounded-2xl p-4 border-2 transition-colors ${d.mode === id ? "border-indigo-500" : T.line} ${T.ring}`}>
+              <div className="text-sm font-medium">{label}</div>
+              <div className={`text-xs mt-1 leading-relaxed ${T.muted}`}>{text}</div>
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Field label="Rôle visé *" hint="Ex. Head of Digital, Digital Transformation Manager">
+            <Input value={d.role} onChange={(e) => set("role", e.target.value)} list="spont-roles" data-autofocus />
+            <datalist id="spont-roles">{roles.map((r) => <option key={r} value={r} />)}</datalist>
+          </Field>
+          {!base && <Field label="Entreprise ciblée *"><Input value={d.company} onChange={(e) => set("company", e.target.value)} /></Field>}
+          {!base && <Field label="Site web (facultatif)"><Input value={d.website} onChange={(e) => set("website", e.target.value)} placeholder="entreprise.be" /></Field>}
+          {!base && <Field label="Interlocuteur (facultatif)" hint="Nom et fonction, si vous le connaissez"><Input value={d.contactName} onChange={(e) => set("contactName", e.target.value)} placeholder="Mme Anne Dupont, CIO" /></Field>}
+          <Field label="Lieu (facultatif)"><Input value={d.location} onChange={(e) => set("location", e.target.value)} placeholder="Bruxelles, Wavre…" /></Field>
+          <Field label="Langue des documents">
+            <Select value={d.language} onChange={(e) => set("language", e.target.value)} className="w-full">
+              <option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+            </Select>
+          </Field>
+        </div>
+        <Field
+          label={base ? "Contexte (facultatif)" : "Pourquoi cette entreprise ? (recommandé)"}
+          hint={base ? "Secteurs ou types d'organisations visés, ce que vous voulez mettre en avant." : "Activité, projets, actualité, enjeux digitaux, valeurs, lien avec vous. Seule source d'information sur l'entreprise : l'IA n'invente aucun fait."}
+        >
+          <Textarea rows={6} value={d.context} onChange={(e) => set("context", e.target.value)} placeholder={base ? "Ex. fédérations, mutualités, secteur public bruxellois ; mettre en avant CRM et automatisation." : "Ex. lance un programme de digitalisation de son service membres ; nouveau CEO en 2026 ; utilise Dynamics 365…"} />
+        </Field>
+      </div>
+    </Modal>
   );
 }
 
@@ -5036,9 +6223,8 @@ function nextStep(a) {
 
 function PipelineView() {
   const T = useT();
-  const { apps, offers, settings, setSettings, requestMove, openApp, go, checkReplies, busy, inbox, setReplyOpen, monitoredCount } = useApp();
+  const { apps, offers, settings, requestMove, openApp, go, setSpontOpen } = useApp();
   const [over, setOver] = useState(null);
-  const pendingMail = inbox.replies.length + inbox.untracked.length;
   const [showClosed, setShowClosed] = useState(true);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
   const cols = STAGES.filter((s) => showClosed || s.id !== "closed");
@@ -5047,22 +6233,10 @@ function PipelineView() {
       <PageHeader
         title="Pipeline"
         subtitle="Glissez une carte pour changer d'étape, ou ouvrez-la pour la déplacer au clavier."
-        actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
+        actions={<><Btn variant="ghost" onClick={() => setShowClosed(!showClosed)}>{showClosed ? "Masquer" : "Afficher"} les clôturées</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn><Btn icon={Briefcase} onClick={() => go("offers")}>Ajouter depuis les offres</Btn></>}
       />
-      <Card className="p-4 mb-6 flex flex-wrap items-center gap-3">
-        <span className={`w-9 h-9 rounded-xl flex items-center justify-center ${T.sub}`}><MailCheck className={`w-4 h-4 ${T.muted}`} aria-hidden="true" /></span>
-        <div className="flex-1 min-w-48">
-          <div className="text-sm font-medium">Surveillance Gmail</div>
-          <div className={`text-xs ${T.muted}`}>
-            {monitoredCount} candidature(s) suivie(s) · vérifié {relTime(settings.lastReplyCheckAt)} · {settings.autoReplies ? `automatique à l'ouverture, toutes les ${settings.autoRepliesHours} h` : "vérification manuelle"} · accusés ATS, réponses, invitations, refus, candidatures non suivies · lecture seule
-          </div>
-        </div>
-        <label className={`inline-flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={!!settings.autoReplies} onChange={(e) => setSettings((x) => ({ ...x, autoReplies: e.target.checked }))} />Auto</label>
-        {pendingMail > 0 && <Btn variant="primary" icon={Inbox} onClick={() => setReplyOpen(true)}>{pendingMail} à valider</Btn>}
-        <Btn icon={RefreshCw} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
-      </Card>
       {apps.length === 0 ? (
-        <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre pour démarrer une candidature." action={<Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn>} /></Card>
+        <Card><Empty icon={Columns} title="Pipeline vide" text="Retenez une offre ou lancez une candidature spontanée." action={<div className="flex flex-wrap justify-center gap-2"><Btn variant="primary" onClick={() => go("offers")}>Voir les offres</Btn><Btn icon={Plus} onClick={() => setSpontOpen(true)}>Candidature spontanée</Btn></div>} /></Card>
       ) : (
         <div className="flex gap-4 overflow-x-auto pb-6 -mx-4 px-4 sm:mx-0 sm:px-0" style={{ scrollSnapType: "x proximity" }}>
           {cols.map((st) => {
@@ -5085,9 +6259,6 @@ function PipelineView() {
                   {list.map((a) => {
                     const o = offerOf(a);
                     const ns = nextStep(a);
-                    const le = lastEmail(a);
-                    const sil = silenceDays(a);
-                    const waiting = inbox.replies.some((r) => r.appId === a.id);
                     return (
                       <li key={a.id}>
                         <button
@@ -5108,12 +6279,10 @@ function PipelineView() {
                           </div>
                           <div className="flex flex-wrap gap-1.5 mt-3">
                             {a.demo && <Chip>exemple</Chip>}
+                            {o?.spontaneous && <Chip tone="accent">spontanée</Chip>}
                             {a.closed && <Chip tone={a.closed.outcome === "accepted" ? "ok" : "neutral"}>{OUTCOME_LABEL[a.closed.outcome]}</Chip>}
                             {Object.keys(a.docs || {}).length > 0 && <Chip><FileText className="w-3 h-3" aria-hidden="true" />{Object.keys(a.docs).length} doc.</Chip>}
                             {ns && <Chip tone={ns.urgent ? "danger" : "neutral"}><Clock className="w-3 h-3" aria-hidden="true" />{ns.text}</Chip>}
-                            {waiting && <Chip tone="accent"><Inbox className="w-3 h-3" aria-hidden="true" />e-mail à valider</Chip>}
-                            {le && <Chip tone={le.kind === "refus" ? "danger" : ["invitation_entretien", "offre"].includes(le.kind) ? "ok" : "neutral"}><Mail className="w-3 h-3" aria-hidden="true" />{(REPLY_KINDS[le.kind] || "E-mail").toLowerCase()} · {relDay(le.date || le.at)}</Chip>}
-                            {sil !== null && sil >= (settings.ghostDays || 21) && <Chip tone="warn">sans nouvelles · {sil} j</Chip>}
                           </div>
                         </button>
                       </li>
@@ -5245,73 +6414,39 @@ function DupeReviewModal({ groups, setGroups, onApply, offers, apps }) {
   );
 }
 
-function ReplyReviewModal({ open, onClose, inbox, setInbox, onResolve, onResolveUntracked, apps, offers }) {
+function ReplyReviewModal({ replies, setReplies, onResolve, apps, offers }) {
   const T = useT();
-  if (!open) return null;
-  const replies = inbox.replies || [];
-  const untracked = inbox.untracked || [];
-  const ACTIONS = { log: "Journaliser seulement", sent: "Marquer « Envoyée » (date de l'e-mail)", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
-  const setAction = (id, action) => setInbox((ib) => ({ ...ib, replies: ib.replies.map((x) => (x.id === id ? { ...x, action } : x)) }));
+  if (!replies) return null;
+  const ACTIONS = { log: "Journaliser seulement", interview: "Passer en « Entretien »", offer: "Passer en « Offre »", closed: "Clôturer (refus)" };
   return (
-    <Modal open wide onClose={onClose} title={`E-mails détectés (${replies.length + untracked.length})`}>
-      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Rien n'est appliqué sans votre validation ; les relances en attente sont annulées en cas d'entretien, d'offre ou de refus. Les e-mails non traités restent ici jusqu'à votre décision.</p>
-      {!replies.length && !untracked.length && <Empty icon={MailCheck} title="Tout est traité" text="Aucun e-mail en attente de validation." />}
-      {replies.length > 0 && (
-        <>
-          <SectionTitle>Réponses aux candidatures suivies</SectionTitle>
-          <ul className="space-y-3 mb-6">
-            {replies.map((r) => {
-              const app = apps.find((a) => a.id === r.appId);
-              const o = offers.find((x) => x.id === app?.offerId);
-              return (
-                <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
-                    <Chip tone={r.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(r.kind) ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
-                    {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
-                  </div>
-                  <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
-                  <div className="text-sm mt-2">« {r.subject} »</div>
-                  {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
-                  {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
-                  <div className="flex flex-wrap items-center gap-2 mt-3">
-                    <Select value={r.action} onChange={(e) => setAction(r.id, e.target.value)} aria-label="Action" className="h-8 text-xs">
-                      {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-                    </Select>
-                    <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
-                    <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
-                    {gmailLink(r) && <ExtLink href={gmailLink(r)} className="text-xs">Gmail</ExtLink>}
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        </>
-      )}
-      {untracked.length > 0 && (
-        <>
-          <SectionTitle>Candidatures envoyées hors de Radar</SectionTitle>
-          <ul className="space-y-3">
-            {untracked.map((u) => (
-              <li key={u.id} className={`rounded-2xl p-4 ${T.sub}`}>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-medium">{u.title || "Poste non précisé"} · {u.company}</span>
-                  <Chip tone={u.kind === "refus" ? "danger" : "accent"}>{REPLY_KINDS[u.kind] || "E-mail"}</Chip>
-                  {!u.verified && <Chip tone="warn">à vérifier</Chip>}
-                </div>
-                <div className={`text-xs mt-1 ${T.muted}`}>{show(u.from)} · {u.date ? fmtDate(u.date) : NC}</div>
-                <div className="text-sm mt-2">« {u.subject} »</div>
-                {u.summary && <div className={`text-sm mt-1 ${T.muted}`}>{u.summary}</div>}
-                <div className="flex flex-wrap items-center gap-2 mt-3">
-                  <Btn size="sm" variant="primary" icon={Plus} onClick={() => onResolveUntracked(u, true)}>Ajouter au pipeline</Btn>
-                  <Btn size="sm" variant="ghost" onClick={() => onResolveUntracked(u, false)}>Ignorer</Btn>
-                  {gmailLink(u) && <ExtLink href={gmailLink(u)} className="text-xs">Gmail</ExtLink>}
-                </div>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+    <Modal open wide onClose={() => setReplies(null)} title={`Réponses détectées (${replies.length})`}>
+      <p className={`text-sm mb-4 ${T.muted}`}>Lecture seule dans Gmail. Validez chaque réponse : elle sera ajoutée au journal et l'étape n'avancera que si vous le choisissez. Les relances en attente sont annulées en cas d'entretien, d'offre ou de refus.</p>
+      <ul className="space-y-3">
+        {replies.map((r) => {
+          const app = apps.find((a) => a.id === r.appId);
+          const o = offers.find((x) => x.id === app?.offerId);
+          return (
+            <li key={r.id} className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium">{o?.title || "Candidature"} · {show(o?.company)}</span>
+                <Chip tone={r.kind === "refus" ? "danger" : r.kind === "invitation_entretien" || r.kind === "offre" ? "ok" : "neutral"}>{REPLY_KINDS[r.kind]}</Chip>
+                {!r.verified && <Chip tone="warn">objet non retrouvé dans les e-mails lus — à vérifier</Chip>}
+              </div>
+              <div className={`text-xs mt-1 ${T.muted}`}>{show(r.from)} · {r.date ? fmtDate(r.date) : NC}</div>
+              <div className="text-sm mt-2">« {r.subject} »</div>
+              {r.summary && <div className={`text-sm mt-1 ${T.muted}`}>{r.summary}</div>}
+              {r.interviewAt && <div className="text-xs mt-1">Entretien proposé : {fmtDate(r.interviewAt, { time: true })}</div>}
+              <div className="flex flex-wrap items-center gap-2 mt-3">
+                <Select value={r.action} onChange={(e) => setReplies(replies.map((x) => (x.id === r.id ? { ...x, action: e.target.value } : x)))} aria-label="Action" className="h-8 text-xs">
+                  {Object.entries(ACTIONS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                </Select>
+                <Btn size="sm" variant="primary" icon={Check} onClick={() => onResolve(r, true)}>Appliquer</Btn>
+                <Btn size="sm" variant="ghost" onClick={() => onResolve(r, false)}>Ignorer</Btn>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </Modal>
   );
 }
@@ -5346,7 +6481,7 @@ function ConfirmExternalModal({ confirm, onClose }) {
 
 function AppDrawer({ id, tab, setTab, onClose }) {
   const T = useT();
-  const { apps, offers, requestMove, openOffer } = useApp();
+  const { allApps: apps, offers, requestMove, openOffer } = useApp();
   const app = apps.find((a) => a.id === id);
   const offer = offers.find((o) => o.id === app?.offerId);
   if (!app) return null;
@@ -5354,15 +6489,17 @@ function AppDrawer({ id, tab, setTab, onClose }) {
   return (
     <Drawer
       open
+      expandable
       onClose={onClose}
       title={offer?.title || "Candidature"}
       subtitle={
         <span className="flex flex-wrap items-center gap-2">
           <span>{show(offer?.company)}</span>
           {offer?.sources?.find((x) => x.url) && (
-            <a href={offer.sources.find((x) => x.url).url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>Voir l'offre <ExternalLink className="w-3 h-3" aria-hidden="true" /></a>
+            <a href={offer.sources.find((x) => x.url).url} target="_blank" rel="noopener noreferrer" className={`inline-flex items-center gap-1 text-xs font-semibold ${T.accentText} hover:underline underline-offset-4 rounded ${T.ring}`}>{offer.spontaneous ? "Site de l'entreprise" : "Voir l'offre"} <ExternalLink className="w-3 h-3" aria-hidden="true" /></a>
           )}
-          {offer && <button type="button" className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>fiche Radar</button>}
+          {offer?.spontaneous && <Chip tone="accent">{SPONT_LABEL[offer.spontaneous]}</Chip>}
+          {offer && !offer.spontaneous && <button type="button" className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`} onClick={() => { onClose(); openOffer(offer.id); }}>fiche Radar</button>}
           {offer && <RatingChip company={offer.company} />}
         </span>
       }
@@ -5385,7 +6522,6 @@ function AppDrawer({ id, tab, setTab, onClose }) {
             { id: "track", label: "Suivi" },
             { id: "docs", label: "Dossier", count: Object.keys(app.docs || {}).length || undefined },
             { id: "followups", label: "Relances", count: fuPending || undefined },
-            { id: "emails", label: "E-mails", count: (app.emails || []).length || undefined },
             { id: "prep", label: "Entretien" },
             { id: "contacts", label: "Contacts", count: (app.contactIds || []).length || undefined },
           ]}
@@ -5394,7 +6530,6 @@ function AppDrawer({ id, tab, setTab, onClose }) {
       {tab === "track" && <TrackPanel app={app} offer={offer} />}
       {tab === "docs" && <DossierPanel app={app} offer={offer} />}
       {tab === "followups" && <AppFollowUps app={app} offer={offer} />}
-      {tab === "emails" && <EmailsPanel app={app} />}
       {tab === "prep" && <PrepPanel app={app} offer={offer} />}
       {tab === "contacts" && <AppContacts app={app} />}
     </Drawer>
@@ -5425,8 +6560,8 @@ function TrackPanel({ app, offer }) {
           />
         </Field>
         <div>
-          <span className={`block text-xs font-medium mb-1.5 ${T.muted}`}>Annonce</span>
-          <div className="text-sm break-all">{offer?.sources?.[0]?.url ? <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink> : <span className={T.faint}>URL {NC}</span>}</div>
+          <span className={`block text-xs font-medium mb-1.5 ${T.muted}`}>{offer?.spontaneous ? "Site de l'entreprise" : "Annonce"}</span>
+          <div className="text-sm break-all">{offer?.sources?.[0]?.url ? <ExtLink href={offer.sources[0].url}>{offer.spontaneous ? hostOf(offer.sources[0].url) : "Ouvrir l'annonce"}</ExtLink> : <span className={T.faint}>{offer?.spontaneous ? "Non renseigné" : `URL ${NC}`}</span>}</div>
         </div>
       </section>
 
@@ -5486,94 +6621,45 @@ function TrackPanel({ app, offer }) {
   );
 }
 
+const MSG_TYPES = DOC_TYPES.filter((d) => d.id !== "cv" && d.id !== "letter");
+
 function DossierPanel({ app, offer }) {
-  const T = useT();
-  const { generateDocs, busy } = useApp();
-  const [type, setType] = useState("studio");
-  const [instruction, setInstruction] = useState("");
+  const { generateDocs, busy, genStatus } = useApp();
+  const [type, setType] = useState("linkedin");
   const docs = app.docs || {};
-  const has = Object.keys(docs).length > 0;
   const loading = busy[`dossier:${app.id}`];
-  const others = DOC_TYPES.filter((d) => d.id !== "cv" && d.id !== "letter");
   const all = DOC_TYPES.filter((d) => docs[d.id]?.length).map((d) => {
     const v = docs[d.id].slice(-1)[0];
-    return `### ${d.label}\n${v.subject ? `Objet : ${v.subject}\n` : ""}${d.id === "cv" || d.id === "letter" ? docPlainText(v.text) : v.text}`;
+    return `### ${d.label}\n${v.subject ? `Objet : ${v.subject}\n` : ""}${v.format === "markup" ? docPlainText(v.text) : v.text}`;
   }).join("\n\n");
+  const msgCount = MSG_TYPES.filter((d) => docs[d.id]?.length).length;
   return (
     <div className="space-y-6">
-      <Notice icon={Info}>
-        La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Exportez le dossier puis ouvrez l'annonce.{" "}
-        {offer?.sources?.find((x) => x.url) && <ExtLink href={offer.sources.find((x) => x.url).url}>Ouvrir l'annonce</ExtLink>}
-      </Notice>
-      {!has ? (
-        <Card className="p-6">
-          {loading ? <Skeleton lines={6} /> : (
-            <>
-              <div className="text-base font-medium">Générer le dossier complet</div>
-              <p className={`text-sm mt-1 mb-4 ${T.muted}`}>CV et lettre prêts à envoyer (mots-clés de l'annonce pour les ATS, mise en page réglable dans le Studio, PDF et Word, traduction FR / NL / EN / DE), message LinkedIn, réponses probables au formulaire et e-mail, dans la langue de l'annonce ({offer?.language ? LANG_NAME[offer.language] : "détectée"}). Tout est éditable et versionné.</p>
-              <Field label="Consigne facultative"><Input value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Ex. insister sur l'automatisation, ton plus direct…" /></Field>
-              <Btn className="mt-4" variant="primary" icon={Sparkles} onClick={() => generateDocs(app.id, DOC_TYPES.map((d) => d.id), instruction)}>Générer</Btn>
-            </>
-          )}
-        </Card>
+      {offer?.spontaneous ? (
+        <Notice icon={Info}>
+          {offer.spontaneous === "base"
+            ? "CV de base : réutilisable pour un cabinet de recrutement, un message LinkedIn ou comme point de départ d'une candidature ciblée."
+            : "Candidature spontanée : envoyez le CV et la lettre en PDF à un décideur nommé (e-mail ou LinkedIn), puis planifiez une relance."}
+        </Notice>
       ) : (
-        <>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="overflow-x-auto"><Tabs value={type} onChange={setType} tabs={[{ id: "studio", label: "CV & lettre" }, ...others.map((d) => ({ id: d.id, label: d.label, count: docs[d.id]?.length || undefined }))]} /></div>
-            <CopyBtn text={all} label="Copier tout le dossier" />
-          </div>
-          {type === "studio" ? <StudioCards app={app} offer={offer} /> : <DocEditor key={`${app.id}-${type}`} app={app} type={type} />}
-        </>
+        <Notice icon={Info}>
+          La soumission automatique sur le site de l'employeur n'est pas possible depuis cet artefact (formulaires tiers, authentification). Ouvrez l'annonce et joignez le CV et la lettre en PDF.{" "}
+          {offer?.sources?.[0]?.url && <ExtLink href={offer.sources[0].url}>Ouvrir l'annonce</ExtLink>}
+        </Notice>
       )}
-    </div>
-  );
-}
-
-/* Cartes CV et lettre : vignette, langues, qualité, accès au Studio et à l'export. */
-function StudioCards({ app, offer }) {
-  const T = useT();
-  const { settings, media, openStudio, openExport, generateDocs, busy } = useApp();
-  const design = resolveDesign(app, settings, (app.docs?.cv || []).slice(-1)[0]?.accent);
-  const loading = busy[`dossier:${app.id}`];
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {[["cv", "CV"], ["letter", "Lettre de motivation"]].map(([kind, label]) => {
-          const langs = docLangs(app, offer, kind);
-          const lang = langs.includes(app.docLanguage) ? app.docLanguage : langs[0];
-          const v = lang ? latestDoc(app, offer, kind, lang) : null;
-          const legacy = !v && (app.docs?.[kind] || []).length > 0;
-          const q = v ? docQuality(v.text, { kind, lang, keywords: kind === "cv" ? v.keywords : [], kwLang: offer?.language, design }) : null;
-          return (
-            <Card key={kind} className="p-4 flex gap-4">
-              {v ? <button type="button" onClick={() => openStudio(app.id, kind)} className={`shrink-0 rounded-xl ${T.ring}`} aria-label={`Ouvrir ${label} dans le Studio`}><DocThumb text={v.text} kind={kind} design={design} photo={media.photo} lang={lang} width={104} /></button>
-                : <div className={`shrink-0 rounded-xl flex items-center justify-center ${T.sub}`} style={{ width: 104, height: 147 }}><FileText className={`w-6 h-6 ${T.faint}`} aria-hidden="true" /></div>}
-              <div className="flex-1 min-w-0 flex flex-col gap-2">
-                <div className="text-sm font-medium">{label}</div>
-                {v ? (
-                  <>
-                    <div className="flex flex-wrap gap-1">{langs.map((l) => <Chip key={l} tone={l === lang ? "accent" : "neutral"}>{LANG_FLAG[l]}</Chip>)}</div>
-                    <div className="flex flex-wrap gap-1"><Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"}>qualité {q.score}</Chip><Chip>{TEMPLATE_BY_ID[design.template]?.label || "Personnalisé"}</Chip></div>
-                    <div className="mt-auto"><Btn size="sm" variant="primary" icon={Palette} onClick={() => openStudio(app.id, kind)}>Ouvrir le Studio</Btn></div>
-                  </>
-                ) : (
-                  <>
-                    <p className={`text-xs ${T.muted}`}>{legacy ? "Ancien format : régénérez pour la mise en page." : "Pas encore généré."}</p>
-                    <div className="mt-auto"><Btn size="sm" icon={Sparkles} loading={loading} onClick={() => generateDocs(app.id, [kind])}>Générer</Btn></div>
-                  </>
-                )}
-              </div>
-            </Card>
-          );
-        })}
-      </div>
-      <div className={`flex flex-wrap items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">Exporter</div>
-          <div className={`text-xs ${T.muted}`}>PDF ou Word, une ou plusieurs langues, fichiers séparés ou fusionnés en un seul.</div>
+      <section>
+        <SectionTitle action={all ? <CopyBtn text={all} label="Copier tout le dossier" /> : null}>CV et lettre — studio plein écran</SectionTitle>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <StudioDocCard app={app} offer={offer} type="cv" />
+          <StudioDocCard app={app} offer={offer} type="letter" />
         </div>
-        <Btn icon={FileDown} onClick={() => openExport(app.id)} disabled={!docLangs(app, offer, "cv").length && !docLangs(app, offer, "letter").length}>Exporter</Btn>
-      </div>
+        {loading && genStatus[app.id] && <div className="mt-3"><GenSteps st={genStatus[app.id]} /></div>}
+      </section>
+      <section>
+        <SectionTitle action={!msgCount && !loading ? <Btn size="sm" variant="ghost" icon={Sparkles} onClick={() => generateDocs(app.id, MSG_TYPES.map((d) => d.id))}>Générer les messages</Btn> : null}>Messages et formulaires</SectionTitle>
+        <div className="overflow-x-auto mb-4"><Tabs value={type} onChange={setType} tabs={MSG_TYPES.map((d) => ({ id: d.id, label: d.label, count: docs[d.id]?.length || undefined }))} /></div>
+        <DocEditor key={`${app.id}-${type}`} app={app} type={type} />
+      </section>
     </div>
   );
 }
@@ -5582,7 +6668,7 @@ const slugFile = (x) => normText(x || "").replace(/\s+/g, "-").slice(0, 40) || "
 
 function DocEditor({ app, type }) {
   const T = useT();
-  const { saveDocVersion, generateDocs, busy, settings, createGmailDraft, contacts } = useApp();
+  const { saveDocVersion, generateDocs, busy, settings, createGmailDraft, contacts, openStudio } = useApp();
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
   const v = versions[idx];
@@ -5597,6 +6683,9 @@ function DocEditor({ app, type }) {
   const dirty = v && (text !== v.text || (type === "email" && subject !== (v.subject || "")));
   const warn = mentionsEmployer(`${subject}\n${text}`, settings.employerNames);
 
+  if (type === "cv" || type === "letter") {
+    return <Card className="p-6"><Empty icon={FileText} title={DOC_LABEL[type]} text="Le CV et la lettre se travaillent dans le studio plein écran." action={<Btn variant="primary" icon={Maximize2} onClick={() => openStudio(app.id, type)}>Ouvrir le studio</Btn>} /></Card>;
+  }
   if (!v) {
     return (
       <Card className="p-6">
@@ -5616,13 +6705,6 @@ function DocEditor({ app, type }) {
         {dirty && <Chip tone="warn">modifications non enregistrées</Chip>}
       </div>
       {warn.length > 0 && <Notice tone="danger" icon={AlertTriangle}>Ce document mentionne votre employeur actuel ({warn.join(", ")}). Vérifiez que c'est voulu avant toute diffusion.</Notice>}
-      {(type === "cv" || type === "letter") && <Notice icon={Info}>Ancien format : régénérez ce document pour l'ouvrir dans le Studio (mise en page, traduction, PDF et Word).</Notice>}
-      {type === "cv" && v.highlights?.length > 0 && (
-        <div className={`rounded-2xl p-4 ${T.sub}`}>
-          <div className={`text-xs font-medium mb-2 ${T.muted}`}>Points clés à mettre en avant</div>
-          <ul className="space-y-1 text-sm">{v.highlights.map((h, i) => <li key={i} className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-1 shrink-0 ${T.accentText}`} aria-hidden="true" />{h}</li>)}</ul>
-        </div>
-      )}
       {type === "email" && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Field label="Objet"><Input value={subject} onChange={(e) => setSubject(e.target.value)} /></Field>
@@ -5633,7 +6715,7 @@ function DocEditor({ app, type }) {
         </div>
       )}
       {loading ? <Card className="p-6"><Skeleton lines={8} /></Card> : (
-        <Textarea rows={type === "linkedin" ? 5 : 16} value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: FONT }} />
+        <AutoTextarea value={text} onChange={(e) => setText(e.target.value)} aria-label={DOC_LABEL[type]} style={{ fontFamily: FONT, minHeight: type === "linkedin" ? 110 : 280 }} />
       )}
       {type === "linkedin" && (
         <p className={`text-xs ${text.length > 300 ? "text-rose-600" : T.faint}`}>{text.length} / 300 caractères (limite d'une invitation). Envoi manuel depuis LinkedIn : aucune automatisation possible.</p>
@@ -5648,6 +6730,1566 @@ function DocEditor({ app, type }) {
         <Btn icon={RefreshCw} loading={loading} onClick={() => generateDocs(app.id, [type], instr)}>Régénérer</Btn>
       </div>
     </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   13 bis. STUDIO CV & LETTRE — plein écran : éditeur structuré, aperçu A4 paginé, optimisation
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Aperçu papier : mêmes métriques que le PDF (Helvetica, tailles en points, marges en mm, pagination par blocs). */
+const MM = 96 / 25.4, PT = 96 / 72;
+const PAPER_FONT = { fontFamily: 'Helvetica, "Helvetica Neue", Arial, sans-serif', color: "#2d2d2d", fontSize: 10 * PT, lineHeight: 1.38, textAlign: "left" };
+const PAGE_BODY = 263 * MM;
+
+function Marked({ text }) {
+  return String(text || "").split(/(\[à compléter[^\]]*\])/gi).map((x, i) => (/^\[à compléter/i.test(x)
+    ? <mark key={i} style={{ background: "#fef3c7", color: "#92400e", borderRadius: 3 }}>{x}</mark>
+    : <React.Fragment key={i}>{x}</React.Fragment>));
+}
+
+function PaperBlock({ b, kind, A }) {
+  const cv = kind === "cv";
+  const pad = (before, after) => ({ paddingTop: before * MM, paddingBottom: after * MM });
+  const fs = (pt) => ({ fontSize: pt * PT, lineHeight: 1.38 });
+  if (b.t === "name") return <div style={{ ...pad(0, 0.6), ...fs(cv ? 22 : 16), fontWeight: 700, color: A }}><Marked text={b.text} /></div>;
+  if (b.t === "quote") return cv
+    ? <div style={{ ...pad(0, 1.2), ...fs(11), color: "#464646" }}><Marked text={b.text} /></div>
+    : <div style={{ ...pad(0, 0.2), ...fs(10) }}><Marked text={b.text} /></div>;
+  if (b.t === "contact") return <div style={pad(0, 5)}><div style={{ ...fs(9), color: "#6e6e6e", paddingBottom: 1.6 * MM, borderBottom: `${0.7 * MM}px solid ${A}` }}><Marked text={b.text} /></div></div>;
+  if (b.t === "date") return <div style={{ ...pad(2, 3), ...fs(10), color: "#5a5a5a", textAlign: "right" }}><Marked text={b.text} /></div>;
+  if (b.t === "h2") return cv
+    ? <div style={pad(2.5, 2.6)}><div style={{ ...fs(10.5), fontWeight: 700, color: A, textTransform: "uppercase", paddingBottom: 0.4 * MM, borderBottom: `${0.25 * MM}px solid #d7d7d7` }}>{b.text}</div></div>
+    : <div style={{ ...pad(2, 3), ...fs(10.5), fontWeight: 700, color: "#1e1e1e" }}><Marked text={b.text} /></div>;
+  if (b.t === "h3") {
+    const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+    return (
+      <div style={pad(0.8, parts.length > 1 ? 1 : 0)}>
+        <div style={{ ...fs(10.5), fontWeight: 700, color: "#191919", paddingBottom: 0.2 * MM }}><Marked text={parts[0]} /></div>
+        {parts.length > 1 && <div style={{ ...fs(9), color: "#737373" }}><Marked text={parts.slice(1).join("  ·  ")} /></div>}
+      </div>
+    );
+  }
+  if (b.t === "bullet") return (
+    <div style={{ ...pad(0, 0.7), ...fs(10), paddingLeft: 4.5 * MM, position: "relative" }}>
+      <span style={{ position: "absolute", left: 0.65 * MM, top: (10 * PT * 1.38) / 2 - 0.65 * MM, width: 1.3 * MM, height: 1.3 * MM, borderRadius: 9, background: A }} />
+      <Marked text={b.text} />
+    </div>
+  );
+  if (b.t === "kv") return <div style={{ ...pad(0, 0.9), ...fs(10) }}><strong style={{ color: "#1e1e1e" }}>{b.label}</strong> <Marked text={b.text} /></div>;
+  if (b.t === "sign") return <div style={{ ...pad(4, 1), ...fs(10), fontWeight: 700 }}>{b.text}</div>;
+  return <div style={{ ...pad(0, cv ? 1.8 : 3.2), ...fs(10) }}><Marked text={b.text} /></div>;
+}
+
+function paginate(hs, blocks) {
+  const pages = [[]];
+  const KEEP = 50 * MM;
+  let y = 0;
+  blocks.forEach((b, i) => {
+    let need = hs[i];
+    if ((b.t === "h2" || b.t === "h3") && i + 1 < blocks.length) need += Math.min(hs[i + 1], KEEP);
+    else if (!(["para", "bullet", "kv"].includes(b.t) && hs[i] < KEEP)) need = Math.min(hs[i], 14 * PT * 1.38);
+    if (y > 0 && y + need > PAGE_BODY) { pages.push([]); y = 0; }
+    pages[pages.length - 1].push(i);
+    y += hs[i];
+  });
+  return pages;
+}
+
+function PaperPages({ text, accent, kind, zoom = 1, maxPages, onPages, onPick, activeSec }) {
+  const A = cleanHex(accent);
+  const blocks = useMemo(() => layoutBlocks(text, kind), [text, kind]);
+  const mRef = useRef(null);
+  const [layout, setLayout] = useState(null);
+  const [hover, setHover] = useState(null);
+  useLayoutEffect(() => {
+    const el = mRef.current;
+    if (!el) return;
+    const p = paginate([...el.children].map((c) => c.getBoundingClientRect().height), blocks);
+    setLayout({ blocks, pages: p });
+    onPages?.(p.length);
+  }, [blocks, A]); // eslint-disable-line react-hooks/exhaustive-deps
+  /* La pagination n'est utilisée que si elle correspond aux blocs courants (sinon : une page, le temps de la mesure). */
+  const pages = layout && layout.blocks === blocks ? layout.pages : null;
+  const list = (pages || [blocks.map((_, i) => i)]).slice(0, maxPages || undefined);
+  const W = 210 * MM, H = 297 * MM;
+  return (
+    <>
+      <div ref={mRef} aria-hidden="true" style={{ position: "fixed", left: -20000, top: 0, width: 174 * MM, visibility: "hidden", pointerEvents: "none", ...PAPER_FONT }}>
+        {blocks.map((b, i) => <PaperBlock key={i} b={b} kind={kind} A={A} />)}
+      </div>
+      <div className="flex flex-col items-center" style={{ gap: Math.round(28 * zoom) + 4 }}>
+        {list.map((pg, pi) => (
+          <div key={pi} style={{ width: W * zoom, height: H * zoom, flexShrink: 0 }}>
+            <div style={{ width: W, height: H, transform: `scale(${zoom})`, transformOrigin: "top left", background: "#ffffff", boxShadow: "0 1px 3px rgba(0,0,0,.08), 0 18px 40px -22px rgba(0,0,0,.35)", padding: `${18 * MM}px ${18 * MM}px 0`, boxSizing: "border-box", position: "relative", overflow: "hidden", ...PAPER_FONT }}>
+              {pg.map((i) => {
+                const b = blocks[i];
+                const on = onPick && (hover === b.sec || activeSec === b.sec);
+                return (
+                  <div
+                    key={i}
+                    onMouseEnter={onPick ? () => setHover(b.sec) : undefined}
+                    onMouseLeave={onPick ? () => setHover(null) : undefined}
+                    onClick={onPick ? () => onPick(b.sec) : undefined}
+                    title={onPick ? "Modifier ce passage" : undefined}
+                    style={{ cursor: onPick ? "pointer" : undefined, background: on ? "rgba(79,70,229,0.07)" : undefined, boxShadow: on ? "-8px 0 0 rgba(79,70,229,0.07), 8px 0 0 rgba(79,70,229,0.07)" : undefined }}
+                  >
+                    <PaperBlock b={b} kind={kind} A={A} />
+                  </div>
+                );
+              })}
+              {pages && pages.length > 1 && <div style={{ position: "absolute", right: 18 * MM, top: 288 * MM - 8 * PT, fontSize: 8 * PT, color: "#969696" }}>{pi + 1} / {pages.length}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function useMedia(q) {
+  const get = () => typeof window !== "undefined" && !!window.matchMedia?.(q).matches;
+  const [m, setM] = useState(get);
+  useEffect(() => {
+    const mq = window.matchMedia?.(q);
+    if (!mq) return undefined;
+    const h = () => setM(mq.matches);
+    mq.addEventListener?.("change", h);
+    return () => mq.removeEventListener?.("change", h);
+  }, [q]);
+  return m;
+}
+
+/* ── Champs de l'éditeur ── */
+function AutoTextarea({ value, onChange, className = "", style, ...rest }) {
+  const T = useT();
+  const ref = useRef(null);
+  const fit = () => { const el = ref.current; if (!el) return; el.style.height = "auto"; el.style.height = `${el.scrollHeight + 2}px`; };
+  useLayoutEffect(fit, [value]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    let w = el.offsetWidth;
+    const ro = new ResizeObserver(() => { if (el.offsetWidth !== w) { w = el.offsetWidth; fit(); } });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return <textarea ref={ref} rows={1} value={value} onChange={onChange} {...rest} className={`w-full resize-none rounded-xl px-3 py-2 text-sm leading-relaxed ${T.input} ${T.ring} ${className}`} style={{ overflow: "hidden", ...style }} />;
+}
+
+function MiniBtn({ icon: Icon, label, onClick, disabled, active }) {
+  const T = useT();
+  return (
+    <button type="button" aria-label={label} title={label} onClick={onClick} disabled={disabled} className={`inline-flex items-center justify-center w-7 h-7 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${active ? T.accentSoft : T.btnGhost} ${T.ring}`}>
+      <Icon className="w-3.5 h-3.5" aria-hidden="true" />
+    </button>
+  );
+}
+
+function AddLink({ onClick, children }) {
+  const T = useT();
+  return (
+    <button type="button" onClick={onClick} className={`inline-flex items-center gap-1.5 text-xs font-medium rounded-lg px-2 py-1 ${T.accentText} ${T.subHover} ${T.ring}`}>
+      <Plus className="w-3.5 h-3.5" aria-hidden="true" />{children}
+    </button>
+  );
+}
+
+const moveIn = (list, i, d) => { const j = i + d; if (j < 0 || j >= list.length) return list; const n = [...list]; [n[i], n[j]] = [n[j], n[i]]; return n; };
+
+/* Ligne éditable : outils (monter, descendre, supprimer) flottants au survol ou au focus, sans réduire la largeur du texte. */
+function RowTools({ children, bullet, onUp, onDown, onRemove }) {
+  const T = useT();
+  const [hot, setHot] = useState(false);
+  const [focus, setFocus] = useState(false);
+  const show = hot || focus;
+  return (
+    <div
+      className="relative flex items-start gap-1.5"
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
+      onFocus={() => setFocus(true)}
+      onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setFocus(false); }}
+    >
+      {bullet && <span className="shrink-0 rounded-full bg-indigo-500" style={{ width: 6, height: 6, marginTop: 15 }} aria-hidden="true" />}
+      <div className="flex-1 min-w-0">{children}</div>
+      <div className={`absolute flex rounded-lg ${T.surface}`} style={{ right: 6, top: -12, zIndex: 2, opacity: show ? 1 : 0, pointerEvents: show ? "auto" : "none", transition: "opacity .12s", ...T.shadow }}>
+        <MiniBtn icon={ArrowUp} label="Monter" onClick={onUp || undefined} disabled={!onUp} />
+        <MiniBtn icon={ArrowDown} label="Descendre" onClick={onDown || undefined} disabled={!onDown} />
+        <MiniBtn icon={X} label="Supprimer" onClick={onRemove} />
+      </div>
+    </div>
+  );
+}
+
+/* Liste de paragraphes ou de puces : Entrée crée l'élément suivant, Retour arrière sur un élément vide le supprime, un collage multiligne est découpé. */
+function ItemList({ items, onChange, bullet, placeholder, addLabel, warnAt = 230, allowEmpty, label }) {
+  const T = useT();
+  const wrap = useRef(null);
+  const focusItem = (id) => setTimeout(() => {
+    const el = wrap.current?.querySelector(`[data-item="${id}"]`);
+    if (el) { el.focus(); const n = el.value.length; el.setSelectionRange?.(n, n); }
+  }, 0);
+  const set = (id, text) => {
+    if (text.includes("\n")) {
+      const idx = items.findIndex((x) => x.id === id);
+      const parts = text.split(/\n+/).map((x) => (bullet ? x.replace(/^\s*[-•*–]\s+/, "") : x).trim());
+      const first = parts.shift();
+      const extra = parts.filter(Boolean).map((x) => mkItem(x));
+      const next = [...items];
+      next[idx] = { ...next[idx], text: first };
+      next.splice(idx + 1, 0, ...extra);
+      onChange(next);
+      if (extra.length) focusItem(extra[extra.length - 1].id);
+      return;
+    }
+    onChange(items.map((x) => (x.id === id ? { ...x, text } : x)));
+  };
+  const insertAfter = (id) => { const it = mkItem(); const i = items.findIndex((x) => x.id === id); const n = [...items]; n.splice(i + 1, 0, it); onChange(n); focusItem(it.id); };
+  const remove = (id, focusPrev) => {
+    const i = items.findIndex((x) => x.id === id);
+    const n = items.filter((x) => x.id !== id);
+    onChange(n.length || allowEmpty ? n : [mkItem()]);
+    if (focusPrev && n[i - 1]) focusItem(n[i - 1].id);
+  };
+  return (
+    <div ref={wrap} className="space-y-1.5">
+      {items.map((it, i) => (
+        <RowTools
+          key={it.id}
+          bullet={bullet}
+          onUp={i > 0 ? () => onChange(moveIn(items, i, -1)) : null}
+          onDown={i < items.length - 1 ? () => onChange(moveIn(items, i, 1)) : null}
+          onRemove={() => remove(it.id)}
+        >
+            <AutoTextarea
+              data-item={it.id}
+              value={it.text}
+              placeholder={placeholder}
+              aria-label={`${label || (bullet ? "Puce" : "Paragraphe")} ${i + 1}`}
+              onChange={(e) => set(it.id, e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); insertAfter(it.id); }
+                else if (e.key === "Backspace" && !it.text && (items.length > 1 || allowEmpty)) { e.preventDefault(); remove(it.id, true); }
+              }}
+            />
+            {it.text.length > warnAt && <div className="text-xs mt-0.5 text-amber-600">{it.text.length} caractères : trop long, visez {bullet ? "2 lignes" : "des phrases plus courtes"}.</div>}
+        </RowTools>
+      ))}
+      <AddLink onClick={() => { const it = mkItem(); onChange([...items, it]); focusItem(it.id); }}>{addLabel}</AddLink>
+      {!items.length && <span className={`text-xs ml-2 ${T.faint}`}>vide</span>}
+    </div>
+  );
+}
+
+function KvEditor({ rows, onChange }) {
+  const up = (id, patch) => onChange(rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  return (
+    <div className="space-y-1.5">
+      {rows.map((r, i) => (
+        <RowTools key={r.id} onUp={i > 0 ? () => onChange(moveIn(rows, i, -1)) : null} onDown={i < rows.length - 1 ? () => onChange(moveIn(rows, i, 1)) : null} onRemove={() => onChange(rows.filter((x) => x.id !== r.id))}>
+          <div className="flex items-start gap-2">
+            <Input value={r.label} onChange={(e) => up(r.id, { label: e.target.value })} placeholder="Libellé" aria-label={`Libellé ${i + 1}`} className="font-medium" style={{ width: "34%", minWidth: 110 }} />
+            <div className="flex-1 min-w-0">
+              <AutoTextarea value={r.value} onChange={(e) => up(r.id, { value: e.target.value.replace(/\n/g, " ") })} placeholder="élément, élément, élément" aria-label={`Valeur ${i + 1}`} onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }} />
+            </div>
+          </div>
+        </RowTools>
+      ))}
+      <AddLink onClick={() => onChange([...rows, { id: uid("r"), label: "", value: "" }])}>Ligne</AddLink>
+    </div>
+  );
+}
+
+const newEntry = () => ({ id: uid("e"), role: "", org: "", place: "", period: "", paras: [], bullets: [mkItem()] });
+function EntriesEditor({ entries, onChange, edu }) {
+  const T = useT();
+  const L = edu ? ["Diplôme", "Établissement", "Lieu", "Année"] : ["Fonction", "Organisation", "Lieu", "Période"];
+  const up = (id, patch) => onChange(entries.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  return (
+    <div className="space-y-3">
+      {entries.map((e, i) => (
+        <div key={e.id} className={`rounded-2xl p-3 space-y-2.5 ${T.sub}`}>
+          <div className="flex items-start gap-2">
+            <div className="flex-1 min-w-0 grid gap-2" style={{ gridTemplateColumns: "minmax(0,1.7fr) minmax(0,1fr)" }}>
+              <Input value={e.role} onChange={(ev) => up(e.id, { role: ev.target.value })} placeholder={L[0]} aria-label={L[0]} className="font-medium" />
+              <Input value={e.period} onChange={(ev) => up(e.id, { period: ev.target.value })} placeholder={L[3]} aria-label={L[3]} />
+              <Input value={e.org} onChange={(ev) => up(e.id, { org: ev.target.value })} placeholder={L[1]} aria-label={L[1]} />
+              <Input value={e.place} onChange={(ev) => up(e.id, { place: ev.target.value })} placeholder={`${L[2]} (facultatif)`} aria-label={L[2]} />
+            </div>
+            <div className="flex flex-col shrink-0">
+              <MiniBtn icon={ArrowUp} label="Monter" onClick={() => onChange(moveIn(entries, i, -1))} disabled={i === 0} />
+              <MiniBtn icon={ArrowDown} label="Descendre" onClick={() => onChange(moveIn(entries, i, 1))} disabled={i === entries.length - 1} />
+              <MiniBtn icon={Trash2} label="Supprimer" onClick={() => onChange(entries.filter((x) => x.id !== e.id))} />
+            </div>
+          </div>
+          {e.paras.length > 0 && <ItemList items={e.paras} onChange={(paras) => up(e.id, { paras })} placeholder="Contexte : organisation, périmètre, enjeu" addLabel="Paragraphe" warnAt={500} allowEmpty label="Contexte" />}
+          <ItemList bullet items={e.bullets} onChange={(bullets) => up(e.id, { bullets })} placeholder="Verbe d'action + périmètre + résultat chiffré" addLabel="Puce" allowEmpty />
+          {!e.paras.length && <AddLink onClick={() => up(e.id, { paras: [mkItem()] })}>Contexte (facultatif)</AddLink>}
+        </div>
+      ))}
+      <AddLink onClick={() => onChange([...entries, newEntry()])}>{edu ? "Diplôme" : "Poste"}</AddLink>
+    </div>
+  );
+}
+
+function SectionBody({ s, onChange }) {
+  const T = useT();
+  if (s.kind === "text") return <ItemList items={s.paras} onChange={(paras) => onChange({ ...s, paras })} placeholder="Paragraphe…" addLabel="Paragraphe" warnAt={900} />;
+  if (s.kind === "bullets") return <ItemList bullet items={s.items} onChange={(items) => onChange({ ...s, items })} placeholder="Verbe d'action + périmètre + résultat chiffré" addLabel="Puce" />;
+  if (s.kind === "kv") return <KvEditor rows={s.rows} onChange={(rows) => onChange({ ...s, rows })} />;
+  if (s.kind === "entries") return <EntriesEditor entries={s.entries} onChange={(entries) => onChange({ ...s, entries })} edu={SEC.education.test(s.title)} />;
+  return (
+    <div className="space-y-1">
+      <AutoTextarea value={s.raw} onChange={(e) => onChange({ ...s, raw: e.target.value })} aria-label="Texte balisé de la section" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5 }} />
+      <p className={`text-xs ${T.faint}`}>Section mixte, éditée en texte : « - » puce · « ### Poste | Organisation | Lieu | Période » · « **Libellé :** valeur » · ligne vide = paragraphe.</p>
+    </div>
+  );
+}
+
+const SECTION_KIND_LABEL = { text: "paragraphes", bullets: "liste à puces", entries: "postes / diplômes", kv: "libellés", raw: "texte balisé" };
+const AI_GOALS = [["impact", "Plus percutant"], ["concise", "Plus concis"], ["keywords", "Mots-clés manquants"], ["style", "Corriger le style"]];
+const PRESETS = {
+  kinds: ["text", "bullets", "entries", "kv", "kv", "entries", "bullets", "text", "text"],
+  fr: ["Profil", "Réalisations clés", "Expérience professionnelle", "Compétences", "Langues", "Formation", "Certifications", "Centres d'intérêt", "Section libre"],
+  nl: ["Profiel", "Belangrijkste realisaties", "Werkervaring", "Vaardigheden", "Talen", "Opleiding", "Certificaten", "Interesses", "Vrije sectie"],
+  en: ["Profile", "Key achievements", "Professional experience", "Skills", "Languages", "Education", "Certifications", "Interests", "Custom section"],
+};
+const newSection = (title, kind) => ({
+  id: uid("sec"), title, kind,
+  ...(kind === "text" ? { paras: [mkItem()] } : kind === "bullets" ? { items: [mkItem()] } : kind === "entries" ? { entries: [newEntry()] } : { rows: [{ id: uid("r"), label: "", value: "" }] }),
+});
+
+/* Affichage lisible d'un balisage et diff ligne à ligne (puis mot à mot) pour les propositions. */
+const displayMarkup = (s) => String(s || "").split("\n").map((l) => l.trim()).filter(Boolean)
+  .map((l) => l.replace(/^#{1,3} /, "").replace(/^[-•*] /, "• ").replace(/^[>@=~] /, "").replace(/\*\*/g, "").replace(/\s\|\s+\|?\s*/g, " · ")).join("\n");
+function lineDiff(a, b) {
+  const A = displayMarkup(a).split("\n").filter(Boolean), B = displayMarkup(b).split("\n").filter(Boolean);
+  const dp = Array.from({ length: A.length + 1 }, () => new Uint16Array(B.length + 1));
+  for (let i = A.length - 1; i >= 0; i--) for (let j = B.length - 1; j >= 0; j--) dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const rows = [];
+  let del = [], add = [];
+  const flush = () => {
+    const n = Math.min(del.length, add.length);
+    for (let k = 0; k < n; k++) rows.push({ t: "chg", segs: wordDiff(del[k], add[k]) });
+    del.slice(n).forEach((x) => rows.push({ t: "del", text: x }));
+    add.slice(n).forEach((x) => rows.push({ t: "add", text: x }));
+    del = []; add = [];
+  };
+  let i = 0, j = 0;
+  while (i < A.length || j < B.length) {
+    if (i < A.length && j < B.length && A[i] === B[j]) { flush(); rows.push({ t: "same", text: A[i] }); i++; j++; }
+    else if (j >= B.length || (i < A.length && dp[i + 1][j] >= dp[i][j + 1])) del.push(A[i++]);
+    else add.push(B[j++]);
+  }
+  flush();
+  return rows;
+}
+
+function DiffView({ before, after, compact }) {
+  const T = useT();
+  const rows = useMemo(() => lineDiff(before, after), [before, after]);
+  const addC = T.dark ? "bg-emerald-900 text-emerald-100" : "bg-emerald-100 text-emerald-900";
+  const delC = T.dark ? "bg-rose-950 text-rose-300" : "bg-rose-50 text-rose-700";
+  return (
+    <div className="space-y-1 text-sm leading-relaxed">
+      {rows.map((r, i) => {
+        if (r.t === "same") return compact ? null : <div key={i} className={T.faint}>{r.text}</div>;
+        if (r.t === "add") return <div key={i}><span className={`rounded px-0.5 ${addC}`}>{r.text}</span></div>;
+        if (r.t === "del") return <div key={i}><span className={`rounded px-0.5 line-through ${delC}`}>{r.text}</span></div>;
+        return (
+          <div key={i}>
+            {r.segs.map((s, k) => (s.t === "same" ? <span key={k}>{s.w} </span>
+              : s.t === "add" ? <span key={k} className={`rounded px-0.5 ${addC}`}>{s.w} </span>
+              : <span key={k} className={`rounded px-0.5 line-through ${delC}`}>{s.w} </span>))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SectionCard({ s, idx, count, kind, onChange, onMove, onRemove, onAI, aiBusy, proposal, onAccept, onReject, flash, missingCount, spont }) {
+  const T = useT();
+  const [aiOpen, setAiOpen] = useState(false);
+  const [custom, setCustom] = useState("");
+  const [confirmDel, setConfirmDel] = useState(false);
+  const isSubject = kind !== "cv" && idx === 0;
+  return (
+    <section id={`studio-sec-${idx}`} className={`rounded-3xl p-4 sm:p-5 space-y-3 ${T.surface}`} style={{ ...T.shadow, scrollMarginTop: 64, boxShadow: flash ? "0 0 0 2px rgba(99,102,241,.6)" : T.shadow.boxShadow, transition: "box-shadow .3s" }}>
+      <div className="flex items-center gap-1.5">
+        {isSubject ? <div className="flex-1 min-w-0 text-base font-semibold tracking-tight px-1.5">Corps de la lettre</div> : (
+          <input
+            value={s.title}
+            onChange={(e) => onChange({ ...s, title: e.target.value })}
+            placeholder={idx === 0 ? "Sans titre (introduction)" : "Titre de la section"}
+            aria-label="Titre de la section"
+            title={SECTION_KIND_LABEL[s.kind]}
+            className={`flex-1 min-w-0 bg-transparent text-base font-semibold tracking-tight rounded-lg px-1.5 py-1 ${T.ring}`}
+          />
+        )}
+        <Btn size="sm" variant={aiOpen ? "primary" : "ghost"} icon={Sparkles} loading={aiBusy} onClick={() => setAiOpen((o) => !o)} aria-expanded={aiOpen} aria-label="Améliorer avec l'IA" title="Améliorer avec l'IA"><span className="hidden sm:inline">Améliorer</span></Btn>
+        <MiniBtn icon={ArrowUp} label="Monter la section" onClick={() => onMove(-1)} disabled={idx === 0} />
+        <MiniBtn icon={ArrowDown} label="Descendre la section" onClick={() => onMove(1)} disabled={idx === count - 1} />
+        {confirmDel
+          ? <Btn size="sm" variant="danger" onClick={onRemove}>Supprimer ?</Btn>
+          : <MiniBtn icon={Trash2} label="Supprimer la section" onClick={() => { setConfirmDel(true); setTimeout(() => setConfirmDel(false), 3500); }} />}
+      </div>
+      {aiOpen && (
+        <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+          <div className="flex flex-wrap gap-1.5">
+            {AI_GOALS.filter(([g]) => kind === "cv" || g !== "keywords").map(([g, l]) => (
+              <Btn key={g} size="sm" variant="soft" disabled={aiBusy || (g === "keywords" && !missingCount)} onClick={() => onAI(g)}>
+                {l}{g === "keywords" ? ` (${missingCount || 0})` : ""}
+              </Btn>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <Input value={custom} onChange={(e) => setCustom(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && custom.trim()) onAI("custom", custom.trim()); }} placeholder="Votre consigne : « mettre en avant le management d'équipe »…" aria-label="Consigne de réécriture" className="h-8 text-xs" />
+            <Btn size="sm" disabled={!custom.trim() || aiBusy} onClick={() => onAI("custom", custom.trim())}>Réécrire</Btn>
+          </div>
+          <p className={`text-xs ${T.faint}`}>L'IA propose une nouvelle version de la section ; vous comparez avant d'appliquer.</p>
+        </div>
+      )}
+      {proposal && (
+        <div className={`rounded-2xl p-3 space-y-3 border ${T.line}`} style={{ borderColor: "rgba(99,102,241,.45)" }}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-xs font-semibold uppercase tracking-wider text-indigo-500">Proposition de réécriture</div>
+            {proposal.note && <span className={`text-xs ${T.muted}`}>{proposal.note}</span>}
+          </div>
+          <DiffView before={proposal.before} after={proposal.body} />
+          <div className="flex gap-2">
+            <Btn size="sm" variant="primary" icon={Check} onClick={onAccept}>Appliquer</Btn>
+            <Btn size="sm" variant="ghost" onClick={onReject}>Ignorer</Btn>
+          </div>
+        </div>
+      )}
+      {isSubject && (
+        <FieldBox label="Objet" hint={spont ? "Ex. « Candidature spontanée — rôle visé »." : "Reprenez l'intitulé exact du poste."}>
+          <Input value={s.title} onChange={(e) => onChange({ ...s, title: e.target.value })} aria-label="Objet de la lettre" />
+        </FieldBox>
+      )}
+      <SectionBody s={s} onChange={onChange} />
+    </section>
+  );
+}
+
+function FieldBox({ label, hint, children, className = "" }) {
+  const T = useT();
+  return (
+    <div className={className}>
+      <span className={`block text-xs font-medium mb-1.5 ${T.muted}`}>{label}</span>
+      {children}
+      {hint && <span className={`block text-xs mt-1 ${T.faint}`}>{hint}</span>}
+    </div>
+  );
+}
+
+function HeaderCard({ model, set, kind, lang, analysis, onHeadlines, hlBusy, hlOpts, flash }) {
+  const T = useT();
+  const { profile } = useApp();
+  const sug = analysis?.positioning?.headline;
+  const len = (model.headline || "").length;
+  const city = String(profile.home || "").split(/[(,]/)[0].trim();
+  const todayLine = lang === "fr" ? `${city}, le ${longDate("fr")}` : `${city}, ${longDate(lang)}`;
+  return (
+    <section id="studio-sec-head" className={`rounded-3xl p-4 sm:p-5 space-y-4 ${T.surface}`} style={{ ...T.shadow, scrollMarginTop: 64, boxShadow: flash ? "0 0 0 2px rgba(99,102,241,.6)" : T.shadow.boxShadow, transition: "box-shadow .3s" }}>
+      <div className="text-base font-semibold tracking-tight">En-tête</div>
+      <Field label="Prénom et nom"><Input value={model.name} onChange={(e) => set({ name: e.target.value })} placeholder="Prénom Nom" /></Field>
+      {kind !== "cv" && (
+        <FieldBox label="Lieu et date">
+          <Input value={model.date} onChange={(e) => set({ date: e.target.value })} aria-label="Lieu et date" />
+          <div className="mt-1"><AddLink onClick={() => set({ date: todayLine })}>Date du jour</AddLink></div>
+        </FieldBox>
+      )}
+      {kind === "cv" && (
+        <FieldBox label="Ligne sous le nom : votre positionnement" hint="Votre fonction réelle + 2 ou 3 expertises qui recoupent l'annonce. L'intitulé du poste visé se cite comme objectif dans le profil, pas ici.">
+          <AutoTextarea value={model.headline} onChange={(e) => set({ headline: e.target.value.replace(/\n/g, " ") })} onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }} placeholder={`${profile.headline || "Fonction actuelle"} | Expertise · Expertise · Expertise`} aria-label="Ligne sous le nom" />
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <span className={`text-xs tabular-nums ${len > 85 ? "text-amber-600" : T.faint}`}>{len}/85</span>
+            {sug && sug !== model.headline && (
+              <button type="button" onClick={() => set({ headline: sug })} className={`text-left text-xs rounded-full px-2.5 py-1 ${T.accentSoft} ${T.ring}`} title="Appliquer la suggestion de l'analyse">Suggestion : {sug}</button>
+            )}
+            <Btn size="sm" variant="ghost" icon={Sparkles} loading={hlBusy} onClick={onHeadlines}>4 variantes</Btn>
+          </div>
+          {hlOpts.length > 0 && (
+            <div className="mt-2 grid grid-cols-1 gap-1.5">
+              {hlOpts.map((o, i) => (
+                <button key={i} type="button" onClick={() => set({ headline: o.headline })} className={`text-left rounded-xl px-3 py-2 text-sm ${model.headline === o.headline ? T.accentSoft : `${T.sub} ${T.subHover}`} ${T.ring}`}>
+                  <span className="font-medium">{o.headline}</span>{o.angle && <span className={`text-xs ${T.muted}`}> · {o.angle}</span>}
+                </button>
+              ))}
+            </div>
+          )}
+        </FieldBox>
+      )}
+      <FieldBox label="Coordonnées" hint="Séparées par « | » : ville, e-mail, téléphone, LinkedIn.">
+        <AutoTextarea value={model.contact} onChange={(e) => set({ contact: e.target.value.replace(/\n/g, " ") })} onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }} aria-label="Coordonnées" />
+        <div className="mt-1"><AddLink onClick={() => set({ contact: profileContact(profile) })}>Reprendre depuis mon profil</AddLink></div>
+      </FieldBox>
+      {kind !== "cv" && (
+        <FieldBox label="Destinataire" hint="Une ligne par élément : service ou nom, entreprise, adresse.">
+          <AutoTextarea value={model.recipients} onChange={(e) => set({ recipients: e.target.value })} aria-label="Destinataire" />
+        </FieldBox>
+      )}
+    </section>
+  );
+}
+
+/* ── Panneau d'optimisation ── */
+function ScoreRing({ value }) {
+  const T = useT();
+  const v = clamp(Number(value) || 0, 0, 100);
+  const c = v >= 80 ? "#4f46e5" : v >= 60 ? "#d97706" : "#e11d48";
+  const r = 22, L = 2 * Math.PI * r;
+  return (
+    <svg width="56" height="56" viewBox="0 0 56 56" role="img" aria-label={`Score ${v} sur 100`}>
+      <circle cx="28" cy="28" r={r} fill="none" stroke={T.dark ? "#292524" : "#e7e5e4"} strokeWidth="5" />
+      <circle cx="28" cy="28" r={r} fill="none" stroke={c} strokeWidth="5" strokeLinecap="round" strokeDasharray={`${(v / 100) * L} ${L}`} transform="rotate(-90 28 28)" style={{ transition: "stroke-dasharray .4s" }} />
+      <text x="28" y="33" textAnchor="middle" fontSize="15" fontWeight="600" fill={T.dark ? "#fafaf9" : "#1c1917"}>{v}</text>
+    </svg>
+  );
+}
+/* Lettre : deux jauges — recouvrement avec le CV (≤ 15 %) et spécificité. */
+function LetterGauges({ scores }) {
+  const T = useT();
+  const ov = scores.overlap;
+  const ovTone = ov === null ? T.faint : ov > 30 ? "text-rose-600" : ov > 15 ? "text-amber-600" : "text-emerald-600";
+  const spTone = scores.spec === null ? T.faint : scores.spec >= 80 ? "text-emerald-600" : scores.spec >= 60 ? "text-amber-600" : "text-rose-600";
+  const Gauge = ({ label, value, unit, tone, hint, max }) => (
+    <div className={`rounded-2xl p-3 ${T.sub}`} title={hint}>
+      <div className={`text-xs ${T.muted}`}>{label}</div>
+      <div className={`text-2xl font-semibold tabular-nums ${tone}`}>{value === null || value === undefined ? "—" : `${value}${unit}`}</div>
+      <div className={`h-1.5 mt-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}>
+        <div className={`h-full rounded-full ${tone.replace("text-", "bg-")}`} style={{ width: `${value == null ? 0 : clamp((value / max) * 100, 0, 100)}%` }} />
+      </div>
+    </div>
+  );
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <Gauge label="Recouvrement CV" value={ov} unit=" %" tone={ovTone} max={50} hint="Part des suites de 4 mots de la lettre déjà présentes dans le CV. Cible ≤ 15 %, bloquant au-delà de 30 %." />
+      <Gauge label="Spécificité" value={scores.spec} unit="/100" tone={spTone} max={100} hint="Pourquoi eux (fait vérifié), conviction, histoire racontée, aucune flatterie." />
+    </div>
+  );
+}
+function ScoreBar({ label, value, hint }) {
+  const T = useT();
+  if (value === null || value === undefined) return null;
+  const c = value >= 80 ? "bg-indigo-600" : value >= 60 ? "bg-amber-500" : "bg-rose-500";
+  return (
+    <div title={hint}>
+      <div className="flex items-center justify-between text-xs mb-1"><span className={T.muted}>{label}</span><span className="tabular-nums font-medium">{value}</span></div>
+      <div className={`h-1.5 rounded-full overflow-hidden ${T.sub}`}><div className={`h-full rounded-full ${c}`} style={{ width: `${value}%`, transition: "width .3s" }} /></div>
+    </div>
+  );
+}
+const ISSUE_ICON = { block: [AlertTriangle, "text-rose-500"], warn: [AlertTriangle, "text-amber-500"], info: [Lightbulb, "text-stone-400"] };
+
+function IssueRow({ i, api }) {
+  const T = useT();
+  const [Icon, color] = ISSUE_ICON[i.level];
+  return (
+    <li className={`rounded-2xl p-3 ${T.sub}`}>
+      <div className="flex gap-2.5">
+        <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${color}`} aria-hidden="true" />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium leading-snug">{i.title}</div>
+          {i.detail && <div className={`text-xs mt-0.5 leading-relaxed ${T.muted}`}>{i.detail}</div>}
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {i.sec !== undefined && i.sec !== null && <Btn size="sm" variant="ghost" icon={ArrowRight} onClick={() => api.goTo(i.sec)}>Voir</Btn>}
+            {i.fix === "headline" && api.headlineFix && <Btn size="sm" variant="soft" icon={Check} onClick={api.applyHeadlineFix} title={api.headlineFix}>Appliquer la suggestion</Btn>}
+            {i.autoFix && <Btn size="sm" variant="soft" icon={Wand2} loading={api.busyFix} onClick={() => api.fix([{ title: i.title, detail: i.detail }])}>Corriger avec l'IA</Btn>}
+            {i.tab === "kw" && <Btn size="sm" variant="ghost" onClick={() => api.setTab("kw")}>Voir les mots-clés</Btn>}
+          </div>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function ProposalCard({ p, text, api }) {
+  const T = useT();
+  const stale = p.status === "pending" && applyEdit(text, p.before, p.after) === null;
+  if (p.status === "applied") return <li className={`text-xs flex items-center gap-1.5 ${T.faint}`}><Check className="w-3.5 h-3.5" aria-hidden="true" />Appliquée : {p.reason || displayMarkup(p.after).slice(0, 60)}</li>;
+  return (
+    <li className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {p.severity && <Chip tone={p.severity === "haute" ? "danger" : p.severity === "moyenne" ? "warn" : "neutral"}>{p.severity}</Chip>}
+        <Chip>{p.source}</Chip>
+        {p.reason && <span className={`text-xs ${T.muted}`}>{p.reason}</span>}
+      </div>
+      <DiffView before={p.before} after={p.after} />
+      {stale && <p className="text-xs text-amber-600">Passage introuvable : le texte a changé depuis la proposition.</p>}
+      <div className="flex gap-2">
+        <Btn size="sm" variant="primary" icon={Check} disabled={stale} onClick={() => api.applyProposal(p)}>Appliquer</Btn>
+        <Btn size="sm" variant="ghost" onClick={() => api.ignoreProposal(p.id)}>Ignorer</Btn>
+      </div>
+    </li>
+  );
+}
+
+/* 6c / 6d : CV maître par langue (base des CV adaptés) et puces verrouillées. */
+function MasterPanel({ app, offer, text }) {
+  const T = useT();
+  const { profile, setMasterCv, clearMasterCv, toggleLockedBullet } = useApp();
+  const lang = docLang(offer, { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, app.analysis);
+  const master = masterOf(profile, lang);
+  const locked = lockedOf(profile);
+  const bullets = master ? docOutline(master.text, "cv").sections.filter((s) => ["experience", "achievements"].includes(secKindOf(s.title))).flatMap((s) => s.lines.map((l) => l.trim()).filter((l) => /^[-•*]\s/.test(l)).map((l) => l.replace(/^[-•*]\s*/, ""))) : [];
+  return (
+    <div className="p-4 space-y-4">
+      <p className={`text-xs ${T.muted}`}>Le CV maître ({LANG_NAME[lang] || lang}) sert de base à chaque CV adapté : seuls la ligne de positionnement, le Profil, les Réalisations clés, l'ordre des puces de chaque poste et les Compétences changent. Le reste est recopié à l'identique, même si l'IA s'en écarte.</p>
+      {!master ? (
+        <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+          <div className="text-sm font-medium">Aucun CV maître en {LANG_NAME[lang] || lang}</div>
+          <Btn size="sm" variant="primary" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Faire de ce CV le CV maître</Btn>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-2 items-center">
+            <Chip tone="accent">maître {String(lang).toUpperCase()} du {fmtDate(master.at)}</Chip>
+            <Btn size="sm" variant="soft" icon={Save} onClick={() => setMasterCv(lang, text, app.id)}>Remplacer par ce CV</Btn>
+            <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => clearMasterCv(lang)}>Supprimer</Btn>
+          </div>
+          <div>
+            <SectionTitle>Écarts avec le maître</SectionTitle>
+            {normText(master.text) === normText(text) ? <p className={`text-xs ${T.faint}`}>Identique au maître.</p> : <DiffView before={master.text} after={text} compact />}
+          </div>
+          <div>
+            <SectionTitle>Puces verrouillées</SectionTitle>
+            <p className={`text-xs mb-2 ${T.muted}`}>Une puce verrouillée est recopiée mot pour mot : ni la génération, ni les corrections, ni la relecture ne la modifient.</p>
+            <ul className="space-y-1.5">
+              {bullets.map((b, i) => {
+                const on = locked.some((x) => bulletKey(x) === bulletKey(b));
+                return (
+                  <li key={i} className="flex gap-2 items-start text-sm">
+                    <button type="button" onClick={() => toggleLockedBullet(b)} aria-pressed={on} title={on ? "Déverrouiller" : "Verrouiller"} className={`shrink-0 mt-0.5 text-xs rounded-full px-2 py-0.5 ${on ? "bg-indigo-600 text-white" : T.chip} ${T.ring}`}>{on ? "verrouillée" : "libre"}</button>
+                    <span className="min-w-0">{b}</span>
+                  </li>
+                );
+              })}
+              {!bullets.length && <li className={`text-xs ${T.faint}`}>Aucune puce d'expérience ou de réalisation dans le maître.</li>}
+            </ul>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function OptimPanel({ app, offer, type, report, pages, text, api }) {
+  const T = useT();
+  const { busy, runAnalysis, setOfferAdText } = useApp();
+  const analysis = app.analysis;
+  const [kwFilter, setKwFilter] = useState("todo");
+  const [ad, setAd] = useState(adTextOf(offer));
+  const fixable = autoFixList(report);
+  const pending = api.proposals.filter((p) => p.status === "pending");
+  const applicable = pending.filter((p) => applyEdit(text, p.before, p.after) !== null);
+  const eligible = report.kw.filter((k) => k.status !== "absent" && (type === "cv" || k.importance === 3));
+  const toIntegrate = eligible.filter((k) => !k.found);
+  const kwShown = report.kw.filter((k) => (kwFilter === "todo" ? toIntegrate.includes(k) : kwFilter === "ok" ? k.found : kwFilter === "absent" ? k.status === "absent" : true));
+  const byCat = Object.keys(KW_CATS).map((c) => [c, kwShown.filter((k) => k.category === c).sort((a, b) => b.importance - a.importance)]).filter(([, l]) => l.length);
+  const groups = [["block", "À corriger avant envoi"], ["warn", "À améliorer"], ["info", "Conseils"]];
+  const tab = api.tab;
+  return (
+    <div className="flex flex-col min-h-full">
+      <div className={`p-4 space-y-3 border-b ${T.line}`}>
+        <div className="flex items-center gap-3">
+          <ScoreRing value={report.scores.total} />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium leading-snug">{report.blockers ? `${report.blockers} point(s) à corriger avant envoi` : "Prêt à envoyer après relecture"}</div>
+            <div className={`text-xs ${T.muted}`}>{report.words} mots · {pages || "…"} page(s){!analysis ? " · annonce non analysée" : ""}</div>
+          </div>
+        </div>
+        {type === "cv" ? (
+          <>
+            <ScoreBar label="Mots-clés ATS" value={report.scores.ats} hint="Couverture pondérée des mots-clés justifiables + intitulé exact" />
+            <ScoreBar label="Impact" value={report.scores.impact} hint="Puces chiffrées, verbes d'action, absence de clichés" />
+            <ScoreBar label="Lisibilité" value={report.scores.read} hint="Longueur, pages, sections, répétitions" />
+          </>
+        ) : (
+          <>
+            <LetterGauges scores={report.scores} />
+            <ScoreBar label="Spécificité (35 %)" value={report.scores.spec} hint="Faits propres à l'entreprise, conviction, histoire racontée, aucune flatterie" />
+            <ScoreBar label="Complémentarité avec le CV (25 %)" value={report.scores.compl} hint="Recouvrement de 4-grammes avec le CV ≤ 15 %, chiffres communs ≤ 1, 2 chiffres au plus" />
+            <ScoreBar label="Impact (20 %)" value={report.scores.impact} hint="Histoire racontée, objet, demande d'échange, aucun cliché" />
+            <ScoreBar label="Lisibilité (20 %)" value={report.scores.read} hint="Longueur, débuts de phrase, répétitions, une page" />
+          </>
+        )}
+      </div>
+      <div className="px-4 pt-3 overflow-x-auto">
+        <Tabs
+          compact
+          value={tab}
+          onChange={api.setTab}
+          tabs={[
+            { id: "checks", label: "Contrôles", count: report.issues.length || undefined },
+            { id: "kw", label: "Mots-clés", count: report.kwPct !== null ? `${report.kwPct} %` : undefined },
+            { id: "ai", label: "IA", count: pending.length || undefined },
+            { id: "ad", label: offer?.spontaneous ? "Cible" : "Annonce" },
+            ...(type === "cv" ? [{ id: "master", label: "Maître" }] : []),
+          ]}
+        />
+      </div>
+
+      {tab === "checks" && (
+        <div className="p-4 space-y-5">
+          {fixable.length > 0 && (
+            <div className={`rounded-2xl p-3 ${T.accentSoft}`}>
+              <Btn variant="primary" icon={Wand2} loading={api.busyFix} onClick={() => api.fix(fixable)}>Corriger automatiquement ({fixable.length})</Btn>
+              <p className="text-xs mt-2">L'IA propose des remplacements ciblés ({type === "cv" ? "titre, mots-clés, style" : "pourquoi eux, conviction, histoire, recouvrement avec le CV, style"}) ; vous validez chacun dans l'onglet IA.</p>
+            </div>
+          )}
+          {groups.map(([lvl, label]) => {
+            const items = report.issues.filter((i) => i.level === lvl);
+            if (!items.length) return null;
+            return (
+              <div key={lvl}>
+                <SectionTitle>{label}</SectionTitle>
+                <ul className="space-y-2">{items.map((i) => <IssueRow key={i.id} i={i} api={api} />)}</ul>
+              </div>
+            );
+          })}
+          {!report.issues.length && <Empty icon={CheckCircle2} title="Aucun point détecté" text="Relisez une dernière fois, puis lancez la relecture recruteur dans l'onglet IA." />}
+          {api.tips?.length > 0 && (
+            <div className={`rounded-2xl p-4 ${T.sub}`}>
+              <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
+              <ul className={`text-sm space-y-1 ${T.muted}`}>{api.tips.map((t, i) => <li key={i}>• {t}</li>)}</ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "kw" && (
+        <div className="p-4 space-y-4">
+          {!analysis && (
+            <Notice tone="warn" icon={Info}>
+              Annonce pas encore analysée : les mots-clés affichés viennent de l'ancienne version.{" "}
+              <button type="button" className="underline underline-offset-4" onClick={() => api.setTab("ad")}>Analyser l'annonce</button>
+            </Notice>
+          )}
+          <div>
+            <div className="flex items-center justify-between text-sm">
+              <span className="font-medium">{type === "cv" ? "Couverture pondérée" : "Mots-clés essentiels"}</span>
+              <span className="tabular-nums">{report.kwPct ?? "—"} %</span>
+            </div>
+            <div className={`h-2 rounded-full overflow-hidden mt-1.5 ${T.sub}`}><div className="h-full rounded-full bg-indigo-600" style={{ width: `${report.kwPct || 0}%` }} /></div>
+            <div className={`text-xs mt-1.5 ${T.muted}`}>
+              {eligible.length - toIntegrate.length}/{eligible.length} mots-clés {type === "cv" ? "justifiables" : "essentiels"} présents
+              {report.titleFound !== null && <> · intitulé exact {report.titleFound ? "présent" : <span className="text-amber-600">absent</span>}</>}
+            </div>
+          </div>
+          {toIntegrate.length > 0 && (
+            <Btn variant="primary" icon={Wand2} loading={api.busyFix} onClick={() => api.integrate(toIntegrate)}>Intégrer les {toIntegrate.length} manquants</Btn>
+          )}
+          <div className="overflow-x-auto">
+            <Tabs compact value={kwFilter} onChange={setKwFilter} tabs={[
+              { id: "todo", label: "À intégrer", count: toIntegrate.length },
+              { id: "ok", label: "Présents", count: report.kw.filter((k) => k.found).length },
+              { id: "absent", label: "Absents", count: report.kw.filter((k) => k.status === "absent").length },
+              { id: "all", label: "Tous" },
+            ]} />
+          </div>
+          {!kwShown.length && <p className={`text-sm ${T.faint}`}>{kwFilter === "todo" ? "Tous les mots-clés justifiables sont présents." : "Aucun."}</p>}
+          {byCat.map(([cat, list]) => (
+            <div key={cat}>
+              <SectionTitle>{KW_CATS[cat]}</SectionTitle>
+              <ul className="space-y-1">
+                {list.map((k) => (
+                  <li key={k.term} className="flex items-start gap-2 py-1">
+                    {k.found ? <Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-500" aria-label="présent" />
+                      : k.status !== "absent" ? <Circle className="w-4 h-4 mt-0.5 shrink-0 text-amber-500" aria-label="à intégrer" />
+                      : <Minus className={`w-4 h-4 mt-0.5 shrink-0 ${T.faint}`} aria-label="non prouvé" />}
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm">
+                        <span className="font-medium">{k.term}</span>
+                        <span className="ml-1.5 tracking-widest text-indigo-500" title={`Importance ${k.importance}/3`} aria-label={`Importance ${k.importance} sur 3`}>{"•".repeat(k.importance)}</span>
+                        {k.found && <span className={`text-xs ml-1.5 tabular-nums ${T.faint}`}>×{k.count}</span>}
+                      </div>
+                      <div className={`text-xs leading-relaxed ${k.status === "absent" && !k.found ? T.faint : T.muted}`}>
+                        {k.found ? `${k.where.map((w) => w.title).join(" · ")}${k.onlyList && type === "cv" ? " — seulement dans une liste" : ""}`
+                          : k.status !== "absent" ? `${k.status === "transférable" ? "Transférable" : "Prouvé"}${k.evidence ? ` : ${k.evidence}` : ""}`
+                          : "Non prouvé par votre profil : à préparer pour l'entretien."}
+                      </div>
+                    </div>
+                    {!k.found && k.status !== "absent" && <Btn size="sm" variant="ghost" disabled={api.busyFix} onClick={() => api.integrate([k])}>Intégrer</Btn>}
+                    {k.status === "absent" && !k.found && analysis && <Btn size="sm" variant="ghost" onClick={() => api.declare(k.term)} title="Vous avez réellement cette compétence : elle est ajoutée à votre profil">Je l'ai</Btn>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "ai" && (
+        <div className="p-4 space-y-4">
+          <div className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium">Relecture recruteur</div>
+                <div className={`text-xs ${T.muted}`}>Lecture critique du document et corrections ciblées.</div>
+              </div>
+              <Btn size="sm" variant={api.review ? "soft" : "primary"} icon={Sparkles} loading={api.busyReview} onClick={api.runReview}>{api.review ? "Relancer" : "Lancer"}</Btn>
+            </div>
+            {api.review && (
+              <div className="space-y-2 pt-1">
+                {api.review.score !== null && <Chip tone={api.review.score >= 80 ? "ok" : api.review.score >= 60 ? "warn" : "danger"}>{api.review.score}/100 selon le relecteur</Chip>}
+                {api.review.verdict && <p className="text-sm leading-relaxed">{api.review.verdict}</p>}
+                {api.review.strengths?.length > 0 && <ul className={`text-xs space-y-0.5 ${T.muted}`}>{api.review.strengths.map((s, i) => <li key={i}>+ {s}</li>)}</ul>}
+              </div>
+            )}
+          </div>
+          {pending.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {applicable.length > 0 && <Btn size="sm" variant="primary" icon={Check} onClick={api.applyAll}>Tout appliquer ({applicable.length})</Btn>}
+              <Btn size="sm" variant="ghost" onClick={api.ignoreAll}>Tout ignorer</Btn>
+            </div>
+          )}
+          {api.proposals.length > 0 ? (
+            <ul className="space-y-2">{api.proposals.map((p) => <ProposalCard key={p.id} p={p} text={text} api={api} />)}</ul>
+          ) : (
+            <p className={`text-sm ${T.faint}`}>Les corrections proposées par l'IA (relecture, mots-clés, contrôles) s'affichent ici avec l'avant / après. Rien n'est modifié sans votre accord.</p>
+          )}
+        </div>
+      )}
+
+      {tab === "master" && <MasterPanel app={app} offer={offer} text={text} />}
+      {tab === "ad" && (
+        <div className="p-4 space-y-5">
+          {analysis ? (
+            <>
+              {offer?.spontaneous && <Notice tone="accent" icon={Info}>Aucune annonce : analyse déduite du rôle visé{offer.spontaneous === "base" ? "" : " et du contexte que vous avez fourni"}.</Notice>}
+              <div>
+                <div className={`text-xs ${T.muted}`}>{offer?.spontaneous ? "Intitulé courant du rôle" : "Intitulé exact"}</div>
+                <div className="text-sm font-medium">{analysis.jobTitle}</div>
+                {analysis.titleVariants?.length > 0 && <div className={`text-xs ${T.faint}`}>Équivalents : {analysis.titleVariants.join(", ")}</div>}
+              </div>
+              {analysis.angle && <div><SectionTitle>{offer?.spontaneous ? "Ce que l'employeur pourrait y gagner" : "Ce que l'employeur cherche"}</SectionTitle><p className="text-sm leading-relaxed">{analysis.angle}</p></div>}
+              {analysis.positioning?.pitch && <div><SectionTitle>Votre proposition de valeur</SectionTitle><p className="text-sm leading-relaxed">{analysis.positioning.pitch}</p></div>}
+              {analysis.requirements?.length > 0 && (
+                <div>
+                  <SectionTitle>{offer?.spontaneous ? "Attentes du rôle et preuves" : "Exigences clés et preuves"}</SectionTitle>
+                  <ul className="space-y-2">
+                    {analysis.requirements.map((r, i) => (
+                      <li key={i} className="flex gap-2 text-sm">
+                        {r.proof ? <Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-500" aria-label="prouvée" /> : <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-500" aria-label="sans preuve" />}
+                        <div className="min-w-0"><div>{r.text}</div><div className={`text-xs ${T.muted}`}>{r.proof || "Pas de preuve directe dans votre profil"}</div></div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {analysis.gaps?.length > 0 && (
+                <div>
+                  <SectionTitle>Écarts à traiter honnêtement</SectionTitle>
+                  <ul className="space-y-1.5 text-sm">{analysis.gaps.map((g, i) => <li key={i}><span className="font-medium">{g.text}</span>{g.approach && <span className={T.muted}> → {g.approach}</span>}</li>)}</ul>
+                </div>
+              )}
+              {analysis.companyFacts?.length > 0 && (
+                <div><SectionTitle>Contexte de l'entreprise (annonce)</SectionTitle><ul className={`text-sm space-y-1 ${T.muted}`}>{analysis.companyFacts.map((f, i) => <li key={i}>• {f}</li>)}</ul></div>
+              )}
+              <p className={`text-xs ${T.faint}`}>Analyse du {fmtDate(analysis.createdAt, { time: true })} · {offer?.spontaneous ? `rôle « ${offer.title} »` : analysis.fromSummary ? "sur un résumé de l'annonce" : `${analysis.adChars || "?"} caractères d'annonce`}</p>
+            </>
+          ) : <p className={`text-sm ${T.muted}`}>{offer?.spontaneous ? "L'analyse déduit l'intitulé courant du rôle, 20 à 30 mots-clés habituels des annonces et les attentes du rôle, confrontés à votre profil." : "L'analyse extrait l'intitulé exact, 20 à 35 mots-clés ATS, les exigences clés et les preuves de votre profil."} Elle pilote la rédaction et les contrôles.</p>}
+          {!offer?.fullText && !offer?.spontaneous && <Notice tone="warn" icon={AlertTriangle}>Seul un résumé de l'annonce est enregistré : collez le texte complet ci-dessous pour une analyse ATS exhaustive.</Notice>}
+          <Field label={offer?.spontaneous ? "Contexte de la candidature" : "Texte complet de l'annonce"} hint={offer?.spontaneous ? "Seule source d'information sur l'entreprise." : `${ad.length} caractères · enregistré sur l'offre`}>
+            <Textarea rows={10} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} placeholder={offer?.spontaneous ? "Ce que vous savez de l'entreprise et pourquoi elle…" : "Collez ici l'annonce complète (missions, profil, compétences, conditions)…"} />
+          </Field>
+          <Btn variant={analysis ? "soft" : "primary"} icon={RefreshCw} loading={busy[`analysis:${app.id}`]} onClick={async () => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); await runAnalysis(app.id); }}>{analysis ? "Relancer l'analyse" : offer?.spontaneous ? "Analyser le rôle" : "Analyser l'annonce"}</Btn>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Réglages de génération ── */
+const GEN_STEPS = ["Analyse de l'annonce ou du rôle", "Rédaction", "Contrôle qualité"];
+function GenSteps({ st }) {
+  const T = useT();
+  return (
+    <div className={`rounded-2xl p-4 space-y-2 ${T.sub}`} aria-live="polite">
+      <ol className="space-y-1.5">
+        {GEN_STEPS.map((l, i) => {
+          const n = i + 1;
+          const done = st && n < st.step, cur = st && n === st.step;
+          return (
+            <li key={l} className={`flex items-center gap-2 text-sm ${done || cur ? "" : T.faint}`}>
+              {done ? <Check className="w-4 h-4 text-emerald-500" aria-hidden="true" /> : cur ? <Loader2 className={`w-4 h-4 animate-spin ${T.accentText}`} aria-hidden="true" /> : <Circle className="w-4 h-4" aria-hidden="true" />}
+              <span className={cur ? "font-medium" : ""}>{n}. {l}</span>
+            </li>
+          );
+        })}
+      </ol>
+      {st?.label && <p className={`text-xs ${T.muted}`}>{st.label}</p>}
+    </div>
+  );
+}
+
+/* ── Pourquoi cette candidature : faits sourcés, pourquoi eux / ce rôle, conviction et histoire, employeur nommé ou non ── */
+function AppMotivationCard({ app, offer, types }) {
+  const T = useT();
+  const { profile, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, busy, go } = useApp();
+  const m = appMotivOf(app);
+  const bank = motivOf(profile);
+  const set = (patch) => setAppMotivation(app.id, patch);
+  const company = offer?.spontaneous === "base" ? null : str(offer?.company);
+  const brief = company ? briefs[briefKey(company)] : null;
+  const facts = companyFactsFor(app, offer, briefs);
+  const chosen = m.factIds.length ? facts.filter((f) => m.factIds.includes(f.id)) : facts;
+  const [src, setSrc] = useState({ open: false, url: "", text: "" });
+  const bKey = company ? `brief:${briefKey(company)}` : "";
+  const writesLetter = types.some((t) => t !== "cv");
+  const toggleFact = (id) => {
+    const base = m.factIds.length ? m.factIds : facts.map((f) => f.id);
+    set({ factIds: base.includes(id) ? base.filter((x) => x !== id) : [...base, id] });
+  };
+  const missing = [
+    company && !chosen.length && "aucun fait sourcé sur l'entreprise",
+    !m.whyRole.trim() && !bank.whyNow.trim() && "pourquoi ce rôle maintenant",
+    !bank.convictions.length && "aucune conviction dans vos Motivations",
+    !bank.stories.length && "banque d'histoires vide",
+  ].filter(Boolean);
+  return (
+    <Card className="p-6 space-y-4 lg:col-span-3">
+      <div>
+        <div className="text-lg font-medium tracking-tight">Pourquoi cette candidature</div>
+        <p className={`text-sm mt-1 ${T.muted}`}>Le CV prouve, la lettre explique. Ces choix nourrissent la lettre{offer?.spontaneous ? "" : ", le message LinkedIn et la réponse « Pourquoi nous ? »"} ; jamais le CV. Laissé vide, un passage s'écrit [à compléter] et bloque l'envoi.</p>
+      </div>
+
+      <Toggle checked={m.employerNamed} onChange={(v) => set({ employerNamed: v })} label="Nommer mon employeur actuel (CV et lettre)" description={m.employerNamed ? `Le CV et la lettre citent « ${profile.experiences?.[0]?.org || "votre employeur"} ».` : "Ni le CV ni la lettre ne le nomment : « une fédération patronale belge ». Toute mention est bloquée au contrôle."} />
+
+      {writesLetter && (
+        <>
+          {company && (
+            <FieldBox label={`Faits sourcés sur ${company}`} hint={brief ? `Fiche ${briefFresh(brief) ? `valable jusqu'au ${fmtDate(brief.expiresAt)}` : "expirée (plus de 60 jours)"} · origine : ${brief.origin}. Un fait sans URL vérifiée est exclu.` : "Faits de l'annonce et de la fiche entreprise. Un fait sans URL vérifiée est exclu."}>
+              {facts.length ? (
+                <ul className="space-y-1.5">
+                  {facts.map((f) => (
+                    <li key={f.id} className="flex gap-2 items-start text-sm">
+                      <input type="checkbox" className="mt-1" checked={!m.factIds.length || m.factIds.includes(f.id)} onChange={() => toggleFact(f.id)} aria-label={`Retenir ${f.id}`} />
+                      <span className="flex-1 min-w-0">{f.text} <ExtLink href={f.url} className="text-xs">{f.source === "annonce" ? "annonce" : hostOf(f.url)}</ExtLink></span>
+                      {f.source !== "annonce" && <IconBtn icon={X} label="Retirer de la fiche" onClick={() => removeBriefFact(company, f.id)} className="w-7 h-7" />}
+                    </li>
+                  ))}
+                </ul>
+              ) : <p className={`text-sm ${T.faint}`}>Aucun fait sourcé pour l'instant.</p>}
+              <div className="flex flex-wrap gap-2 mt-3">
+                <Btn size="sm" icon={Search} loading={!!busy[bKey]} onClick={() => requestBrief(company, offer?.title ? `poste visé : ${offer.title}` : "")}>{brief ? "Actualiser la fiche" : "Rechercher des faits"}</Btn>
+                <Btn size="sm" variant="ghost" icon={Plus} onClick={() => setSrc((x) => ({ ...x, open: !x.open }))}>Coller une source</Btn>
+              </div>
+              {src.open && (
+                <div className={`rounded-2xl p-3 mt-2 space-y-2 ${T.sub}`}>
+                  <Input value={src.url} onChange={(e) => setSrc({ ...src, url: e.target.value })} placeholder="URL de la source (obligatoire)" aria-label="URL de la source" />
+                  <Textarea rows={5} value={src.text} onChange={(e) => setSrc({ ...src, text: e.target.value })} placeholder="Collez le texte : page « À propos », rapport annuel, article, post LinkedIn de l'entreprise…" aria-label="Texte de la source" />
+                  <Btn size="sm" variant="primary" icon={Wand2} loading={!!busy[bKey]} disabled={!isHttp(src.url) || src.text.trim().length < 80} onClick={async () => { const r = await addManualBrief(company, src.url.trim(), src.text); if (r) setSrc({ open: false, url: "", text: "" }); }}>Extraire les faits</Btn>
+                </div>
+              )}
+            </FieldBox>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {company && <Field label={`Pourquoi ${company} ?`} hint="Votre lien réel avec un fait retenu."><Textarea rows={3} value={m.whyCompany} onChange={(e) => set({ whyCompany: e.target.value })} /></Field>}
+            <Field label="Pourquoi ce rôle, maintenant ?" hint={bank.whyNow ? `Par défaut : « ${bank.whyNow.slice(0, 80)}${bank.whyNow.length > 80 ? "…" : ""} »` : "Rien dans vos Motivations."}><Textarea rows={3} value={m.whyRole} onChange={(e) => set({ whyRole: e.target.value })} /></Field>
+            {company && <Field label="Lien personnel (facultatif)" hint="Client, utilisateur, rencontre, secteur…"><Textarea rows={2} value={m.personalLink} onChange={(e) => set({ personalLink: e.target.value })} /></Field>}
+            <Field label="Conviction à mettre en avant">
+              <Select value={m.convictionId || ""} onChange={(e) => set({ convictionId: e.target.value || null })} className="w-full">
+                <option value="">{bank.convictions.length ? "Au choix de l'IA" : "Aucune conviction renseignée"}</option>
+                {bank.convictions.map((c) => <option key={c.id} value={c.id}>{c.id} · {c.text.slice(0, 70)}</option>)}
+              </Select>
+            </Field>
+            <Field label="Histoire à raconter">
+              <Select value={m.storyId || ""} onChange={(e) => set({ storyId: e.target.value || null })} className="w-full">
+                <option value="">{bank.stories.length ? "Au choix de l'IA" : "Banque d'histoires vide"}</option>
+                {bank.stories.map((x) => <option key={x.id} value={x.id}>{x.id} · {x.title || x.situation.slice(0, 60)}</option>)}
+              </Select>
+            </Field>
+          </div>
+          {missing.length > 0 && (
+            <Notice tone="warn" icon={AlertTriangle}>
+              Manquant : {missing.join(" · ")}. La lettre écrira [à compléter] à ces endroits.{" "}
+              {(!bank.convictions.length || !bank.stories.length) && <button type="button" className="underline underline-offset-4" onClick={() => go("profile")}>Compléter mes Motivations</button>}
+            </Notice>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+function StudioSetup({ app, offer, type, onDone, onCancel }) {
+  const T = useT();
+  const { generateDocs, busy, genStatus, setOfferAdText, patchOfferNow, profile, go } = useApp();
+  const first = !Object.keys(app.docs || {}).length;
+  const spont = offer?.spontaneous;
+  const [prefs, setPrefs] = useState({ ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) });
+  const [types, setTypes] = useState(first ? (spont === "base" ? ["cv"] : spont ? ["cv", "letter", "linkedin", "email"] : DOC_TYPES.map((d) => d.id)) : [type]);
+  const [tgt, setTgt] = useState({ title: offer?.title || "", company: offer?.company || "", contactName: offer?.contactName || "", location: offer?.location || "" });
+  const commitTgt = () => {
+    const patch = {};
+    for (const k of Object.keys(tgt)) { const v = str(tgt[k]); if ((v || null) !== (offer?.[k] || null)) patch[k] = v; }
+    if (patch.title === null) delete patch.title;
+    if (Object.keys(patch).length) patchOfferNow(offer.id, patch);
+  };
+  const [instruction, setInstruction] = useState("");
+  const [ad, setAd] = useState(adTextOf(offer));
+  const loading = !!busy[`dossier:${app.id}`];
+  const toggle = (t) => setTypes((l) => (l.includes(t) ? l.filter((x) => x !== t) : [...l, t]));
+  const P2 = (k, v) => setPrefs((p) => ({ ...p, [k]: v }));
+  const weakProfile = !profile.name || (profile.achievements || []).some((a) => /\[à compléter/i.test(a)) || !(profile.cvText || "").trim();
+  const run = async () => {
+    if (spont) commitTgt();
+    if ((ad.trim() || spont) && ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad);
+    const ok = await generateDocs(app.id, types, instruction.trim(), prefs);
+    if (ok) onDone?.();
+  };
+  return (
+    <div className="flex-1 overflow-y-auto">
+      <div className="max-w-6xl mx-auto px-4 sm:px-8 py-8 grid grid-cols-1 lg:grid-cols-5 gap-6">
+        {spont ? (
+          <Card className="p-6 lg:col-span-3 space-y-4">
+            <div>
+              <div className="text-lg font-medium tracking-tight">{SPONT_LABEL[spont]}</div>
+              <p className={`text-sm mt-1 ${T.muted}`}>Aucune offre : l'IA déduit les attentes du rôle visé et les mots-clés habituels des annonces belges, puis les confronte à votre profil. {spont === "base" ? "Le document reste réutilisable : aucune entreprise n'est citée." : "Le contexte ci-dessous est la seule source d'information sur l'entreprise : rien n'est inventé."}</p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <Field label="Rôle visé"><Input value={tgt.title} onChange={(e) => setTgt((x) => ({ ...x, title: e.target.value }))} onBlur={commitTgt} placeholder="Ex. Head of Digital" /></Field>
+              {spont !== "base" && <Field label="Entreprise ciblée"><Input value={tgt.company} onChange={(e) => setTgt((x) => ({ ...x, company: e.target.value }))} onBlur={commitTgt} /></Field>}
+              {spont !== "base" && <Field label="Interlocuteur (facultatif)"><Input value={tgt.contactName} onChange={(e) => setTgt((x) => ({ ...x, contactName: e.target.value }))} onBlur={commitTgt} placeholder="Ex. Mme Anne Dupont, CIO" /></Field>}
+              <Field label="Lieu (facultatif)"><Input value={tgt.location} onChange={(e) => setTgt((x) => ({ ...x, location: e.target.value }))} onBlur={commitTgt} /></Field>
+            </div>
+            <Field label={spont === "base" ? "Contexte (facultatif)" : "Pourquoi cette entreprise ? (recommandé)"} hint={spont === "base" ? "Secteurs ou types d'organisations visés, ce que vous voulez mettre en avant." : "Activité, projets, actualité, enjeux digitaux, valeurs, lien avec vous."}>
+              <Textarea rows={10} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} />
+            </Field>
+          </Card>
+        ) : (
+        <Card className="p-6 lg:col-span-3 space-y-4">
+          <div>
+            <div className="text-lg font-medium tracking-tight">Annonce source</div>
+            <p className={`text-sm mt-1 ${T.muted}`}>L'IA en extrait l'intitulé exact, 20 à 35 mots-clés ATS et les exigences clés, puis les confronte à votre profil avant d'écrire. Plus le texte est complet, meilleure est la couverture.</p>
+          </div>
+          {!offer?.fullText && <Notice tone="warn" icon={AlertTriangle}>Seul un résumé de l'annonce est enregistré. Collez le texte complet (missions, profil, compétences, conditions).</Notice>}
+          <Textarea rows={18} value={ad} onChange={(e) => setAd(e.target.value)} onBlur={() => { if (ad.trim() && ad.trim() !== adTextOf(offer)) setOfferAdText(offer.id, ad); }} aria-label="Texte complet de l'annonce" placeholder="Collez ici l'annonce complète…" />
+          <div className={`text-xs ${T.faint}`}>{ad.length} caractères{offer?.sources?.[0]?.url ? <> · <ExtLink href={offer.sources[0].url}>ouvrir l'annonce</ExtLink></> : null}</div>
+        </Card>
+        )}
+        <AppMotivationCard app={app} offer={offer} types={types} />
+        <div className="lg:col-span-2 space-y-4">
+          <Card className="p-6 space-y-4">
+            <div className="text-lg font-medium tracking-tight">Réglages</div>
+            <FieldBox label="Documents à générer">
+              <div className="flex flex-wrap gap-1.5">
+                {DOC_TYPES.map((d) => (
+                  <button key={d.id} type="button" aria-pressed={types.includes(d.id)} onClick={() => toggle(d.id)} className={`text-xs rounded-full px-3 py-1.5 font-medium transition-colors ${types.includes(d.id) ? "bg-indigo-600 text-white" : `${T.chip} ${T.subHover}`} ${T.ring}`}>
+                    {d.label}
+                  </button>
+                ))}
+              </div>
+            </FieldBox>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Langue">
+                <Select value={prefs.language} onChange={(e) => P2("language", e.target.value)} className="w-full">
+                  <option value="auto">{spont ? "Celle choisie pour la cible" : "Celle de l'annonce"}</option><option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+                </Select>
+              </Field>
+              <Field label="Ton">
+                <Select value={prefs.tone} onChange={(e) => P2("tone", e.target.value)} className="w-full">
+                  <option value="sobre">Sobre et factuel</option><option value="direct">Direct</option><option value="chaleureux">Chaleureux</option>
+                </Select>
+              </Field>
+              <Field label="Profil du CV rédigé">
+                <Select value={prefs.voice} onChange={(e) => P2("voice", e.target.value)} className="w-full">
+                  <option value="nominal">Sans « je » (style CV)</option><option value="je">À la 1re personne</option>
+                </Select>
+              </Field>
+              <Field label="Longueur du CV">
+                <Select value={prefs.cvLength} onChange={(e) => P2("cvLength", e.target.value)} className="w-full">
+                  <option value="2">1 à 2 pages</option><option value="1">1 page</option>
+                </Select>
+              </Field>
+            </div>
+            <Field label="Consigne (facultatif)">
+              <Textarea rows={3} value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Ex. mettre en avant le pilotage d'équipe et l'automatisation ; citer le projet de migration CRM…" />
+            </Field>
+            {weakProfile && (
+              <Notice tone="warn" icon={Info}>
+                Votre profil est la seule source de faits : complétez nom, réalisations chiffrées et CV complet pour un résultat précis.{" "}
+                <button type="button" className="underline underline-offset-4" onClick={() => { onCancel?.(true); go("profile"); }}>Compléter le profil</button>
+              </Notice>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Btn variant="primary" size="lg" icon={Sparkles} loading={loading} disabled={!types.length || (spont ? !tgt.title.trim() : ad.trim().length < 40)} onClick={run}>{first ? "Générer le dossier" : "Générer une nouvelle version"}</Btn>
+              {onCancel && !first && <Btn variant="ghost" size="lg" onClick={() => onCancel()} disabled={loading}>Annuler</Btn>}
+            </div>
+          </Card>
+          {loading && <GenSteps st={genStatus[app.id]} />}
+          {!loading && (
+            <div className={`text-xs space-y-1 ${T.muted}`}>
+              <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Rédaction en 3 étapes : analyse {spont ? "du rôle visé" : "de l'annonce"}, rédaction, contrôle qualité avec corrections ciblées.</div>
+              <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Votre fonction réelle sous votre nom ; le poste visé cité comme objectif, jamais comme acquis.</div>
+              <div className="flex gap-2"><Check className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${T.accentText}`} aria-hidden="true" />Aucun chiffre inventé : les manques sont marqués [à compléter].</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Studio ── */
+function StudioBar({ offer, type, setType, onClose, children }) {
+  const T = useT();
+  return (
+    <header className={`flex items-center gap-2 px-3 sm:px-4 h-14 border-b shrink-0 overflow-x-auto ${T.line}`}>
+      <IconBtn icon={X} label="Fermer le studio (Échap)" onClick={onClose} className="shrink-0" />
+      <div className="min-w-0 hidden lg:block" style={{ maxWidth: 210 }}>
+        <div className="text-sm font-medium truncate">{offer?.title || "Candidature"}</div>
+        <div className={`text-xs truncate ${T.muted}`}>{offer?.spontaneous === "base" ? "CV de base · sans entreprise" : offer?.spontaneous ? `${show(offer.company)} · spontanée` : show(offer?.company)}</div>
+      </div>
+      <div className="shrink-0"><Tabs compact value={type} onChange={setType} tabs={[{ id: "cv", label: "CV" }, { id: "letter", label: "Lettre" }]} /></div>
+      {children}
+    </header>
+  );
+}
+
+function DocStudio({ appId, type, setType, onClose }) {
+  const T = useT();
+  const { allApps: apps, offers } = useApp();
+  const ref = useRef(null);
+  const flushRef = useRef(null);
+  const closeRef = useRef(null);
+  closeRef.current = () => { flushRef.current?.(); onClose(); };
+  useFocusTrap(true, ref, () => closeRef.current());
+  /* Disposition partagée entre CV et lettre (le changement de document ne la réinitialise pas). */
+  const [ui, setUi] = useState(() => ({ layout: "split", pane: "edit", tab: "checks", zoomMode: "fit", panelOpen: typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1536px)").matches }));
+  const app = apps.find((a) => a.id === appId);
+  const offer = offers.find((o) => o.id === app?.offerId);
+  const close = () => closeRef.current();
+  if (!app || !offer) {
+    return (
+      <div ref={ref} className={`fixed inset-0 z-50 flex flex-col ${T.app}`} role="dialog" aria-modal="true" aria-label="Studio CV et lettre">
+        <StudioBar offer={offer} type={type} setType={setType} onClose={close} />
+        <Empty icon={AlertTriangle} title="Candidature ou offre introuvable" text="Elle a peut-être été supprimée." action={<Btn onClick={close}>Fermer</Btn>} />
+      </div>
+    );
+  }
+  const has = (app.docs?.[type] || []).length > 0;
+  return (
+    <div ref={ref} className={`fixed inset-0 z-50 flex flex-col ${T.app}`} role="dialog" aria-modal="true" aria-label="Studio CV et lettre" style={{ fontFamily: FONT }}>
+      {has
+        ? <StudioWorkspace key={`${app.id}-${type}`} app={app} offer={offer} type={type} setType={setType} onClose={close} flushRef={flushRef} ui={ui} setUi={setUi} />
+        : (
+          <>
+            <StudioBar offer={offer} type={type} setType={setType} onClose={close} />
+            <StudioSetup app={app} offer={offer} type={type} onCancel={(leave) => { if (leave) onClose(); else setType(type === "cv" ? "letter" : "cv"); }} />
+          </>
+        )}
+    </div>
+  );
+}
+
+function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
+  const T = useT();
+  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs } = useApp();
+  const wide = useMedia("(min-width: 1024px)");
+  const versions = app.docs?.[type] || [];
+  const [idx, setIdx] = useState(versions.length - 1);
+  useEffect(() => { setIdx(versions.length - 1); }, [versions.length]);
+  const v = versions[clamp(idx, 0, versions.length - 1)];
+  const lang = v.language || app.docLanguage || offer?.language || "fr";
+  const prefs = { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) };
+  const baseline = useMemo(() => normalizeDoc(v.text, type, lang), [v.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pickDraft = () => { const d = app.drafts?.[type]; return d && d.baseId === v.id && d.text !== baseline ? d : null; };
+  const [model, setModel] = useState(() => docToModel(pickDraft()?.text ?? baseline, type));
+  const [accent, setAccent] = useState(() => cleanHex(pickDraft()?.accent ?? v.accent));
+  const [restoredAt, setRestoredAt] = useState(() => pickDraft()?.at || null);
+  const text = useMemo(() => modelToDoc(model, type, lang), [model, type, lang]);
+  const dirty = text !== baseline || accent !== cleanHex(v.accent);
+
+  /* Historique (annuler / rétablir) : un instantané après chaque pause de frappe ou action de l'IA. */
+  const hist = useRef({ list: [text], pos: 0 });
+  const [, setHistTick] = useState(0);
+  useEffect(() => {
+    const h = hist.current;
+    if (h.list[h.pos] === text) return undefined;
+    const t = setTimeout(() => {
+      if (h.list[h.pos] === text) return;
+      h.list = [...h.list.slice(0, h.pos + 1), text].slice(-80);
+      h.pos = h.list.length - 1;
+      setHistTick((x) => x + 1);
+    }, 700);
+    return () => clearTimeout(t);
+  }, [text]);
+  const pushNow = () => { const h = hist.current; if (h.list[h.pos] !== text) { h.list = [...h.list.slice(0, h.pos + 1), text]; h.pos = h.list.length - 1; } };
+  const replaceText = (nt) => {
+    pushNow();
+    const m = docToModel(nt, type);
+    const norm = modelToDoc(m, type, lang);
+    const h = hist.current;
+    h.list = [...h.list.slice(0, h.pos + 1), norm].slice(-80);
+    h.pos = h.list.length - 1;
+    setModel(m);
+    setHistTick((x) => x + 1);
+  };
+  const undo = () => { pushNow(); const h = hist.current; if (h.pos > 0) { h.pos--; setModel(docToModel(h.list[h.pos], type)); setHistTick((x) => x + 1); } };
+  const redo = () => { const h = hist.current; if (h.pos < h.list.length - 1) { h.pos++; setModel(docToModel(h.list[h.pos], type)); setHistTick((x) => x + 1); } };
+  const canUndo = hist.current.pos > 0 || hist.current.list[hist.current.pos] !== text;
+  const canRedo = hist.current.pos < hist.current.list.length - 1;
+
+  /* Changement de version (sélecteur, nouvelle génération) : recharge, sauf si le texte est déjà celui-là (enregistrement). */
+  const lastV = useRef(v.id);
+  useEffect(() => {
+    if (lastV.current === v.id) return;
+    lastV.current = v.id;
+    setProposals([]); setSecProp(null); setReview(null);
+    if (baseline === text) return;
+    const d = pickDraft();
+    setModel(docToModel(d?.text ?? baseline, type));
+    setAccent(cleanHex(d?.accent ?? v.accent));
+    setRestoredAt(d?.at || null);
+    hist.current = { list: [d?.text ?? baseline], pos: 0 };
+  }, [v.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* Brouillon enregistré automatiquement (rien n'est perdu en fermant le studio). */
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const d = app.drafts?.[type];
+      if (dirty) { if (!d || d.text !== text || d.accent !== accent || d.baseId !== v.id) saveDocDraft(app.id, type, { text, accent, baseId: v.id }); }
+      else if (d && d.baseId === v.id) saveDocDraft(app.id, type, null);
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [text, accent, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
+  flushRef.current = () => { if (dirty) saveDocDraft(app.id, type, { text, accent, baseId: v.id }); };
+
+  const save = () => {
+    if (!dirty) return;
+    saveDocVersion(app.id, type, text, undefined, { accent, accentSource: accent !== cleanHex(v.accent) ? "choisie" : v.accentSource, language: lang, format: "markup" });
+    setRestoredAt(null);
+    toast("Version enregistrée", "ok");
+  };
+  const discardDraft = () => { setModel(docToModel(baseline, type)); setAccent(cleanHex(v.accent)); setRestoredAt(null); saveDocDraft(app.id, type, null); };
+
+  /* Disposition */
+  const uiSet = (k) => (v) => setUi((u) => ({ ...u, [k]: typeof v === "function" ? v(u[k]) : v }));
+  const { layout, pane, panelOpen, tab, zoomMode } = ui;
+  const setLayout = uiSet("layout"), setPane = uiSet("pane"), setPanelOpen = uiSet("panelOpen"), setTab = uiSet("tab"), setZoomMode = uiSet("zoomMode");
+  const showEditor = wide ? layout !== "preview" : pane === "edit";
+  const showPreview = wide ? layout !== "edit" : pane === "preview";
+  const showPanel = wide ? panelOpen : pane === "panel";
+
+  /* Aperçu : zoom ajusté à la largeur */
+  const [fitZoom, setFitZoom] = useState(0.8);
+  const prevRef = useRef(null);
+  useEffect(() => {
+    const el = prevRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(() => setFitZoom(clamp((el.clientWidth - 48) / (210 * MM), 0.3, 1.2)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [showPreview]);
+  const zoom = zoomMode === "fit" ? fitZoom : Number(zoomMode);
+  const [pages, setPages] = useState(null);
+
+  /* Contrôle qualité en direct */
+  const report = useMemo(
+    () => analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs, lang, settings, profile, pages, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })),
+    [text, type, pages, app.analysis, app.motivation, briefs, prefs.voice, profile.headline, profile.motivation, lang, type === "letter" ? latestCvText(app) : ""], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const missing = report.kw.filter((k) => k.status !== "absent" && !k.found);
+
+  /* Navigation éditeur ⇄ aperçu */
+  const [flash, setFlash] = useState(null);
+  const goTo = (sec) => {
+    if (sec === undefined || sec === null) return;
+    if (!wide) setPane("edit"); else if (layout === "preview") setLayout("split");
+    const id = sec === "head" ? "studio-sec-head" : sec === "sign" ? "studio-sec-sign" : `studio-sec-${sec}`;
+    setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }), 40);
+    setFlash(sec);
+    setTimeout(() => setFlash((f) => (f === sec ? null : f)), 1600);
+  };
+
+  /* Modèle */
+  const setHead = (patch) => setModel((m) => ({ ...m, ...patch }));
+  const setSection = (id, s) => setModel((m) => ({ ...m, sections: m.sections.map((x) => (x.id === id ? s : x)) }));
+  const moveSection = (i, d) => setModel((m) => ({ ...m, sections: moveIn(m.sections, i, d) }));
+  const removeSection = (id) => setModel((m) => ({ ...m, sections: m.sections.filter((x) => x.id !== id) }));
+  const addSection = (title, kind) => { const s = newSection(title, kind); setModel((m) => ({ ...m, sections: [...m.sections, s] })); setTimeout(() => goTo(model.sections.length), 60); };
+
+  /* IA : propositions à valider */
+  const [proposals, setProposals] = useState([]);
+  const [review, setReview] = useState(null);
+  const [secProp, setSecProp] = useState(null);
+  const [secBusy, setSecBusy] = useState(null);
+  const [hlOpts, setHlOpts] = useState([]);
+  const addProposals = (edits, source) => {
+    const list = (Array.isArray(edits) ? edits : [])
+      .filter((e) => e && typeof e.before === "string" && typeof e.after === "string" && e.before.trim() && e.before !== e.after && !touchesLocked(e.before, lockedOf(profile)))
+      .map((e) => ({ id: uid("p"), before: e.before, after: e.after, reason: str(e.reason), severity: ["haute", "moyenne", "basse"].includes(e.severity) ? e.severity : null, source, status: "pending" }));
+    setProposals((l) => [...list, ...l.filter((x) => x.status === "pending")]);
+    return list.length;
+  };
+  const fix = async (issues, source = "contrôle") => {
+    const d = await docAI(app.id, "fix", { kind: type, text, issues });
+    if (!d) return;
+    const n = addProposals(d.edits, source);
+    if (n) { setTab("ai"); if (!wide) setPane("panel"); else setPanelOpen(true); }
+    toast(n ? `${n} proposition(s) à valider` : "Aucune correction proposée", n ? "ok" : "neutral");
+  };
+  const integrate = (kws) => fix(kws.map((k) => ({ title: `Intégrer le mot-clé « ${k.term} »`, detail: k.evidence ? `preuve dans le profil : ${k.evidence}` : "justifié par le profil" })), "mots-clés");
+  const runReview = async () => {
+    const d = await docAI(app.id, "review", { kind: type, text });
+    if (!d) return;
+    setReview({ verdict: str(d.verdict), score: Number.isFinite(Number(d.score)) && d.score !== null ? clamp(Math.round(Number(d.score)), 0, 100) : null, strengths: (Array.isArray(d.strengths) ? d.strengths : []).map(String).slice(0, 4) });
+    const n = addProposals(d.edits, "relecture");
+    toast(`Relecture terminée${n ? ` · ${n} proposition(s)` : ""}`, "ok");
+  };
+  const applyProposal = (p) => {
+    const nt = applyEdit(text, p.before, p.after);
+    if (nt === null) { toast("Passage introuvable : le texte a changé depuis la proposition.", "warn"); return; }
+    replaceText(nt);
+    setProposals((l) => l.map((x) => (x.id === p.id ? { ...x, status: "applied" } : x)));
+  };
+  const applyAll = () => {
+    let t = text;
+    const ok = new Set();
+    for (const p of proposals.filter((x) => x.status === "pending")) { const nt = applyEdit(t, p.before, p.after); if (nt !== null) { t = nt; ok.add(p.id); } }
+    if (ok.size) replaceText(t);
+    setProposals((l) => l.map((x) => (x.status === "pending" && ok.has(x.id) ? { ...x, status: "applied" } : x)));
+    toast(`${ok.size} correction(s) appliquée(s)${ok.size < proposals.filter((x) => x.status === "pending").length ? " · certaines n'ont plus de correspondance" : ""}`, "ok");
+  };
+  const improveSection = async (s, goal, custom) => {
+    const body = sectionToLines(s, lang).join("\n").trim();
+    setSecBusy(s.id);
+    try {
+      const d = await docAI(app.id, "section", { kind: type, text, title: s.title, body, goal, custom, missing, lang });
+      const nb = String(d?.body || "").replace(/^```\w*\n?|```\s*$/g, "").split("\n").filter((l) => !/^##\s/.test(l.trim())).join("\n").trim();
+      if (nb) setSecProp({ secId: s.id, body: nb, before: body, note: str(d.note) });
+    } finally { setSecBusy(null); }
+  };
+  const acceptSec = () => {
+    pushNow();
+    setModel((m) => ({ ...m, sections: m.sections.map((x) => (x.id === secProp.secId ? { ...sectionFromLines(x.title, secProp.body.split("\n")), id: x.id } : x)) }));
+    setSecProp(null);
+  };
+  const headlineFix = app.analysis?.positioning?.headline || [profile.headline, (profile.skills || []).slice(0, 3).join(" · ")].filter(Boolean).join(" | ");
+  const proposeHeadlines = async () => {
+    const d = await docAI(app.id, "headlines", { lang });
+    const opts = (Array.isArray(d?.options) ? d.options : []).map((o) => ({ headline: str(o?.headline), angle: str(o?.angle) })).filter((o) => o.headline);
+    setHlOpts(opts);
+    if (!opts.length && d) toast("Aucune proposition reçue", "neutral");
+  };
+
+  /* PDF */
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const downloadPdf = async () => {
+    setPdfBusy(true);
+    try {
+      const kws = (app.analysis?.keywords || v.keywords || []).map((k) => (typeof k === "string" ? k : k.term));
+      const data = await buildDocPdf(text, { accent, kind: type, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: kws.slice(0, 30), author: profile.name });
+      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}.pdf`, data, "application/pdf");
+      if (r === "saved") toast(report.blockers ? "PDF prêt — attention, des points restent à corriger" : "PDF prêt", report.blockers ? "warn" : "ok");
+    } catch (e) {
+      toast(`PDF impossible : ${e.message}`, "danger");
+    } finally { setPdfBusy(false); }
+  };
+
+  /* Raccourcis : ⌘/Ctrl+S enregistre, ⌘/Ctrl+Z hors champ annule */
+  const keys = useRef({});
+  keys.current = { save, undo, redo };
+  useEffect(() => {
+    const h = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "s") { e.preventDefault(); keys.current.save(); return; }
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target?.tagName)) return;
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); keys.current.undo(); }
+      else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); keys.current.redo(); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
+
+  const [setupOpen, setSetupOpen] = useState(false);
+  const gen = genStatus[app.id];
+  const isMarkup = v.format === "markup";
+  const api = {
+    goTo, fix, integrate, proposals, review, runReview, applyProposal, applyAll, tab, setTab, tips: v.tips,
+    ignoreProposal: (id) => setProposals((l) => l.filter((x) => x.id !== id)),
+    ignoreAll: () => setProposals((l) => l.filter((x) => x.status !== "pending")),
+    declare: (term) => declareSkill(app.id, term),
+    busyFix: !!busy[`docai:${app.id}:fix`], busyReview: !!busy[`docai:${app.id}:review`],
+    headlineFix: type === "cv" ? headlineFix : null,
+    applyHeadlineFix: () => { pushNow(); setHead({ headline: headlineFix }); },
+  };
+  const presetTitles = PRESETS[lang] || PRESETS.fr;
+  const outline = [{ sec: "head", label: "En-tête" }, ...model.sections.map((s, i) => ({ sec: i, label: s.title || "Introduction" }))];
+
+  return (
+    <>
+      <StudioBar offer={offer} type={type} setType={(t) => { flushRef.current?.(); setType(t); }} onClose={onClose}>
+        <Select value={clamp(idx, 0, versions.length - 1)} onChange={(e) => setIdx(Number(e.target.value))} aria-label="Version" className="h-8 text-xs hidden sm:block shrink-0" style={{ maxWidth: 190 }}>
+          {versions.map((x, i) => <option key={x.id} value={i}>v{i + 1} · {x.origin} · {fmtDate(x.createdAt, { time: true })}</option>)}
+        </Select>
+        <span className="hidden 2xl:inline-flex shrink-0 whitespace-nowrap">{dirty ? <Chip tone="warn">brouillon auto-enregistré</Chip> : <Chip tone="ok">version enregistrée</Chip>}</span>
+        <div className="flex-1" />
+        <span className="hidden sm:inline-flex shrink-0">
+          <MiniBtn icon={Undo2} label="Annuler (⌘Z)" onClick={undo} disabled={!canUndo} />
+          <MiniBtn icon={Redo2} label="Rétablir (⇧⌘Z)" onClick={redo} disabled={!canRedo} />
+        </span>
+        {wide && <div className="shrink-0"><Tabs compact value={layout} onChange={setLayout} tabs={[{ id: "edit", label: "Édition" }, { id: "split", label: "Côte à côte" }, { id: "preview", label: "Aperçu" }]} /></div>}
+        <Btn size="sm" variant="ghost" icon={RefreshCw} onClick={() => setSetupOpen(true)} aria-label="Régénérer" title="Nouvelle version générée par l'IA"><span className="hidden 2xl:inline">Régénérer</span></Btn>
+        <Btn size="sm" variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={save} aria-label="Enregistrer une version (⌘S)" title="Enregistrer une version (⌘S)"><span className="hidden lg:inline">Enregistrer</span></Btn>
+        <Btn size="sm" icon={Download} loading={pdfBusy} onClick={downloadPdf} aria-label="Télécharger le PDF"><span className="hidden lg:inline">PDF</span></Btn>
+        {wide && <button
+          type="button"
+          onClick={() => setPanelOpen((o) => !o)}
+          aria-pressed={panelOpen}
+          title={panelOpen ? "Masquer le panneau d'optimisation" : "Afficher le panneau d'optimisation"}
+          className={`shrink-0 inline-flex items-center gap-1.5 h-8 rounded-xl px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${panelOpen && wide ? T.accentSoft : T.btnSoft} ${T.ring}`}
+        >
+          <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
+          <span className="tabular-nums">{report.scores.total}/100</span>
+          {report.blockers > 0 && <span className="rounded-full px-1.5 bg-rose-500 text-white tabular-nums">{report.blockers}</span>}
+        </button>}
+      </StudioBar>
+      {gen && !setupOpen && <div className={`px-4 py-2 text-xs flex items-center gap-2 ${T.accentSoft}`}><Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />{gen.label}</div>}
+
+      <div className="flex-1 flex min-h-0 relative">
+        {showEditor && (
+          <div className="min-w-0 overflow-y-auto" style={wide && layout === "split" ? { flex: "1 1 0", minWidth: 380, maxWidth: 760 } : { flex: "1 1 auto" }}>
+            <div className={`sticky top-0 z-10 px-4 sm:px-6 py-2 border-b ${T.line}`} style={T.glass}>
+              <div className="flex gap-1 overflow-x-auto" role="navigation" aria-label="Sections du document">
+                {outline.map((o) => (
+                  <button key={String(o.sec)} type="button" onClick={() => goTo(o.sec)} className={`shrink-0 text-xs rounded-full px-2.5 py-1 whitespace-nowrap ${flash === o.sec ? T.accentSoft : `${T.muted} ${T.subHover}`} ${T.ring}`}>{o.label}</button>
+                ))}
+              </div>
+            </div>
+            <div className="mx-auto px-4 sm:px-6 py-6 space-y-4" style={{ maxWidth: wide && layout === "edit" ? 880 : 780 }}>
+              {restoredAt && (
+                <Notice tone="accent" icon={History}>
+                  Brouillon non enregistré restauré ({relTime(restoredAt)}).{" "}
+                  <button type="button" className="underline underline-offset-4" onClick={discardDraft}>Revenir à la version enregistrée</button>
+                </Notice>
+              )}
+              {!isMarkup && <Notice tone="warn" icon={Info}>Ancien format de document : régénérez-le pour profiter de la mise en page, de l'analyse ATS et des contrôles.</Notice>}
+              <HeaderCard model={model} set={setHead} kind={type} lang={lang} analysis={app.analysis} onHeadlines={proposeHeadlines} hlBusy={!!busy[`docai:${app.id}:headlines`]} hlOpts={hlOpts} flash={flash === "head"} />
+              {model.sections.map((s, i) => (
+                <SectionCard
+                  key={s.id} s={s} idx={i} count={model.sections.length} kind={type}
+                  onChange={(ns) => setSection(s.id, ns)}
+                  onMove={(d) => moveSection(i, d)}
+                  onRemove={() => { pushNow(); removeSection(s.id); }}
+                  onAI={(goal, custom) => improveSection(s, goal, custom)}
+                  aiBusy={secBusy === s.id}
+                  proposal={secProp?.secId === s.id ? secProp : null}
+                  onAccept={acceptSec}
+                  onReject={() => setSecProp(null)}
+                  flash={flash === i}
+                  missingCount={missing.length}
+                  spont={!!offer?.spontaneous}
+                />
+              ))}
+              {type === "cv" ? (
+                <div className={`rounded-3xl p-4 border border-dashed ${T.line}`}>
+                  <div className={`text-xs font-medium mb-2 ${T.muted}`}>Ajouter une section</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {presetTitles.map((t, i) => <Btn key={t} size="sm" variant="soft" icon={Plus} onClick={() => addSection(t, PRESETS.kinds[i])}>{t}</Btn>)}
+                  </div>
+                </div>
+              ) : (
+                <section id="studio-sec-sign" className={`rounded-3xl p-4 sm:p-5 ${T.surface}`} style={{ ...T.shadow, scrollMarginTop: 64 }}>
+                  <Field label="Signature"><Input value={model.sign} onChange={(e) => setHead({ sign: e.target.value })} placeholder="Prénom Nom" /></Field>
+                </section>
+              )}
+              <div className="h-16" aria-hidden="true" />
+            </div>
+          </div>
+        )}
+
+        {showPreview && (
+          <div ref={prevRef} className={`min-w-0 overflow-auto ${T.dark ? "bg-stone-900" : "bg-stone-200"}`} style={{ flex: "1.25 1 0" }}>
+            <div className="sticky top-0 z-10 flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2" style={T.glass}>
+              <Select value={zoomMode} onChange={(e) => setZoomMode(e.target.value)} aria-label="Zoom" className="h-8 text-xs">
+                <option value="fit">Ajuster</option><option value="0.75">75 %</option><option value="1">100 %</option><option value="1.25">125 %</option>
+              </Select>
+              <label className={`inline-flex items-center gap-1.5 text-xs ${T.muted}`}>
+                <Palette className="w-4 h-4" aria-hidden="true" /> Couleur
+                <input type="color" value={cleanHex(accent)} onChange={(e) => setAccent(e.target.value)} aria-label="Couleur d'accent" style={{ width: 28, height: 22, border: "none", background: "transparent" }} />
+              </label>
+              {v.accentSource && accent === cleanHex(v.accent) && <span className={`text-xs ${T.faint}`}>({v.accentSource})</span>}
+              <span className="flex-1" />
+              <Chip tone={pages && pages > (type === "cv" ? 2 : 1) ? "warn" : "neutral"}>{pages || "…"} page{pages > 1 ? "s" : ""}</Chip>
+              <span className={`text-xs tabular-nums ${T.faint}`}>{report.words} mots</span>
+              <CopyBtn text={docPlainText(text)} label="Copier le texte" />
+            </div>
+            <div className="px-4 py-6">
+              <PaperPages text={text} accent={accent} kind={type} zoom={zoom} onPages={setPages} onPick={goTo} activeSec={flash} />
+              <p className={`text-xs text-center mt-4 ${T.faint}`}>Cliquez sur un passage pour le modifier. Aperçu fidèle au PDF (texte sélectionnable, lisible par les ATS).</p>
+            </div>
+          </div>
+        )}
+
+        {showPanel && (
+          <aside className={`shrink-0 overflow-y-auto ${wide ? `border-l ${T.line}` : "flex-1"} ${T.app}`} style={wide ? { width: 400 } : undefined} aria-label="Optimisation du document">
+            <OptimPanel app={app} offer={offer} type={type} report={report} pages={pages} text={text} api={api} />
+          </aside>
+        )}
+
+        {setupOpen && (
+          <div className={`absolute inset-0 z-20 flex flex-col ${T.app}`}>
+            <StudioSetup app={app} offer={offer} type={type} onDone={() => setSetupOpen(false)} onCancel={(leave) => { setSetupOpen(false); if (leave) onClose(); }} />
+          </div>
+        )}
+      </div>
+
+      {!wide && (
+        <nav className={`shrink-0 border-t px-3 py-2 flex justify-center ${T.line}`} aria-label="Vue du studio">
+          <Tabs value={pane} onChange={setPane} tabs={[{ id: "edit", label: "Éditer" }, { id: "preview", label: "Aperçu" }, { id: "panel", label: "Optimiser", count: report.blockers || undefined }]} />
+        </nav>
+      )}
+    </>
+  );
+}
+
+/* Carte de document dans la fiche candidature : vignette, score, accès au studio. */
+function StudioDocCard({ app, offer, type }) {
+  const T = useT();
+  const { openStudio, settings, profile, genStatus, briefs } = useApp();
+  const versions = app.docs?.[type] || [];
+  const v = versions[versions.length - 1];
+  const draft = app.drafts?.[type];
+  const useDraft = v && draft && draft.baseId === v.id;
+  const text = useDraft ? draft.text : v?.text;
+  const lang = v?.language || app.docLanguage || offer?.language || "fr";
+  const rep = useMemo(
+    () => (v ? analyzeDoc(text, type, lintCtx({ offer, analysis: app.analysis, prefs: { ...DEFAULT_DOC_PREFS, ...(app.docPrefs || {}) }, lang, settings, profile, fallbackKeywords: v.keywords, cvText: type === "letter" ? latestCvText(app) : "", app, briefs })) : null),
+    [text, app.analysis, type], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const z = 0.15;
+  return (
+    <Card className="p-4 flex gap-3">
+      <button type="button" onClick={() => openStudio(app.id, type)} className={`shrink-0 rounded-lg overflow-hidden ${T.ring}`} aria-label={`Ouvrir ${DOC_LABEL[type]} dans le studio`} style={{ width: 210 * MM * z, height: 297 * MM * z, background: v ? "transparent" : undefined }}>
+        {v ? (
+          <div style={{ pointerEvents: "none" }}><PaperPages text={text} accent={useDraft ? draft.accent : v.accent} kind={type} zoom={z} maxPages={1} /></div>
+        ) : (
+          <div className={`w-full h-full flex items-center justify-center ${T.sub}`}><FileText className={`w-6 h-6 ${T.faint}`} aria-hidden="true" /></div>
+        )}
+      </button>
+      <div className="flex-1 min-w-0 flex flex-col">
+        <div className="text-sm font-medium">{type === "cv" ? "CV" : "Lettre de motivation"}</div>
+        {v ? <div className={`text-xs ${T.muted}`}>v{versions.length} · {fmtDate(v.createdAt)}{useDraft ? " · brouillon en cours" : ""}</div> : <div className={`text-xs ${T.faint}`}>{genStatus[app.id] ? genStatus[app.id].label : "Pas encore généré"}</div>}
+        {rep && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            <Chip tone={rep.scores.total >= 80 ? "accent" : rep.scores.total >= 60 ? "warn" : "danger"}>{rep.scores.total}/100</Chip>
+            {rep.blockers ? <Chip tone="danger">{rep.blockers} à corriger</Chip> : <Chip tone="ok">prêt</Chip>}
+            {rep.kwPct !== null && <Chip>ATS {rep.kwPct} %</Chip>}
+          </div>
+        )}
+        <div className="mt-auto pt-3">
+          <Btn size="sm" variant="primary" icon={Maximize2} onClick={() => openStudio(app.id, type)}>{v ? "Ouvrir" : "Créer"}</Btn>
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -5731,19 +8373,16 @@ function PrepPanel({ app, offer }) {
   const loading = busy[`prep:${app.id}`];
   if (!p) {
     return (
-      <div className="space-y-8">
-        <Card className="p-6">
-          {loading ? <Skeleton lines={8} /> : (
-            <Empty
-              icon={Sparkles}
-              title="Préparer l'entretien"
-              text="Fiche entreprise sourcée (recherche web), questions probables, vos exemples STAR, questions à poser et points de négociation."
-              action={<Btn variant="primary" icon={Search} onClick={() => prepareInterview(app.id)}>Générer la fiche</Btn>}
-            />
-          )}
-        </Card>
-        <PracticePanel app={app} offer={offer} />
-      </div>
+      <Card className="p-6">
+        {loading ? <Skeleton lines={8} /> : (
+          <Empty
+            icon={Sparkles}
+            title="Préparer l'entretien"
+            text="Fiche entreprise sourcée (recherche web), questions probables, vos exemples STAR, questions à poser et points de négociation."
+            action={<Btn variant="primary" icon={Search} onClick={() => prepareInterview(app.id)}>Générer la fiche</Btn>}
+          />
+        )}
+      </Card>
     );
   }
   return (
@@ -5800,7 +8439,6 @@ function PrepPanel({ app, offer }) {
           <p className="text-sm">{p.salaryBenchmark.range} {p.salaryBenchmark.sourceUrl && <ExtLink href={p.salaryBenchmark.sourceUrl} className="text-xs">source</ExtLink>}</p>
         ) : <p className={`text-sm ${T.faint}`}>{NC} — aucune source publique chiffrée trouvée.</p>}
       </section>
-      <PracticePanel app={app} offer={offer} />
     </div>
   );
 }
@@ -5826,1096 +8464,91 @@ function AppContacts({ app }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   13b. STUDIO CV & LETTRE — édition visuelle, design en temps réel, export
-   ════════════════════════════════════════════════════════════════════════ */
-
-const PX_MM = 3.7795; // pixels CSS par mm à 100 %
-
-/* Une page du moteur de mise en page, en SVG (mêmes coordonnées que le PDF). */
-function PageSvg({ page, W, H, photo, idp, interactive, sel, hover, onPick, onHover, accent }) {
-  const shapeEl = (o, props) => {
-    if (o.shape === "circle") return <circle cx={o.x + o.s / 2} cy={o.y + o.s / 2} r={o.s / 2} {...props} />;
-    if (o.shape === "rounded") return <rect x={o.x} y={o.y} width={o.s} height={o.s} rx={o.s * 0.18} {...props} />;
-    if (o.shape === "hexagon") return <polygon points={hexPoints(o.x, o.y, o.s).map((p) => p.join(",")).join(" ")} {...props} />;
-    return <rect x={o.x} y={o.y} width={o.s} height={o.s} {...props} />;
-  };
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="100%" style={{ display: "block", background: "#ffffff" }} xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Aperçu de la page">
-      <defs>
-        {page.ops.map((o, i) => (o.t === "photo" ? <clipPath key={i} id={`${idp}-c${i}`}>{shapeEl(o, {})}</clipPath> : null))}
-      </defs>
-      {page.ops.map((o, i) => {
-        if (o.t === "rect") return <rect key={i} x={o.x} y={o.y} width={o.w} height={o.h} rx={o.r || 0} fill={o.fill} />;
-        if (o.t === "circle") return <circle key={i} cx={o.cx} cy={o.cy} r={o.r} fill={o.fill} />;
-        if (o.t === "line") return <line key={i} x1={o.x1} y1={o.y1} x2={o.x2} y2={o.y2} stroke={o.color} strokeWidth={o.w} />;
-        if (o.t === "text") {
-          return (
-            <text key={i} x={o.x} y={o.y} fontFamily={FONT_CSS[o.font]} fontSize={o.size * PT} fontWeight={o.bold ? 700 : 400} fontStyle={o.italic ? "italic" : "normal"} fill={o.color} textAnchor={o.anchor} letterSpacing={o.cs || undefined} style={{ whiteSpace: "pre" }}>
-              {o.s}
-            </text>
-          );
-        }
-        if (o.t === "icon") {
-          return (
-            <g key={i} transform={`translate(${o.x} ${o.y}) scale(${o.s / 24})`} fill="none" stroke={o.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-              {(DOC_ICONS[o.name] || []).map((d, k) => <path key={k} d={d} />)}
-            </g>
-          );
-        }
-        if (o.t === "photo") {
-          return (
-            <g key={i}>
-              {photo?.src ? <image href={photo.src} x={o.x} y={o.y} width={o.s} height={o.s} preserveAspectRatio="xMidYMid slice" clipPath={`url(#${idp}-c${i})`} /> : shapeEl(o, { fill: "#e7e5e4" })}
-              {o.border > 0 && shapeEl(o, { fill: "none", stroke: o.borderColor, strokeWidth: o.border })}
-            </g>
-          );
-        }
-        return null;
-      })}
-      {interactive && page.hits.filter((h) => h.kind === "section").map((h, i) => (
-        <rect key={`s${i}`} x={h.x - 1.2} y={h.y - 0.8} width={h.w + 2.4} height={h.h + 1.6} rx={1.5} fill="transparent" stroke={hover === h.src.key ? accent : "transparent"} strokeDasharray="1.2 1" strokeWidth={0.35} onMouseEnter={() => onHover?.(h.src.key)} />
-      ))}
-      {interactive && page.hits.filter((h) => h.kind === "block").map((h, i) => {
-        const on = sel && (h.src.photo ? sel.photo : sel.l0 === h.src.l0);
-        return (
-          <rect key={`b${i}`} x={h.x} y={h.y} width={h.w} height={h.h} rx={0.8} fill={on ? "rgba(79,70,229,0.08)" : "transparent"} stroke={on ? accent : "transparent"} strokeWidth={0.35} style={{ cursor: "text" }}
-            onClick={(e) => { e.stopPropagation(); onPick?.(h); }}
-            onMouseEnter={(e) => { if (!on) e.currentTarget.setAttribute("stroke", "rgba(79,70,229,0.45)"); }}
-            onMouseLeave={(e) => { if (!on) e.currentTarget.setAttribute("stroke", "transparent"); }} />
-        );
-      })}
-    </svg>
-  );
-}
-
-/* Vignette d'un document (première page), sans interaction. */
-function DocThumb({ text, kind, design, photo, lang, width = 160, className = "" }) {
-  const lay = useMemo(() => (text ? layoutDocument(docModel(text, kind), design, { photo, lang }) : null), [text, kind, design, photo, lang]);
-  if (!lay) return null;
-  return (
-    <div className={`rounded-xl overflow-hidden ${className}`} style={{ width, height: (width * lay.H) / lay.W, boxShadow: "0 8px 24px -14px rgba(0,0,0,.35)", border: "1px solid #e7e5e4" }}>
-      <PageSvg page={lay.pages[0]} W={lay.W} H={lay.H} photo={photo} idp={`th-${kind}-${lang}-${width}`} />
-    </div>
-  );
-}
-
-/* Schéma d'un gabarit (aperçu instantané, sans calcul de mise en page). */
-function TemplateThumb({ tpl, accent, active, onClick }) {
-  const T = useT();
-  const d = mergeDesign(DESIGN_BASE, tpl.d);
-  const a = accent || d.colors.accent;
-  const two = Number(d.columns) === 2;
-  const sw = two ? 34 * (d.sideWidth / 100) : 0;
-  const sx = d.side === "right" ? 34 - sw : 0;
-  const mx = two && d.side !== "right" ? sw + 2 : 3;
-  const mw = two ? 34 - sw - 5 : 28;
-  const sideFill = two ? (luminance(d.colors.side) < 0.35 ? a : d.colors.side) : null;
-  return (
-    <button type="button" onClick={onClick} aria-pressed={active} className={`rounded-2xl p-2 text-left transition-colors duration-150 ${active ? T.accentSoft : T.subHover} ${T.ring}`}>
-      <svg viewBox="0 0 34 48" className="w-full" style={{ background: "#fff", borderRadius: 6, border: active ? `1.5px solid ${a}` : "1px solid #e7e5e4" }} aria-hidden="true">
-        {d.header === "band" && <rect x="0" y="0" width="34" height="9" fill={a} />}
-        {two && <rect x={sx} y={d.header === "side" || d.sideFull ? 0 : 10} width={sw} height={d.header === "side" || d.sideFull ? 48 : 36} fill={sideFill} rx={d.sideFull ? 0 : 1} />}
-        {d.photo.show && <circle cx={d.header === "center" ? 17 : d.header === "side" ? sx + sw / 2 : 6} cy={d.header === "side" ? 6 : 5} r="2.6" fill={d.header === "band" ? "#fff" : "#d6d3d1"} />}
-        <rect x={d.header === "center" ? 9 : d.header === "side" ? sx + 2 : d.photo.show ? 10 : 3} y={d.header === "side" ? 10 : 3} width={d.header === "side" ? sw - 4 : 16} height="2" rx="0.6" fill={d.header === "band" ? "#fff" : a} />
-        {[0, 1, 2, 3].map((i) => <rect key={i} x={mx} y={14 + i * 8} width={mw} height="1.4" rx="0.5" fill={a} opacity={0.9} />)}
-        {[0, 1, 2, 3].map((i) => <rect key={`l${i}`} x={mx} y={17 + i * 8} width={mw * 0.85} height="0.9" rx="0.4" fill="#c7c7c7" />)}
-        {two && [0, 1, 2].map((i) => <rect key={`s${i}`} x={sx + 2} y={20 + i * 7} width={sw - 4} height="0.9" rx="0.4" fill={luminance(d.colors.side) < 0.35 ? "#fff" : "#bdbdbd"} />)}
-      </svg>
-      <div className="text-xs font-medium mt-1.5">{tpl.label}</div>
-      <div className={`text-xs leading-snug ${T.faint}`}>{tpl.hint}</div>
-    </button>
-  );
-}
-
-/* Petits contrôles du panneau Design. */
-function Slider({ label, value, min, max, step = 1, unit = "", onChange }) {
-  const T = useT();
-  return (
-    <label className="block">
-      <span className="flex items-center justify-between text-xs mb-1"><span className={T.muted}>{label}</span><span className="tabular-nums">{String(Math.round(value * 100) / 100).replace(".", ",")}{unit}</span></span>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full" aria-label={label} />
-    </label>
-  );
-}
-function Seg({ label, value, options, onChange }) {
-  const T = useT();
-  return (
-    <div>
-      {label && <div className={`text-xs mb-1 ${T.muted}`}>{label}</div>}
-      <div role="radiogroup" aria-label={label} className={`flex flex-wrap gap-1 p-1 rounded-xl ${T.sub}`}>
-        {options.map(([v, l]) => (
-          <button key={String(v)} type="button" role="radio" aria-checked={value === v} onClick={() => onChange(v)} className={`flex-1 min-w-0 px-2 h-7 rounded-lg text-xs truncate transition-colors duration-150 ${value === v ? `${T.navActive} font-medium` : T.muted} ${T.ring}`} style={value === v ? T.shadow : undefined}>{l}</button>
-        ))}
-      </div>
-    </div>
-  );
-}
-const SWATCHES = ["#1f3a5f", "#1e293b", "#2563eb", "#0f766e", "#047857", "#7c2d12", "#9f1239", "#6d28d9", "#c2410c", "#111827", "#ffffff", "#f1f5f9"];
-function ColorField({ label, value, onChange, swatches = SWATCHES }) {
-  const T = useT();
-  return (
-    <div>
-      <div className="flex items-center justify-between gap-2">
-        <span className={`text-xs ${T.muted}`}>{label}</span>
-        <input type="color" value={cleanHex(value)} onChange={(e) => onChange(e.target.value)} aria-label={label} style={{ width: 34, height: 24, border: "none", background: "transparent", cursor: "pointer" }} />
-      </div>
-      <div className="flex flex-wrap gap-1 mt-1">
-        {swatches.map((c) => (
-          <button key={c} type="button" onClick={() => onChange(c)} aria-label={`${label} ${c}`} className={`w-5 h-5 rounded-full ${T.ring}`} style={{ background: c, border: cleanHex(value) === c ? "2px solid #4f46e5" : "1px solid #d6d3d1" }} />
-        ))}
-      </div>
-    </div>
-  );
-}
-function Fold({ title, children, open: open0 = false }) {
-  const T = useT();
-  const [open, setOpen] = useState(open0);
-  return (
-    <section className={`border-b ${T.line}`}>
-      <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} className={`w-full flex items-center justify-between py-3 text-sm font-medium ${T.ring} rounded-lg`}>
-        {title}<ChevronRight className={`w-4 h-4 transition-transform duration-150 ${open ? "rotate-90" : ""} ${T.faint}`} aria-hidden="true" />
-      </button>
-      {open && <div className="pb-4 space-y-4">{children}</div>}
-    </section>
-  );
-}
-
-/* ── Photo : import, recadrage, rotation (locale, jamais envoyée à l'IA) ── */
-function PhotoEditor({ open, onClose }) {
-  const T = useT();
-  const { media, setMedia, toast } = useApp();
-  const [orig, setOrig] = useState(null);
-  const [crop, setCrop] = useState({ zoom: 1, x: 0, y: 0, rot: 0 });
-  const [shape, setShape] = useState("circle");
-  const cv = useRef(null);
-  const img = useRef(null);
-  const drag = useRef(null);
-  const file = useRef(null);
-  const V = 260;
-  useEffect(() => {
-    if (!open) return;
-    setOrig(media.photo?.original || null);
-    setCrop(media.photo?.crop || { zoom: 1, x: 0, y: 0, rot: 0 });
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    let off = false;
-    if (!orig) { img.current = null; return undefined; }
-    loadImg(orig).then((i) => { if (!off) { img.current = i; draw(); } }).catch(() => toast("Image illisible", "danger"));
-    return () => { off = true; };
-  }, [orig]); // eslint-disable-line react-hooks/exhaustive-deps
-  const draw = () => { const c = cv.current; if (c && img.current) drawCrop(c.getContext("2d"), img.current, V * 2, crop); };
-  useEffect(draw, [crop]); // eslint-disable-line react-hooks/exhaustive-deps
-  const onFile = (e) => {
-    const f = e.target.files?.[0];
-    e.target.value = "";
-    if (!f) return;
-    if (!/^image\//.test(f.type)) { toast("Choisissez une image (JPEG, PNG…)", "warn"); return; }
-    const r = new FileReader();
-    r.onload = async () => { try { setOrig(await downscaleImage(String(r.result))); setCrop({ zoom: 1, x: 0, y: 0, rot: 0 }); } catch (err) { toast(err.message, "danger"); } };
-    r.readAsDataURL(f);
-  };
-  const save = async () => {
-    if (!orig) return;
-    const src = await cropPhoto(orig, crop);
-    setMedia((m) => ({ ...m, photo: { src, original: orig, crop, updatedAt: nowISO() } }));
-    toast("Photo enregistrée (stockée localement, jamais envoyée à l'IA)", "ok");
-    onClose(shape);
-  };
-  const clip = { circle: "circle(50% at 50% 50%)", rounded: "inset(0 round 18%)", square: "none", hexagon: "polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%)" }[shape];
-  return (
-    <Modal open={open} onClose={() => onClose()} title="Photo de profil" footer={<><Btn variant="ghost" onClick={() => onClose()}>Annuler</Btn><Btn variant="primary" icon={Check} disabled={!orig} onClick={save}>Valider le recadrage</Btn></>}>
-      <div className="space-y-4">
-        <div className="flex flex-col items-center gap-3">
-          <div
-            className="relative rounded-2xl overflow-hidden"
-            style={{ width: V, height: V, background: T.dark ? "#292524" : "#f5f5f4", cursor: orig ? "grab" : "default", touchAction: "none" }}
-            onPointerDown={(e) => { if (!orig) return; e.currentTarget.setPointerCapture(e.pointerId); drag.current = { x: e.clientX, y: e.clientY, c: crop }; }}
-            onPointerMove={(e) => { const d = drag.current; if (!d) return; setCrop({ ...d.c, x: clamp(d.c.x + (e.clientX - d.x) / V, -1, 1), y: clamp(d.c.y + (e.clientY - d.y) / V, -1, 1) }); }}
-            onPointerUp={() => { drag.current = null; }}
-            onWheel={(e) => { if (orig) setCrop((c) => ({ ...c, zoom: clamp(c.zoom * (e.deltaY < 0 ? 1.06 : 0.94), 1, 4) })); }}
-          >
-            {orig ? (
-              <>
-                <canvas ref={cv} width={V * 2} height={V * 2} style={{ width: V, height: V, opacity: 0.35, position: "absolute", inset: 0 }} aria-hidden="true" />
-                <canvas width={V * 2} height={V * 2} style={{ width: V, height: V, position: "absolute", inset: 0, clipPath: clip }} ref={(el) => { if (el && img.current) drawCrop(el.getContext("2d"), img.current, V * 2, crop); }} aria-label="Aperçu du recadrage" />
-              </>
-            ) : (
-              <button type="button" onClick={() => file.current?.click()} className={`absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm ${T.muted} ${T.ring}`}>
-                <Upload className="w-6 h-6" aria-hidden="true" />Importer une photo
-              </button>
-            )}
-          </div>
-          <input ref={file} type="file" accept="image/*" className="hidden" onChange={onFile} aria-label="Fichier photo" />
-          <p className={`text-xs text-center ${T.faint}`}>Glissez pour cadrer, molette ou curseur pour zoomer. La forme finale se règle aussi dans le panneau Design.</p>
-        </div>
-        {orig && (
-          <>
-            <Slider label="Zoom" value={crop.zoom} min={1} max={4} step={0.01} unit="×" onChange={(zoom) => setCrop({ ...crop, zoom })} />
-            <div className="flex flex-wrap gap-2">
-              <Btn size="sm" icon={RotateCw} onClick={() => setCrop({ ...crop, rot: (crop.rot + 90) % 360 })}>Pivoter</Btn>
-              <Btn size="sm" variant="ghost" onClick={() => setCrop({ zoom: 1, x: 0, y: 0, rot: 0 })}>Recentrer</Btn>
-              <Btn size="sm" variant="ghost" icon={Upload} onClick={() => file.current?.click()}>Autre photo</Btn>
-            </div>
-            <Seg label="Aperçu de forme" value={shape} onChange={setShape} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
-          </>
-        )}
-      </div>
-    </Modal>
-  );
-}
-
-/* ── Panneau Design ── */
-function DesignPanel({ design, setDesign, accentSuggested, onPhoto, hasPhoto, kind }) {
-  const T = useT();
-  const { settings, setSettings, toast, setMedia } = useApp();
-  const D = design;
-  const set = (patch) => setDesign({ ...D, ...patch });
-  const setC = (k, v) => setDesign({ ...D, colors: { ...D.colors, [k]: v } });
-  const setM = (k, v) => setDesign({ ...D, margin: D.linkMargins ? { t: v, r: v, b: v, l: v } : { ...D.margin, [k]: v } });
-  const setP = (k, v) => setDesign({ ...D, photo: { ...D.photo, [k]: v } });
-  const [keepAccent, setKeepAccent] = useState(true);
-  return (
-    <div>
-      <Fold title="Modèles" open>
-        <label className={`flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={keepAccent} onChange={(e) => setKeepAccent(e.target.checked)} />Garder ma couleur d'accent</label>
-        <div className="grid grid-cols-2 gap-2">
-          {TEMPLATES.map((t) => (
-            <TemplateThumb key={t.id} tpl={t} accent={keepAccent ? D.colors.accent : null} active={D.template === t.id}
-              onClick={() => setDesign(designFromTemplate(t.id, { layout: D.layout, accent: keepAccent ? D.colors.accent : null, page: D.page }))} />
-          ))}
-        </div>
-      </Fold>
-      <Fold title="Couleurs" open>
-        {accentSuggested && cleanHex(accentSuggested) !== cleanHex(D.colors.accent) && (
-          <button type="button" onClick={() => setDesign({ ...D, colors: { ...D.colors, accent: accentSuggested, ...(D.colors.band === D.colors.accent ? { band: accentSuggested } : {}) } })} className={`w-full flex items-center gap-2 rounded-xl px-3 py-2 text-xs ${T.sub} ${T.ring}`}>
-            <span className="w-4 h-4 rounded-full" style={{ background: accentSuggested }} />Appliquer la couleur de l'entreprise (suggestion IA)
-          </button>
-        )}
-        <ColorField label="Accent (titres, puces)" value={D.colors.accent} onChange={(v) => setC("accent", v)} />
-        <ColorField label="Texte" value={D.colors.text} onChange={(v) => setC("text", v)} swatches={["#111827", "#262626", "#374151", "#1f2937", "#0f172a"]} />
-        <ColorField label="Texte secondaire" value={D.colors.muted} onChange={(v) => setC("muted", v)} swatches={["#6b6b6b", "#6b7280", "#64748b", "#78716c", "#57534e"]} />
-        <ColorField label="Filets" value={D.colors.rule} onChange={(v) => setC("rule", v)} swatches={["#d4d4d4", "#e5e7eb", "#94a3b8", D.colors.accent]} />
-        {Number(D.columns) === 2 && <>
-          <ColorField label="Fond de colonne" value={D.colors.side} onChange={(v) => setC("side", v)} swatches={["#ffffff", "#f1f5f9", "#f5f5f4", "#f0fdfa", "#eff6ff", "#134e4a", "#1e293b", "#1f3a5f", D.colors.accent]} />
-          <ColorField label="Texte de colonne" value={D.colors.sideText} onChange={(v) => setC("sideText", v)} swatches={["#262626", "#ffffff", "#f0fdfa", "#e2e8f0"]} />
-        </>}
-        {D.header === "band" && <>
-          <ColorField label="Bandeau" value={D.colors.band} onChange={(v) => setC("band", v)} />
-          <ColorField label="Texte du bandeau" value={D.colors.bandText} onChange={(v) => setC("bandText", v)} swatches={["#ffffff", "#f8fafc", "#111827"]} />
-        </>}
-      </Fold>
-      <Fold title="Typographie">
-        <Seg label="Police des titres" value={D.headingFont} onChange={(v) => set({ headingFont: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
-        <Seg label="Police du texte" value={D.font} onChange={(v) => set({ font: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
-        <Slider label="Taille du texte" value={D.size} min={8.5} max={12} step={0.25} unit=" pt" onChange={(size) => set({ size })} />
-        <Slider label="Interligne" value={D.lineHeight} min={1.05} max={1.8} step={0.05} onChange={(lineHeight) => set({ lineHeight })} />
-        <Slider label="Taille du nom" value={D.nameSize} min={1.5} max={3.4} step={0.05} unit="×" onChange={(nameSize) => set({ nameSize })} />
-        <Slider label="Taille des titres" value={D.headingSize} min={0.85} max={1.6} step={0.01} unit="×" onChange={(headingSize) => set({ headingSize })} />
-        <Seg label="Casse des titres" value={D.headingCase} onChange={(v) => set({ headingCase: v })} options={[["upper", "MAJUSCULES"], ["normal", "Normale"]]} />
-        {D.headingCase === "upper" && <Slider label="Espacement des lettres (titres)" value={D.headingSpacing} min={0} max={2.5} step={0.1} unit=" pt" onChange={(headingSpacing) => set({ headingSpacing })} />}
-      </Fold>
-      <Fold title="Mise en page">
-        <Seg label="Format" value={D.page} onChange={(v) => set({ page: v })} options={[["a4", "A4"], ["letter", "US Letter"]]} />
-        {kind === "cv" && <Seg label="Colonnes" value={Number(D.columns)} onChange={(v) => set({ columns: v })} options={[[1, "Une"], [2, "Deux"]]} />}
-        {kind === "cv" && Number(D.columns) === 2 && <>
-          <Seg label="Colonne secondaire" value={D.side} onChange={(v) => set({ side: v })} options={[["left", "À gauche"], ["right", "À droite"]]} />
-          <Slider label="Largeur de la colonne" value={D.sideWidth} min={22} max={42} step={1} unit=" %" onChange={(sideWidth) => set({ sideWidth })} />
-          <Slider label="Écart entre colonnes" value={D.colGap} min={3} max={14} step={0.5} unit=" mm" onChange={(colGap) => set({ colGap })} />
-          <Toggle checked={!!D.sideFull} onChange={(v) => set({ sideFull: v })} label="Fond de colonne bord à bord" description="Le fond va jusqu'au bord de la feuille." />
-        </>}
-        <Seg label="En-tête" value={D.header} onChange={(v) => set({ header: v })} options={[["left", "Gauche"], ["center", "Centré"], ["band", "Bandeau"], ...(kind === "cv" && Number(D.columns) === 2 ? [["side", "Colonne"]] : [])]} />
-        <Toggle checked={!!D.linkMargins} onChange={(v) => setDesign({ ...D, linkMargins: v, margin: v ? { t: D.margin.l, r: D.margin.l, b: D.margin.l, l: D.margin.l } : D.margin })} label="Marges identiques" />
-        <div className="grid grid-cols-2 gap-3">
-          {(D.linkMargins ? [["l", "Marges"]] : [["t", "Haut"], ["b", "Bas"], ["l", "Gauche"], ["r", "Droite"]]).map(([k, l]) => (
-            <Slider key={k} label={l} value={D.margin[k]} min={0} max={30} step={0.5} unit=" mm" onChange={(v) => setM(k, v)} />
-          ))}
-        </div>
-        <Slider label="Espace entre sections" value={D.sectionGap} min={1} max={12} step={0.25} unit=" mm" onChange={(sectionGap) => set({ sectionGap })} />
-        <Slider label="Espace entre éléments" value={D.itemGap} min={0} max={6} step={0.1} unit=" mm" onChange={(itemGap) => set({ itemGap })} />
-        <Slider label="Espace entre paragraphes" value={D.paraGap} min={0} max={6} step={0.1} unit=" mm" onChange={(paraGap) => set({ paraGap })} />
-      </Fold>
-      <Fold title="Éléments">
-        <Seg label="Style des titres" value={D.headingStyle} onChange={(v) => set({ headingStyle: v })} options={[["line", "Trait"], ["bar", "Barre"], ["pill", "Pastille"], ["double", "Double"], ["plain", "Simple"]]} />
-        <Slider label="Épaisseur des traits" value={D.rule} min={0} max={2} step={0.05} unit=" mm" onChange={(rule) => set({ rule })} />
-        <Seg label="Puces" value={D.bullet} onChange={(v) => set({ bullet: v })} options={[["dot", "●"], ["square", "■"], ["dash", "–"], ["arrow", "›"], ["none", "Aucune"]]} />
-        <Toggle checked={!!D.icons} onChange={(v) => set({ icons: v })} label="Icônes des coordonnées" />
-        {kind === "cv" && <Toggle checked={!!D.sectionIcons} onChange={(v) => set({ sectionIcons: v })} label="Icônes des sections" />}
-        {kind === "cv" && <Toggle checked={!!D.datesRight} onChange={(v) => set({ datesRight: v })} label="Dates alignées à droite" />}
-        {kind === "cv" && <Toggle checked={!!D.skillsAsTags} onChange={(v) => set({ skillsAsTags: v })} label="Compétences en étiquettes" />}
-        {kind === "letter" && <Toggle checked={!!D.justify} onChange={(v) => set({ justify: v })} label="Paragraphes justifiés" />}
-      </Fold>
-      <Fold title="Photo">
-        <Toggle checked={!!D.photo.show} onChange={(v) => setP("show", v)} label="Afficher la photo" description={hasPhoto ? "Courant en Belgique ; déconseillé pour l'anglais." : "Aucune photo importée."} />
-        <div className="flex flex-wrap gap-2">
-          <Btn size="sm" icon={hasPhoto ? Crop : Upload} onClick={onPhoto}>{hasPhoto ? "Recadrer / changer" : "Importer une photo"}</Btn>
-          {hasPhoto && <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => { setMedia((m) => ({ ...m, photo: null })); toast("Photo supprimée", "ok"); }}>Supprimer</Btn>}
-        </div>
-        <Seg label="Forme" value={D.photo.shape} onChange={(v) => setP("shape", v)} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
-        <Slider label="Taille" value={D.photo.size} min={16} max={48} step={0.5} unit=" mm" onChange={(v) => setP("size", v)} />
-        <Slider label="Bordure" value={D.photo.border} min={0} max={3} step={0.1} unit=" mm" onChange={(v) => setP("border", v)} />
-        {D.photo.border > 0 && <ColorField label="Couleur de bordure" value={D.photo.borderColor} onChange={(v) => setP("borderColor", v)} swatches={["#ffffff", "#e7e5e4", D.colors.accent, "#111827"]} />}
-      </Fold>
-      <div className="flex flex-wrap gap-2 pt-4">
-        <Btn size="sm" icon={Star} onClick={() => { const { layout, ...rest } = D; setSettings((s) => ({ ...s, designDefault: rest })); toast("Style enregistré par défaut pour les prochains dossiers", "ok"); }}>Style par défaut</Btn>
-        <Btn size="sm" variant="ghost" icon={RotateCcw} onClick={() => setDesign(designFromTemplate(D.template, { layout: D.layout, accent: D.colors.accent, page: D.page }))}>Réinitialiser le modèle</Btn>
-      </div>
-      {settings.designDefault && <p className={`text-xs mt-2 ${T.faint}`}>Style par défaut : {TEMPLATE_BY_ID[settings.designDefault.template]?.label || "personnalisé"}.</p>}
-    </div>
-  );
-}
-
-/* ── Panneau Structure : ordre, colonne, visibilité des sections ── */
-function StructurePanel({ model, design, setDesign, onAddSection, onDeleteSection, lang }) {
-  const T = useT();
-  const two = Number(design.columns) === 2;
-  const arr = arrangeSections(model.sections, design.layout, two);
-  const [dragKey, setDragKey] = useState(null);
-  const [overCol, setOverCol] = useState(null);
-  const L = design.layout || {};
-  const sideList = Array.isArray(L.side) ? L.side : model.sections.filter((s) => arr.isSide(s.key)).map((s) => s.key);
-  const setLayout = (patch) => setDesign({ ...design, layout: { ...L, order: arr.order, side: sideList, ...patch } });
-  const colOf = (k) => (two && sideList.includes(k) ? "side" : "main");
-  const moveTo = (key, target, beforeKey) => {
-    const order = arr.order.filter((k) => k !== key);
-    const i = beforeKey ? order.indexOf(beforeKey) : -1;
-    order.splice(i >= 0 ? i : order.length, 0, key);
-    const side = target === "side" ? [...new Set([...sideList, key])] : sideList.filter((k) => k !== key);
-    setLayout({ order, side });
-  };
-  const step = (key, dir) => {
-    const col = colOf(key);
-    const same = arr.order.filter((k) => colOf(k) === col);
-    const i = same.indexOf(key), j = i + dir;
-    if (j < 0 || j >= same.length) return;
-    const order = [...arr.order];
-    const a = order.indexOf(same[i]), b = order.indexOf(same[j]);
-    [order[a], order[b]] = [order[b], order[a]];
-    setLayout({ order });
-  };
-  const toggleHide = (key) => setLayout({ hidden: arr.hidden.has(key) ? [...arr.hidden].filter((k) => k !== key) : [...arr.hidden, key] });
-  const missing = Object.keys(SECTION_TITLES.fr).filter((k) => !model.sections.some((s) => baseKey(s.key) === k));
-  const cols = two ? [["main", "Colonne principale"], ["side", "Colonne secondaire"]] : [["main", "Sections"]];
-  return (
-    <div className="space-y-5">
-      <p className={`text-xs ${T.muted}`}>Glissez les sections pour les réordonner{two ? " ou les changer de colonne" : ""}. Survolez une section dans l'aperçu pour la déplacer sur place.</p>
-      {cols.map(([col, label]) => {
-        const keys = arr.order.filter((k) => colOf(k) === col);
-        return (
-          <div key={col}
-            onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
-            onDragLeave={() => setOverCol((c) => (c === col ? null : c))}
-            onDrop={(e) => { e.preventDefault(); setOverCol(null); if (dragKey) moveTo(dragKey, col, null); setDragKey(null); }}
-            className={`rounded-2xl p-2 transition-colors duration-150 ${overCol === col ? T.accentSoft : T.sub}`}>
-            <div className={`px-2 pb-2 text-xs font-semibold uppercase tracking-wider ${T.faint}`}>{label}</div>
-            <ul className="space-y-1">
-              {keys.map((k) => {
-                const sec = model.sections.find((s) => s.key === k);
-                const hidden = arr.hidden.has(k);
-                return (
-                  <li key={k} draggable
-                    onDragStart={(e) => { setDragKey(k); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", k); }}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={(e) => { e.preventDefault(); e.stopPropagation(); setOverCol(null); if (dragKey && dragKey !== k) moveTo(dragKey, col, k); setDragKey(null); }}
-                    className={`flex items-center gap-1 rounded-xl pl-1 pr-1 py-1 ${T.surface} ${hidden ? "opacity-50" : ""}`} style={T.shadow}>
-                    <GripVertical className={`w-4 h-4 shrink-0 cursor-grab ${T.faint}`} aria-hidden="true" />
-                    <span className="flex-1 min-w-0 text-sm truncate">{sectionLabel(sec)}</span>
-                    <IconBtn icon={ArrowUp} label="Monter" onClick={() => step(k, -1)} small />
-                    <IconBtn icon={ArrowDown} label="Descendre" onClick={() => step(k, 1)} small />
-                    {two && <IconBtn icon={ArrowLeftRight} label={col === "side" ? "Vers la colonne principale" : "Vers la colonne secondaire"} onClick={() => moveTo(k, col === "side" ? "main" : "side", null)} small />}
-                    <IconBtn icon={hidden ? EyeOff : Eye} label={hidden ? "Afficher" : "Masquer à l'export"} onClick={() => toggleHide(k)} small />
-                    {sec?.heading && <IconBtn icon={Trash2} label="Supprimer la section du texte" onClick={() => onDeleteSection(sec)} small />}
-                  </li>
-                );
-              })}
-              {!keys.length && <li className={`text-xs text-center py-4 ${T.faint}`}>Déposez une section ici</li>}
-            </ul>
-          </div>
-        );
-      })}
-      {missing.length > 0 && (
-        <div>
-          <div className={`text-xs mb-2 ${T.muted}`}>Ajouter une section</div>
-          <div className="flex flex-wrap gap-1.5">
-            {missing.map((k) => <Btn key={k} size="sm" variant="ghost" icon={Plus} onClick={() => onAddSection(k)}>{(SECTION_TITLES[lang] || SECTION_TITLES.fr)[k]}</Btn>)}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Panneau Qualité : score local + mots-clés ── */
-function QualityPanel({ q, cov, kwInfo, tips, missingInProfile }) {
-  const T = useT();
-  const tone = q.score >= 85 ? "#059669" : q.score >= 65 ? "#d97706" : "#e11d48";
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center gap-4">
-        <svg width="64" height="64" viewBox="0 0 36 36" aria-label={`Score qualité ${q.score} sur 100`} role="img">
-          <circle cx="18" cy="18" r="15.5" fill="none" stroke={T.dark ? "#292524" : "#e7e5e4"} strokeWidth="3.5" />
-          <circle cx="18" cy="18" r="15.5" fill="none" stroke={tone} strokeWidth="3.5" strokeDasharray={`${(q.score / 100) * 97.4} 97.4`} strokeLinecap="round" transform="rotate(-90 18 18)" />
-          <text x="18" y="21.5" textAnchor="middle" fontSize="10" fontWeight="600" fill="currentColor">{q.score}</text>
-        </svg>
-        <div>
-          <div className="text-sm font-medium">Score qualité</div>
-          <div className={`text-xs ${T.muted}`}>{q.words} mots · calculé localement, sans IA. Visez 85 et plus.</div>
-        </div>
-      </div>
-      <ul className="space-y-2">
-        {q.checks.map((c) => (
-          <li key={c.id} className="flex gap-2 text-sm">
-            {c.tone === "info" ? <Info className={`w-4 h-4 mt-0.5 shrink-0 ${T.muted}`} aria-hidden="true" /> : c.ok ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" aria-label="Conforme" /> : <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${c.tone === "danger" ? "text-rose-500" : "text-amber-500"}`} aria-label="À améliorer" />}
-            <span className="min-w-0"><span className="block">{c.label}</span><span className={`block text-xs ${T.muted}`}>{c.detail}</span></span>
-          </li>
-        ))}
-      </ul>
-      {cov && cov.pct !== null && (
-        <div>
-          <SectionTitle>Mots-clés de l'annonce · {cov.pct} %</SectionTitle>
-          {kwInfo && <p className={`text-xs mb-2 ${T.muted}`}>{kwInfo}</p>}
-          <div className="flex flex-wrap gap-1.5">{cov.covered.map((k) => <Chip key={k} tone="ok">{k}</Chip>)}{cov.missing.map((k) => <Chip key={k} tone="warn">{k}</Chip>)}</div>
-          {cov.missing.length > 0 && <p className={`text-xs mt-2 ${T.faint}`}>En orange : absents. Ajoutez-les seulement si c'est vrai.</p>}
-        </div>
-      )}
-      {missingInProfile?.length > 0 && <Notice icon={HelpCircle}>Exigences non couvertes par votre profil : {missingInProfile.join(", ")}. À préparer pour l'entretien.</Notice>}
-      {tips?.length > 0 && (
-        <div className={`rounded-2xl p-4 ${T.accentSoft}`}>
-          <div className="text-sm font-medium mb-1">Pour sortir du lot sur cette offre</div>
-          <ul className="text-sm space-y-1">{tips.map((t, i) => <li key={i}>• {t}</li>)}</ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* Édition d'un bloc à l'emplacement cliqué. */
-const BLOCK_PREFIX = { name: "# ", h2: "## ", h3: "### ", bullet: "- ", quote: "> ", contact: "@ ", date: "= ", sign: "~ " };
-const BLOCK_LABEL = { name: "Nom", h2: "Titre de section", h3: "Poste | Organisation | Lieu | Période", bullet: "Puces (une par ligne)", quote: "Accroche / destinataire", contact: "Coordonnées (séparées par |)", date: "Lieu et date", sign: "Signature", kv: "**Libellé :** valeurs", para: "Paragraphe" };
-const splitLines = (t) => String(t || "").split("\n");
-function blockValue(text, b) {
-  const ls = splitLines(text).slice(b.l0, b.l1 + 1);
-  if (BLOCK_PREFIX[b.t]) return ls.map((l) => l.trim().replace(/^(#{1,3}|[-•*]|>|@|=|~)\s/, "")).join("\n");
-  return ls.join("\n");
-}
-function replaceLines(text, l0, l1, newLines) { const ls = splitLines(text); ls.splice(l0, l1 - l0 + 1, ...newLines); return ls.join("\n"); }
-function BlockEditor({ block, text, onChange, onClose, onMove, onDuplicate, onDelete, style }) {
-  const T = useT();
-  const ref = useRef(null);
-  const [val, setVal] = useState(() => blockValue(text, block));
-  useEffect(() => { const el = ref.current; if (el) { el.focus(); const n = el.value.length; try { el.setSelectionRange(n, n); } catch { /* ignore */ } } }, [block.l0]);
-  useEffect(() => { if (document.activeElement !== ref.current) setVal(blockValue(text, block)); }, [text, block.l0, block.l1]); // eslint-disable-line react-hooks/exhaustive-deps
-  const commit = (v) => {
-    setVal(v);
-    const pre = BLOCK_PREFIX[block.t];
-    const out = pre ? splitLines(v).map((l) => (l.trim() ? pre + l.trim() : "")).filter((l, i, a) => l || i < a.length - 1) : splitLines(v);
-    onChange(out.length ? out : [""]);
-  };
-  return (
-    <div className="absolute rounded-2xl p-3 space-y-2" style={{ ...T.glass, ...T.shadow, zIndex: 5, ...style }} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Modifier le bloc">
-      <div className="flex items-center justify-between gap-2">
-        <span className={`text-xs ${T.muted}`}>{BLOCK_LABEL[block.t] || "Bloc"}</span>
-        <span className="flex gap-0.5">
-          <IconBtn icon={ArrowUp} label="Monter le bloc" onClick={() => onMove(-1)} small />
-          <IconBtn icon={ArrowDown} label="Descendre le bloc" onClick={() => onMove(1)} small />
-          <IconBtn icon={Copy} label="Dupliquer" onClick={onDuplicate} small />
-          <IconBtn icon={Trash2} label="Supprimer le bloc" onClick={onDelete} small />
-          <IconBtn icon={X} label="Fermer (Échap)" onClick={onClose} small />
-        </span>
-      </div>
-      <textarea ref={ref} value={val} onChange={(e) => commit(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } }}
-        rows={Math.min(8, Math.max(2, val.split("\n").length + 1))} className={`w-full rounded-xl px-3 py-2 text-sm leading-relaxed ${T.input} ${T.ring}`} aria-label={BLOCK_LABEL[block.t] || "Texte du bloc"} />
-      {block.t === "bullet" && <p className={`text-xs ${T.faint}`}>Entrée = nouvelle puce. Commencez par un verbe d'action et un chiffre.</p>}
-    </div>
-  );
-}
-
-/* ── Studio plein écran ── */
-function Studio({ appId, initialKind = "cv", onClose }) {
-  const T = useT();
-  const { apps, offers, settings, media, saveDocVersion, translateDoc, generateDocs, setAppDesign, busy, toast, openExport } = useApp();
-  const app = apps.find((a) => a.id === appId);
-  const offer = offers.find((o) => o.id === app?.offerId);
-  const ref = useRef(null);
-  const center = useRef(null);
-  const taRef = useRef(null);
-  const [kind, setKind] = useState(initialKind);
-  const firstLang = (k) => { const l = docLangs(app, offer, k); return l.includes(app?.docLanguage) ? app.docLanguage : l[0] || offerLang(offer); };
-  const [lang, setLang] = useState(() => firstLang(initialKind));
-  const key = `${kind}:${lang}`;
-  const latest = latestDoc(app, offer, kind, lang);
-  const [drafts, setDrafts] = useState({});
-  const text = drafts[key] ?? latest?.text ?? "";
-  const cvLatest = latestDoc(app, offer, "cv", lang) || (app?.docs?.cv || []).slice(-1)[0];
-  const [design, setDesignState] = useState(() => resolveDesign(app, settings, cvLatest?.accent));
-  const [sel, setSel] = useState(null);
-  const [hover, setHover] = useState(null);
-  const [left, setLeft] = useState("content");
-  const [mobile, setMobile] = useState("preview");
-  const [zoom, setZoom] = useState("fit");
-  const [fit, setFit] = useState(0.7);
-  const [photoOpen, setPhotoOpen] = useState(false);
-  const [instr, setInstr] = useState("");
-  const [trOpen, setTrOpen] = useState(false);
-  const hist = useRef({ past: [], future: [], at: 0 });
-  // Échap : ferme d'abord l'éditeur de bloc ou le menu, puis le Studio (le piège de focus garde la première fonction reçue).
-  const escRef = useRef(null);
-  escRef.current = () => { if (trOpen) setTrOpen(false); else if (sel) setSel(null); else tryClose(); };
-  useFocusTrap(true, ref, () => escRef.current());
-
-  /* Historique (annuler / rétablir) : texte et design. Les frappes rapprochées sont regroupées. */
-  const snapshot = () => ({ drafts, design });
-  const remember = (coalesce) => {
-    const h = hist.current;
-    const now = Date.now();
-    if (!(coalesce && now - h.at < 900)) { h.past.push(snapshot()); if (h.past.length > 80) h.past.shift(); h.future = []; }
-    h.at = now;
-  };
-  const setText = (v, coalesce = true) => { remember(coalesce); setDrafts((d) => ({ ...d, [key]: v })); };
-  const setDesign = (d) => { remember(false); setDesignState(d); };
-  const undo = () => { const h = hist.current; const s = h.past.pop(); if (!s) return; h.future.push(snapshot()); setDrafts(s.drafts); setDesignState(s.design); h.at = 0; };
-  const redo = () => { const h = hist.current; const s = h.future.pop(); if (!s) return; h.past.push(snapshot()); setDrafts(s.drafts); setDesignState(s.design); h.at = 0; };
-
-  // Le design (commun au CV et à la lettre) est enregistré sur la candidature au fil de l'eau.
-  useEffect(() => { const t = setTimeout(() => setAppDesign(appId, design), 400); return () => clearTimeout(t); }, [design]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    const onKey = (e) => {
-      if (!(e.metaKey || e.ctrlKey)) return;
-      const k = e.key.toLowerCase();
-      if (k === "s") { e.preventDefault(); save(); return; }
-      if (/^(INPUT|TEXTAREA)$/.test(e.target?.tagName)) return;
-      if (k === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
-      if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); redo(); }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  });
-  useEffect(() => {
-    const el = center.current;
-    if (!el || typeof ResizeObserver === "undefined") return undefined;
-    const ro = new ResizeObserver(([e]) => setFit(clamp((e.contentRect.width - 48) / (PAGE_SIZES[design.page]?.[0] || 210) / PX_MM, 0.35, 1.6)));
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [design.page]);
-
-  const deferred = useDeferredValue(text);
-  const model = useMemo(() => docModel(deferred, kind), [deferred, kind]);
-  const layout = useMemo(() => layoutDocument(model, design, { photo: media.photo, lang }), [model, design, media.photo, lang]);
-  const k = zoom === "fit" ? fit : zoom;
-  const kw = latest?.keywords || cvLatest?.keywords || [];
-  const kwLang = offer?.language || app?.docLanguage;
-  const q = useMemo(() => docQuality(deferred, { kind, lang, keywords: kind === "cv" ? kw : [], kwLang, design }), [deferred, kind, lang, design]); // eslint-disable-line react-hooks/exhaustive-deps
-  const cov = kind === "cv" && kw.length ? keywordCoverage(deferred, kw) : null;
-  const dirtyKeys = Object.keys(drafts).filter((dk) => { const [kk, ll] = dk.split(":"); return drafts[dk] !== (latestDoc(app, offer, kk, ll)?.text ?? ""); });
-  const dirty = dirtyKeys.includes(key);
-  const langs = docLangs(app, offer, kind);
-  const allLangs = [...new Set([...langs, ...dirtyKeys.filter((dk) => dk.startsWith(`${kind}:`)).map((dk) => dk.split(":")[1])])];
-
-  function save() {
-    if (!dirty || !text.trim()) return;
-    saveDocVersion(appId, kind, text, undefined, { lang, format: "markup" });
-    toast(`${kind === "cv" ? "CV" : "Lettre"} ${LANG_FLAG[lang]} enregistré(e) — nouvelle version`, "ok");
-  }
-  function saveAll() {
-    const todo = dirtyKeys.filter((dk) => drafts[dk]?.trim());
-    todo.forEach((dk) => { const [kk, ll] = dk.split(":"); saveDocVersion(appId, kk, drafts[dk], undefined, { lang: ll, format: "markup" }); });
-    if (todo.length) toast(`${todo.length} document(s) modifié(s) enregistré(s) en nouvelle version`, "ok");
-  }
-  function tryClose() { saveAll(); onClose(); }
-  const switchTo = (nk, nl) => { setSel(null); setKind(nk); setLang(nl ?? (docLangs(app, offer, nk).includes(lang) ? lang : firstLang(nk))); };
-  const translate = async (to) => {
-    setTrOpen(false);
-    if (dirty) save();
-    const from = langs.includes(app?.docLanguage) ? app.docLanguage : langs[0] || lang;
-    const v = await translateDoc(appId, kind, from, to);
-    if (v) { setLang(to); toast(`Traduction ${LANG_FLAG[from]} → ${LANG_FLAG[to]} prête : relisez-la avant l'envoi`, "ok"); }
-  };
-  const regenerate = async () => {
-    if (dirty) save();
-    setDrafts((d) => { const n = { ...d }; delete n[key]; return n; });
-    await generateDocs(appId, [kind], instr, lang);
-    setInstr("");
-  };
-
-  /* Clic dans l'aperçu : sélection du bloc (ou de la photo), synchronisation de la zone de texte. */
-  const pick = (h) => {
-    if (h.src.photo) { setSel({ photo: true }); setPhotoOpen(true); return; }
-    const b = model.blocks.find((x) => x.l0 === h.src.l0) || h.src;
-    setSel({ ...b, page: layout.pages.findIndex((pg) => pg.hits.includes(h)), hit: h });
-    const ta = taRef.current;
-    if (ta) {
-      const ls = splitLines(text);
-      const start = ls.slice(0, b.l0).reduce((n, l) => n + l.length + 1, 0);
-      const end = start + ls.slice(b.l0, b.l1 + 1).join("\n").length;
-      try { ta.setSelectionRange(start, end); ta.scrollTop = Math.max(0, b.l0 * 19 - 60); } catch { /* zone non visible */ }
-    }
-  };
-  const editBlock = (newLines) => {
-    if (!sel || sel.photo) return;
-    setText(replaceLines(text, sel.l0, sel.l1, newLines));
-    setSel((s) => s && { ...s, l1: s.l0 + newLines.length - 1 });
-  };
-  const blockAt = (l0) => model.blocks.find((x) => x.l0 === l0);
-  const moveBlock = (dir) => {
-    const bs = model.blocks;
-    const i = bs.findIndex((x) => x.l0 === sel.l0);
-    const j = i + dir;
-    if (i < 0 || j < 0 || j >= bs.length) return;
-    const [a, b] = dir < 0 ? [bs[j], bs[i]] : [bs[i], bs[j]];
-    const ls = splitLines(text);
-    const A = ls.slice(a.l0, a.l1 + 1), B = ls.slice(b.l0, b.l1 + 1), mid = ls.slice(a.l1 + 1, b.l0);
-    const out = [...ls.slice(0, a.l0), ...B, ...mid, ...A, ...ls.slice(b.l1 + 1)];
-    setText(out.join("\n"), false);
-    const nl0 = dir < 0 ? a.l0 : a.l0 + B.length + mid.length;
-    setSel((s) => ({ ...s, l0: nl0, l1: nl0 + (s.l1 - s.l0), hit: null }));
-  };
-  const duplicateBlock = () => {
-    const ls = splitLines(text);
-    const chunk = ls.slice(sel.l0, sel.l1 + 1);
-    ls.splice(sel.l1 + 1, 0, ...(sel.t === "para" ? ["", ...chunk] : chunk));
-    setText(ls.join("\n"), false);
-  };
-  const deleteBlock = () => { setText(replaceLines(text, sel.l0, sel.l1, []), false); setSel(null); toast("Bloc supprimé — Ctrl+Z pour annuler", "neutral"); };
-  const addSection = (k2) => {
-    const title = (SECTION_TITLES[lang] || SECTION_TITLES.fr)[k2];
-    setText(`${text.replace(/\s+$/, "")}\n\n## ${title}\n${k2 === "skills" || k2 === "languages" ? "**Groupe :** élément, élément" : "- "}`, false);
-  };
-  const deleteSection = (sec) => {
-    const next = model.sections.map((s) => s.heading?.l0).filter((x) => x > sec.heading.l0).sort((a, b) => a - b)[0];
-    const ls = splitLines(text);
-    ls.splice(sec.heading.l0, (next ?? ls.length) - sec.heading.l0);
-    setText(ls.join("\n"), false);
-    setSel(null);
-    toast(`Section « ${sec.title} » supprimée — Ctrl+Z pour annuler`, "neutral");
-  };
-  const sectionMove = (key2, dir) => {
-    const two = Number(design.columns) === 2;
-    const arr = arrangeSections(model.sections, design.layout, two);
-    const sideList = Array.isArray(design.layout?.side) ? design.layout.side : model.sections.filter((s) => arr.isSide(s.key)).map((s) => s.key);
-    const col = (k3) => (two && sideList.includes(k3) ? "side" : "main");
-    if (dir === "swap") {
-      setDesign({ ...design, layout: { ...design.layout, order: arr.order, side: col(key2) === "side" ? sideList.filter((x) => x !== key2) : [...sideList, key2] } });
-      return;
-    }
-    if (dir === "hide") { setDesign({ ...design, layout: { ...design.layout, order: arr.order, side: sideList, hidden: [...arr.hidden, key2] } }); setHover(null); return; }
-    const same = arr.order.filter((k3) => col(k3) === col(key2) && !arr.hidden.has(k3));
-    const i = same.indexOf(key2), j = i + dir;
-    if (j < 0 || j >= same.length) return;
-    const order = [...arr.order];
-    const a = order.indexOf(same[i]), b = order.indexOf(same[j]);
-    [order[a], order[b]] = [order[b], order[a]];
-    setDesign({ ...design, layout: { ...design.layout, order, side: sideList } });
-  };
-  const generating = busy[`dossier:${appId}`];
-  const translating = DOC_LANGS.find((l) => busy[`tr:${appId}:${kind}:${l}`]);
-  const accent = "#4f46e5";
-  const selHit = sel && !sel.photo && (() => {
-    for (let p = 0; p < layout.pages.length; p++) { const h = layout.pages[p].hits.find((x) => x.kind === "block" && x.src.l0 === sel.l0); if (h) return { p, h }; }
-    return null;
-  })();
-
-  if (!app) return null;
-  const leftPanel = (
-    <div className="flex flex-col min-h-0 h-full">
-      <div className="px-4 pt-4 pb-3"><Tabs value={left} onChange={setLeft} tabs={[{ id: "content", label: "Contenu" }, ...(kind === "cv" ? [{ id: "structure", label: "Structure" }] : []), { id: "quality", label: "Qualité", count: q.score }]} /></div>
-      <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-6">
-        {left === "content" && (
-          <div className="space-y-3">
-            {!latest && !text ? (
-              <Empty icon={FileText} title={`${kind === "cv" ? "CV" : "Lettre"} ${LANG_FLAG[lang]} pas encore généré(e)`} text="L'IA rédige à partir de votre profil et de l'annonce, sans rien inventer." action={<Btn variant="primary" icon={Sparkles} loading={generating} onClick={regenerate}>Générer</Btn>} />
-            ) : (
-              <>
-                <textarea ref={taRef} value={text} onChange={(e) => setText(e.target.value)} spellCheck lang={DOCX_LANG[lang]} rows={24} aria-label="Texte du document (balisage léger)"
-                  className={`w-full rounded-xl px-3 py-2.5 ${T.input} ${T.ring}`} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: "19px", minHeight: 320 }} />
-                <p className={`text-xs ${T.faint}`}># nom · &gt; accroche ou destinataire · @ coordonnées (séparées par |) · = date · ## section · ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature</p>
-              </>
-            )}
-            <div className={`pt-3 border-t ${T.line} space-y-2`}>
-              <Input value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Consigne : plus court, accent sur l'automatisation…" aria-label="Consigne de régénération" />
-              <Btn size="sm" icon={RefreshCw} loading={generating} onClick={regenerate}>{latest ? "Régénérer" : "Générer"} en {LANG_FLAG[lang]}</Btn>
-            </div>
-          </div>
-        )}
-        {left === "structure" && <StructurePanel model={model} design={design} setDesign={setDesign} onAddSection={addSection} onDeleteSection={deleteSection} lang={lang} />}
-        {left === "quality" && <QualityPanel q={q} cov={cov} kwInfo={kwLang && kwLang !== lang ? `Annonce en ${LANG_NAME[kwLang] || kwLang} : analyse pertinente surtout sur la version ${LANG_FLAG[kwLang] || ""}.` : null} tips={latest?.tips || cvLatest?.tips} missingInProfile={kind === "cv" ? latest?.missingInProfile : null} />}
-      </div>
-    </div>
-  );
-  const pageW = layout.W * PX_MM * k, pageH = layout.H * PX_MM * k;
-  const preview = (
-    <div ref={center} className="h-full overflow-auto" style={{ background: T.dark ? "#1c1917" : "#e7e5e4" }} onClick={() => setSel(null)}>
-      <div className="flex flex-col items-center gap-6 py-6 px-6" onMouseLeave={() => setHover(null)}>
-        {layout.pages.map((pg, i) => {
-          const secHit = hover && pg.hits.find((h) => h.kind === "section" && h.src.key === hover);
-          return (
-            <div key={i} className="relative shrink-0" style={{ width: pageW, height: pageH, boxShadow: "0 18px 40px -24px rgba(0,0,0,.45)" }}>
-              <PageSvg page={pg} W={layout.W} H={layout.H} photo={media.photo} idp={`st-${i}`} interactive sel={sel} hover={hover} onPick={pick} onHover={setHover} accent={accent} />
-              {secHit && kind === "cv" && (
-                <div className="absolute flex gap-0.5 rounded-xl p-0.5" style={{ left: Math.min(pageW - 150, (secHit.x + secHit.w) * PX_MM * k - 150), top: Math.max(0, secHit.y * PX_MM * k - 30), ...T.glass, ...T.shadow }} onClick={(e) => e.stopPropagation()}>
-                  <IconBtn icon={ArrowUp} label="Monter la section" onClick={() => sectionMove(hover, -1)} small />
-                  <IconBtn icon={ArrowDown} label="Descendre la section" onClick={() => sectionMove(hover, 1)} small />
-                  {Number(design.columns) === 2 && <IconBtn icon={ArrowLeftRight} label="Changer de colonne" onClick={() => sectionMove(hover, "swap")} small />}
-                  <IconBtn icon={EyeOff} label="Masquer la section" onClick={() => sectionMove(hover, "hide")} small />
-                </div>
-              )}
-              {selHit?.p === i && (
-                <BlockEditor key={sel.l0} block={blockAt(sel.l0) || sel} text={text} onChange={editBlock} onClose={() => setSel(null)} onMove={moveBlock} onDuplicate={duplicateBlock} onDelete={deleteBlock}
-                  style={{ left: clamp(selHit.h.x * PX_MM * k, 8, Math.max(8, pageW - 340)), top: (selHit.h.y + selHit.h.h) * PX_MM * k + 8, width: Math.min(340, pageW - 16) }} />
-              )}
-              <span className={`absolute -bottom-5 right-0 text-xs ${T.faint}`}>{i + 1} / {layout.pages.length}</span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-  return (
-    <div ref={ref} className={`fixed inset-0 flex flex-col ${T.app}`} style={{ zIndex: 45 }} role="dialog" aria-modal="true" aria-label="Studio CV et lettre">
-      <div className={`flex flex-wrap items-center gap-2 px-3 sm:px-4 py-2 border-b ${T.line}`} style={T.glass}>
-        <IconBtn icon={X} label="Fermer le Studio (les modifications sont enregistrées)" onClick={tryClose} />
-        <div className="min-w-0 mr-2">
-          <div className="text-sm font-medium truncate" style={{ maxWidth: 260 }}>{offer?.title || "Candidature"}</div>
-          <div className={`text-xs truncate ${T.muted}`} style={{ maxWidth: 260 }}>{show(offer?.company)}</div>
-        </div>
-        <Tabs value={kind} onChange={(v) => switchTo(v)} tabs={[{ id: "cv", label: "CV" }, { id: "letter", label: "Lettre" }]} />
-        <div className="flex items-center gap-1" role="group" aria-label="Langue du document">
-          {allLangs.map((l) => (
-            <button key={l} type="button" onClick={() => switchTo(kind, l)} aria-pressed={l === lang} className={`h-8 px-2.5 rounded-xl text-xs font-semibold ${l === lang ? T.accentSoft : T.btnGhost} ${T.ring}`}>
-              {LANG_FLAG[l]}{dirtyKeys.includes(`${kind}:${l}`) ? " •" : ""}
-            </button>
-          ))}
-          {!allLangs.includes(lang) && <span className={`h-8 px-2.5 inline-flex items-center rounded-xl text-xs font-semibold ${T.accentSoft}`}>{LANG_FLAG[lang]}</span>}
-          <div className="relative">
-            <Btn size="sm" variant="ghost" icon={Languages} loading={!!translating} disabled={!langs.length} onClick={() => setTrOpen(!trOpen)}>{translating ? `→ ${LANG_FLAG[translating]}` : "Traduire"}</Btn>
-            {trOpen && (
-              <div className="absolute mt-1 rounded-2xl p-1 w-56" style={{ ...T.glass, ...T.shadow, zIndex: 6 }}>
-                {DOC_LANGS.filter((l) => !langs.includes(l)).map((l) => (
-                  <button key={l} type="button" onClick={() => translate(l)} className={`w-full text-left px-3 h-9 rounded-xl text-sm ${T.subHover} ${T.ring}`}>Traduire en {LANG_NAME[l]}</button>
-                ))}
-                {DOC_LANGS.filter((l) => !langs.includes(l)).map((l) => (
-                  <button key={`g${l}`} type="button" onClick={() => { setTrOpen(false); switchTo(kind, l); }} className={`w-full text-left px-3 h-9 rounded-xl text-xs ${T.muted} ${T.subHover} ${T.ring}`}>Rédiger directement en {LANG_NAME[l]}</button>
-                ))}
-                {DOC_LANGS.every((l) => langs.includes(l)) && <div className={`px-3 py-2 text-xs ${T.faint}`}>Toutes les langues sont disponibles.</div>}
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="flex-1" />
-        <div className="hidden sm:flex items-center gap-1">
-          <IconBtn icon={Undo2} label="Annuler (Ctrl+Z)" onClick={undo} disabled={!hist.current.past.length} />
-          <IconBtn icon={Redo2} label="Rétablir (Ctrl+Maj+Z)" onClick={redo} disabled={!hist.current.future.length} />
-          <IconBtn icon={ZoomOut} label="Zoom arrière" onClick={() => setZoom(clamp(k - 0.1, 0.35, 2))} />
-          <button type="button" onClick={() => setZoom("fit")} className={`h-9 px-2 rounded-xl text-xs tabular-nums ${T.btnGhost} ${T.ring}`} aria-label="Ajuster à la largeur">{Math.round(k * 100)} %</button>
-          <IconBtn icon={ZoomIn} label="Zoom avant" onClick={() => setZoom(clamp(k + 0.1, 0.35, 2))} />
-        </div>
-        <Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"} className="hidden sm:inline-flex">qualité {q.score}</Chip>
-        <Chip className="hidden md:inline-flex">{layout.pages.length} page(s)</Chip>
-        <Btn variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={save}>Enregistrer</Btn>
-        <Btn icon={FileDown} onClick={() => { saveAll(); openExport(appId); }}>Exporter</Btn>
-      </div>
-      <div className="flex-1 min-h-0 flex">
-        <aside className={`${mobile === "content" ? "flex" : "hidden"} md:flex w-full md:w-80 shrink-0 border-r ${T.line} flex-col min-h-0`} aria-label="Contenu">{leftPanel}</aside>
-        <main className={`${mobile === "preview" ? "flex" : "hidden"} md:flex flex-1 min-w-0 flex-col min-h-0`}>{preview}</main>
-        <aside className={`${mobile === "design" ? "flex" : "hidden"} md:flex w-full md:w-80 shrink-0 border-l ${T.line} flex-col min-h-0`} aria-label="Design">
-          <div className="flex-1 min-h-0 overflow-y-auto px-4 pb-8">
-            <DesignPanel design={design} setDesign={setDesign} accentSuggested={cvLatest?.accent} onPhoto={() => setPhotoOpen(true)} hasPhoto={!!media.photo?.src} kind={kind} />
-          </div>
-        </aside>
-      </div>
-      <div className={`md:hidden flex border-t ${T.line}`}>
-        {[["content", "Contenu", Pencil], ["preview", "Aperçu", Eye], ["design", "Design", Palette]].map(([id, l, I]) => (
-          <button key={id} type="button" onClick={() => setMobile(id)} className={`flex-1 h-12 flex flex-col items-center justify-center text-xs ${mobile === id ? T.accentText : T.muted} ${T.ring}`}><I className="w-4 h-4" aria-hidden="true" />{l}</button>
-        ))}
-      </div>
-      <PhotoEditor open={photoOpen} onClose={(shape) => { setPhotoOpen(false); setSel(null); if (shape) setDesign({ ...design, photo: { ...design.photo, show: true, shape } }); }} />
-    </div>
-  );
-}
-
-/* ── Export : documents × langues × formats, fichiers séparés ou fusionnés ── */
-function ExportModal({ appId, onClose }) {
-  const T = useT();
-  const { apps, offers, settings, media, profile, translateDoc, toast } = useApp();
-  const app = apps.find((a) => a.id === appId);
-  const offer = offers.find((o) => o.id === app?.offerId);
-  const avail = { cv: docLangs(app, offer, "cv"), letter: docLangs(app, offer, "letter") };
-  const known = [...new Set([...avail.cv, ...avail.letter])];
-  const [docs, setDocs] = useState({ cv: avail.cv.length > 0, letter: avail.letter.length > 0 });
-  const [langs, setLangs] = useState(() => (known.length ? known : [offerLang(offer)]));
-  const [format, setFormat] = useState("pdf");
-  const [group, setGroup] = useState("perLang");
-  const [order, setOrder] = useState("cvFirst");
-  const [wordMode, setWordMode] = useState("design");
-  const [run, setRun] = useState(null);
-  if (!app) return null;
-  const kinds = (order === "cvFirst" ? ["cv", "letter"] : ["letter", "cv"]).filter((k) => docs[k]);
-  const missing = kinds.flatMap((k) => langs.filter((l) => !avail[k].includes(l)).map((l) => ({ k, l })));
-  const noSource = missing.filter((m) => !avail[m.k].length);
-  const design = resolveDesign(app, settings, (app.docs?.cv || []).slice(-1)[0]?.accent);
-  const name = profile.name || "candidat";
-  const base = (k, ls) => `${k === "both" ? "Dossier" : k === "cv" ? "CV" : "Lettre"}_${slugFile(name)}_${slugFile(offer?.company || offer?.title)}_${ls.map((l) => LANG_FLAG[l]).join("-")}`;
-  const nFiles = (() => {
-    const per = group === "merged" ? 1 : group === "perLang" ? langs.length : langs.length * kinds.length;
-    return per * (format === "both" ? 2 : 1);
-  })();
-  const go = async () => {
-    try {
-      const texts = {};
-      for (const { k, l } of missing) {
-        if (!avail[k].length) continue;
-        setRun(`Traduction ${k === "cv" ? "du CV" : "de la lettre"} en ${LANG_NAME[l]}…`);
-        const from = avail[k].includes(app.docLanguage) ? app.docLanguage : avail[k][0];
-        const v = await translateDoc(appId, k, from, l);
-        if (!v) throw new Error(`Traduction ${LANG_FLAG[l]} impossible.`);
-        texts[`${k}:${l}`] = v.text;
-      }
-      setRun("Mise en page…");
-      const items = [];
-      for (const l of langs) for (const k of kinds) {
-        const t = texts[`${k}:${l}`] ?? latestDoc(app, offer, k, l)?.text;
-        if (t) items.push({ kind: k, lang: l, text: t, title: `${k === "cv" ? "CV" : "Lettre de motivation"} (${LANG_FLAG[l]})` });
-      }
-      if (!items.length) throw new Error("Aucun document à exporter.");
-      const groups = group === "merged" ? [items] : group === "perLang" ? langs.map((l) => items.filter((i) => i.lang === l)).filter((g) => g.length) : items.map((i) => [i]);
-      const kw = (app.docs?.cv || []).slice(-1)[0]?.keywords || [];
-      const files = [];
-      for (const g of groups) {
-        const ks = [...new Set(g.map((i) => i.kind))];
-        const fname = base(ks.length > 1 ? "both" : ks[0], [...new Set(g.map((i) => i.lang))]);
-        const meta = { title: [ks.length > 1 ? "Dossier de candidature" : g[0].title, name, offer?.title, offer?.company].filter(Boolean).join(" - "), author: profile.name, keywords: kw, subject: offer?.title };
-        if (format !== "docx") {
-          setRun(`PDF : ${fname}…`);
-          const pdf = await buildPdf(g.map((i) => ({ ...i, photo: media.photo, layout: layoutDocument(docModel(i.text, i.kind), design, { photo: media.photo, lang: i.lang }) })), meta);
-          files.push({ name: `${fname}.pdf`, data: new Uint8Array(pdf), mime: "application/pdf" });
-        }
-        if (format !== "pdf") {
-          setRun(`Word : ${fname}…`);
-          files.push({ name: `${fname}${wordMode === "ats" ? "_ATS" : ""}.docx`, data: buildDocx(g.map((i) => ({ ...i, design })), { photo: media.photo, mode: wordMode, ...meta }), mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
-        }
-      }
-      setRun("Téléchargement…");
-      const out = files.length === 1 ? files[0] : { name: `${base(kinds.length > 1 ? "both" : kinds[0], langs)}.zip`, data: zipStore(files.map((f) => ({ name: f.name, data: f.data }))), mime: "application/zip" };
-      const buf = out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength);
-      const r = await saveFile(out.name, buf, out.mime);
-      if (r === "saved") { toast(files.length === 1 ? `${out.name} prêt` : `${files.length} fichiers regroupés dans ${out.name}`, "ok"); onClose(); }
-    } catch (e) {
-      toast(`Export impossible : ${e.message}`, "danger");
-    } finally { setRun(null); }
-  };
-  return (
-    <Modal open wide onClose={() => !run && onClose()} title="Exporter le dossier"
-      footer={<><Btn variant="ghost" onClick={onClose} disabled={!!run}>Annuler</Btn><Btn variant="primary" icon={FileDown} loading={!!run} disabled={!kinds.length || !langs.length || noSource.length === kinds.length * langs.length} onClick={go}>{missing.length - noSource.length ? `Traduire ${missing.length - noSource.length} et exporter` : `Exporter (${nFiles} fichier${nFiles > 1 ? "s" : ""})`}</Btn></>}>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="space-y-5">
-          <div>
-            <div className={`text-xs mb-2 ${T.muted}`}>Documents</div>
-            <div className="flex flex-wrap gap-2">
-              {[["cv", "CV"], ["letter", "Lettre de motivation"]].map(([k, l]) => (
-                <label key={k} className={`inline-flex items-center gap-2 rounded-xl px-3 h-9 text-sm ${T.sub}`}><input type="checkbox" checked={docs[k]} onChange={(e) => setDocs({ ...docs, [k]: e.target.checked })} />{l}<span className={`text-xs ${T.faint}`}>{avail[k].map((x) => LANG_FLAG[x]).join(" ") || "—"}</span></label>
-              ))}
-            </div>
-          </div>
-          <div>
-            <div className={`text-xs mb-2 ${T.muted}`}>Langues</div>
-            <div className="flex flex-wrap gap-2">
-              {DOC_LANGS.map((l) => {
-                const on = langs.includes(l);
-                const todo = kinds.some((k) => !avail[k].includes(l));
-                return (
-                  <button key={l} type="button" aria-pressed={on} onClick={() => setLangs(on ? langs.filter((x) => x !== l) : DOC_LANGS.filter((x) => x === l || langs.includes(x)))} className={`h-9 px-3 rounded-xl text-sm ${on ? T.accentSoft : T.btnSoft} ${T.ring}`}>
-                    {LANG_NAME[l]}{on && todo ? " · à traduire" : ""}
-                  </button>
-                );
-              })}
-            </div>
-            {missing.length - noSource.length > 0 && <p className={`text-xs mt-2 ${T.muted}`}>{missing.length - noSource.length} traduction(s) seront générées puis enregistrées comme nouvelles versions (relisez-les ensuite dans le Studio).</p>}
-          </div>
-          <Seg label="Ordre" value={order} onChange={setOrder} options={[["cvFirst", "CV puis lettre"], ["letterFirst", "Lettre puis CV"]]} />
-        </div>
-        <div className="space-y-5">
-          <Seg label="Format" value={format} onChange={setFormat} options={[["pdf", "PDF"], ["docx", "Word"], ["both", "PDF + Word"]]} />
-          {format !== "pdf" && <Seg label="Word" value={wordMode} onChange={setWordMode} options={[["design", "Fidèle au design"], ["ats", "ATS 1 colonne"]]} />}
-          <Seg label="Regroupement" value={group} onChange={setGroup} options={[["perLang", "Un fichier par langue"], ["merged", "Tout en un"], ["separate", "Fichiers séparés"]]} />
-          <Notice icon={Info}>
-            {group === "merged" ? "Un seul fichier avec tous les documents, dans l'ordre choisi (signets PDF par document)." : group === "perLang" ? "Un fichier par langue réunissant CV et lettre : idéal pour un envoi bilingue." : "Un fichier par document et par langue."}
-            {nFiles > 1 ? ` ${nFiles} fichiers, livrés dans un ZIP.` : ""} PDF texte (lisible par les ATS), Word modifiable.
-          </Notice>
-          {run && <p className={`text-sm ${T.muted}`} aria-live="polite"><Loader2 className="inline w-4 h-4 mr-1 animate-spin" aria-hidden="true" />{run}</p>}
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-/* ── Comparateur d'offres (2 à 4) ── */
-function CompareModal({ ids, onClose }) {
-  const T = useT();
-  const { offers, settings, ratings } = useApp();
-  const list = ids.map((id) => offers.find((o) => o.id === id)).filter(Boolean);
-  if (!list.length) return null;
-  const crits = [...new Set(list.flatMap((o) => (o.score?.breakdown || []).map((b) => b.criterion)))];
-  const row = (label, f) => (
-    <tr key={label} className={`border-t ${T.line}`}>
-      <th scope="row" className={`text-left align-top py-2 pr-3 text-xs font-medium ${T.muted}`} style={{ minWidth: 120 }}>{label}</th>
-      {list.map((o) => <td key={o.id} className="align-top py-2 px-2 text-sm">{f(o)}</td>)}
-    </tr>
-  );
-  const facts = (o) => o.score?.facts || {};
-  return (
-    <Modal open wide onClose={onClose} title={`Comparer ${list.length} offres`}>
-      <div className="overflow-x-auto">
-        <table className="w-full" style={{ borderCollapse: "collapse" }}>
-          <thead><tr><th />{list.map((o) => <th key={o.id} className="text-left align-bottom px-2 pb-2" style={{ minWidth: 180 }}><div className="text-sm font-medium leading-snug">{o.title}</div><div className={`text-xs font-normal ${T.muted}`}>{show(o.company)}</div></th>)}</tr></thead>
-          <tbody>
-            {row("Score", (o) => <span className="inline-flex items-center gap-2"><ScorePill score={o.score} threshold={settings.threshold} />{offerVerdict(o, settings.threshold) && <Chip tone={offerVerdict(o, settings.threshold).tone}>{offerVerdict(o, settings.threshold).label}</Chip>}</span>)}
-            {row("En bref", (o) => o.score?.tldr || o.score?.summary || <span className={T.faint}>{NC}</span>)}
-            {row("Lieu · trajet", (o) => `${show(o.location)} · ${commuteLabel(o.commute)}`)}
-            {row("Contrat", (o) => show(facts(o).contract || o.contract))}
-            {row("Télétravail", (o) => (facts(o).remoteDays != null ? `${facts(o).remoteDays} j / semaine` : show(o.remote)))}
-            {row("Salaire", (o) => show(fmtSalary(facts(o), o.salary)))}
-            {row("Équipe", (o) => (facts(o).teamSize ? `${facts(o).teamSize} pers.${facts(o).reportsTo ? ` · ${facts(o).reportsTo}` : ""}` : show(facts(o).reportsTo)))}
-            {row("Langues", (o) => (facts(o).languages?.length ? facts(o).languages.map((l) => LANG_FLAG[l]).join(" · ") : show(o.language && LANG_FLAG[o.language])))}
-            {row("Note employeur", (o) => fmtRating(ratings[ratingKey(o.company)]) ? `★ ${fmtRating(ratings[ratingKey(o.company)])}` : <span className={T.faint}>{NC}</span>)}
-            {crits.map((c) => row(c, (o) => { const b = (o.score?.breakdown || []).find((x) => x.criterion === c); return b ? <div><MatchBar value={b.match} kind={b.kind} /><div className={`text-xs mt-1 ${T.muted}`}>{b.note || b.match}</div></div> : <span className={T.faint}>—</span>; }))}
-            {row("Points forts", (o) => <ul className="space-y-1">{(o.score?.strengths || []).slice(0, 4).map((x, i) => <li key={i}>+ {x}</li>)}</ul>)}
-            {row("Écarts", (o) => <ul className="space-y-1">{(o.score?.gaps || []).slice(0, 4).map((x, i) => <li key={i}>− {x}</li>)}</ul>)}
-            {row("Alertes", (o) => (o.score?.redFlags?.length ? <span className="text-rose-600">{o.score.redFlags.map((r) => r.evidence).join(" · ")}</span> : <span className={T.faint}>aucune</span>))}
-          </tbody>
-        </table>
-      </div>
-    </Modal>
-  );
-}
-
-/* ── Onglet E-mails d'une candidature ── */
-function EmailsPanel({ app }) {
-  const T = useT();
-  const { checkReplies, busy, settings } = useApp();
-  const list = [...(app.emails || [])].sort((a, b) => new Date(b.date || b.at) - new Date(a.date || a.at));
-  const silent = silenceDays(app);
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className={`text-xs ${T.faint}`}>Gmail vérifié {relTime(settings.lastReplyCheckAt)} · lecture seule</span>
-        <Btn size="sm" icon={MailCheck} loading={busy.replies} onClick={() => checkReplies()}>Vérifier maintenant</Btn>
-      </div>
-      {silent !== null && silent >= (settings.ghostDays || 21) && <Notice tone="warn" icon={Clock}>Sans nouvelles depuis {silent} jours. Relancez une dernière fois ou clôturez avec l'issue « Sans réponse ».</Notice>}
-      {!list.length ? <Empty icon={Mail} title="Aucun e-mail rattaché" text="Les réponses validées depuis la surveillance Gmail apparaissent ici, avec un lien vers le fil." /> : (
-        <ul className="space-y-2">
-          {list.map((m) => (
-            <li key={m.id} className={`rounded-2xl p-4 ${T.sub}`}>
-              <div className="flex flex-wrap items-center gap-2">
-                <Chip tone={m.kind === "refus" ? "danger" : ["invitation_entretien", "offre", "confirmation_candidature"].includes(m.kind) ? "ok" : "neutral"}>{REPLY_KINDS[m.kind] || "E-mail"}</Chip>
-                <span className={`text-xs ${T.muted}`}>{m.date ? fmtDate(m.date) : NC} · {show(m.from)}</span>
-              </div>
-              <div className="text-sm mt-2">« {m.subject} »</div>
-              {m.summary && <div className={`text-sm mt-1 ${T.muted}`}>{m.summary}</div>}
-              {gmailLink(m) && <div className="mt-2"><ExtLink href={gmailLink(m)}>Ouvrir dans Gmail</ExtLink></div>}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/* ── Entraînement à l'entretien (évaluation de réponses écrites) ── */
-function PracticePanel({ app, offer }) {
-  const T = useT();
-  const { evaluatePractice, busy } = useApp();
-  const qs = (app.prep?.likelyQuestions || []).map((x) => x.question).filter(Boolean);
-  const [q, setQ] = useState(qs[0] || "");
-  const [a, setA] = useState("");
-  const loading = busy[`practice:${app.id}`];
-  const hist = [...(app.practice || [])].reverse();
-  const words = a.split(/\s+/).filter(Boolean).length;
-  return (
-    <section className="space-y-4">
-      <SectionTitle>Entraînement</SectionTitle>
-      <p className={`text-xs ${T.muted}`}>Répondez par écrit comme à l'oral. L'IA note la réponse, vérifie la structure STAR et propose une version améliorée sans inventer de faits.</p>
-      {qs.length > 0 && (
-        <Select value={qs.includes(q) ? q : ""} onChange={(e) => setQ(e.target.value)} className="w-full" aria-label="Question probable">
-          <option value="">Question personnalisée…</option>
-          {qs.map((x) => <option key={x} value={x}>{x}</option>)}
-        </Select>
-      )}
-      <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Question d'entretien" aria-label="Question" />
-      <Textarea rows={6} value={a} onChange={(e) => setA(e.target.value)} placeholder="Votre réponse…" aria-label="Votre réponse" />
-      <div className="flex flex-wrap items-center gap-3">
-        <Btn variant="primary" icon={Sparkles} loading={loading} disabled={!q.trim() || words < 15} onClick={async () => { if (await evaluatePractice(app.id, q.trim(), a.trim())) setA(""); }}>Évaluer ma réponse</Btn>
-        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots · ~{Math.round((words / 130) * 60)} s à l'oral</span>
-      </div>
-      {hist.map((p) => (
-        <div key={p.id} className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium flex-1 min-w-0">{p.question}</span>
-            <Chip tone={p.feedback.score >= 4 ? "ok" : p.feedback.score >= 3 ? "warn" : "danger"}>{p.feedback.score} / 5</Chip>
-          </div>
-          <div className="flex flex-wrap gap-1.5">{[["situation", "S"], ["task", "T"], ["action", "A"], ["result", "R"]].map(([k, l]) => <Chip key={k} tone={p.feedback.star?.[k] ? "ok" : "neutral"}>{l}{p.feedback.star?.[k] ? " ✓" : " —"}</Chip>)}<Chip>~{p.feedback.seconds} s</Chip></div>
-          {p.feedback.strengths.length > 0 && <ul className="text-sm space-y-0.5">{p.feedback.strengths.map((x, i) => <li key={i}>+ {x}</li>)}</ul>}
-          {p.feedback.improvements.length > 0 && <ul className={`text-sm space-y-0.5 ${T.muted}`}>{p.feedback.improvements.map((x, i) => <li key={i}>→ {x}</li>)}</ul>}
-          {p.feedback.improved && (
-            <details className="text-sm">
-              <summary className={`cursor-pointer text-xs ${T.accentText}`}>Version améliorée</summary>
-              <p className="mt-2 whitespace-pre-line">{p.feedback.improved}</p>
-              <CopyBtn text={p.feedback.improved} />
-            </details>
-          )}
-          <div className={`text-xs ${T.faint}`}>{fmtDate(p.at, { time: true })}</div>
-        </div>
-      ))}
-    </section>
-  );
-}
-
-/* ════════════════════════════════════════════════════════════════════════
    14. ASSISTANT CANDIDATURE
    ════════════════════════════════════════════════════════════════════════ */
 
+/* Ch.7 · Mesures : ce que la lettre utilise, recouvrement avec le CV, corrections manuelles par document (doit baisser), étape atteinte. */
+function docMeasures(app) {
+  const pick = (t) => {
+    const list = app.docs?.[t] || [];
+    const ia = [...list].reverse().find((v) => v.origin === "IA");
+    const ed = [...list].reverse().find((v) => v.origin === "édition" && v.edits && (!ia || v.edits.baseId === ia.id));
+    return { ia, pct: ed ? ed.edits.pct : ia ? null : undefined };
+  };
+  const cv = pick("cv"), letter = pick("letter");
+  const lm = letter.ia?.metrics || (letter.ia ? letterMetrics(letter.ia.text, cv.ia?.text || "") : null);
+  return { at: (letter.ia || cv.ia)?.createdAt || null, cvPct: cv.pct, letterPct: letter.pct, overlap: lm?.overlap ?? null, numbers: lm?.numbers ?? null, used: letter.ia?.used || null, reached: app.reached ?? STAGE_INDEX[app.stage] };
+}
+function QualityStats() {
+  const T = useT();
+  const { allApps, offers } = useApp();
+  const rows = (allApps || []).filter((a) => a.docs?.cv?.length || a.docs?.letter?.length).map((a) => ({ a, o: offers.find((o) => o.id === a.offerId), m: docMeasures(a) })).filter((r) => r.m.at).sort((x, y) => new Date(x.m.at) - new Date(y.m.at));
+  if (!rows.length) return null;
+  const edited = rows.map((r) => [r.m.cvPct, r.m.letterPct].filter((x) => typeof x === "number")).filter((l) => l.length).map((l) => l.reduce((n, x) => n + x, 0) / l.length);
+  const half = Math.floor(edited.length / 2);
+  const avg = (l) => (l.length ? Math.round(l.reduce((n, x) => n + x, 0) / l.length) : null);
+  const early = avg(edited.slice(0, half)), late = avg(edited.slice(half));
+  const pctCell = (x) => (typeof x === "number" ? `${x} %` : x === null ? "non retouché" : "—");
+  return (
+    <Card className="p-6 lg:col-span-3">
+      <SectionTitle action={edited.length >= 4 && early !== null && late !== null ? <Chip tone={late <= early ? "ok" : "warn"}>corrections : {early} % → {late} %</Chip> : null}>Mesures des dossiers</SectionTitle>
+      <p className={`text-xs mb-3 ${T.muted}`}>Corrections manuelles = part des mots modifiés entre la version IA et votre version enregistrée (doit baisser au fil des candidatures). Recouvrement = part de la lettre déjà présente dans le CV (cible ≤ 15 %).</p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className={`text-left ${T.muted}`}><th className="py-1 pr-3 font-medium">Candidature</th><th className="pr-3 font-medium">Généré</th><th className="pr-3 font-medium">Corrections CV</th><th className="pr-3 font-medium">Corrections lettre</th><th className="pr-3 font-medium">Recouvrement</th><th className="pr-3 font-medium">Chiffres</th><th className="pr-3 font-medium">Lettre utilise</th><th className="font-medium">Étape atteinte</th></tr></thead>
+          <tbody>
+            {rows.slice(-15).reverse().map(({ a, o, m }) => (
+              <tr key={a.id} className={`border-t ${T.line}`}>
+                <td className="py-1.5 pr-3">{o?.title || "—"}<span className={T.faint}> · {show(o?.company)}</span></td>
+                <td className="pr-3 tabular-nums">{fmtDate(m.at)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.cvPct)}</td>
+                <td className="pr-3 tabular-nums">{pctCell(m.letterPct)}</td>
+                <td className={`pr-3 tabular-nums ${m.overlap > 30 ? "text-rose-600" : m.overlap > 15 ? "text-amber-600" : ""}`}>{m.overlap === null ? "—" : `${m.overlap} %`}</td>
+                <td className={`pr-3 tabular-nums ${m.numbers > 2 ? "text-amber-600" : ""}`}>{m.numbers ?? "—"}</td>
+                <td className="pr-3">{m.used ? [m.used.companyFacts?.length ? `${m.used.companyFacts.length} fait(s)` : "0 fait", m.used.convictionId ? "conviction" : null, m.used.storyId ? "histoire" : null].filter(Boolean).join(" · ") : "—"}</td>
+                <td>{STAGES[m.reached]?.label || "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
 function AssistantView() {
   const T = useT();
-  const { apps, offers, settings, media, openApp, openStudio, openExport, addToPipeline, go } = useApp();
-  const active = apps.filter((a) => ["new", "retained", "prep", "sent", "followup", "interview"].includes(a.stage));
+  const { apps, allApps, offers, settings, openApp, openStudio, addToPipeline, go, setSpontOpen } = useApp();
+  const inPrep = apps.filter((a) => ["new", "retained", "prep"].includes(a.stage));
+  const baseDocs = allApps.filter((a) => a.kind === "base");
   const candidates = offers.filter((o) => o.status === "new" && o.score?.value >= settings.threshold).sort((a, b) => b.score.value - a.score.value).slice(0, 6);
   const offerOf = (a) => offers.find((o) => o.id === a.offerId);
-  const def = settings.designDefault ? TEMPLATE_BY_ID[settings.designDefault.template]?.label || "personnalisé" : "Classique ATS";
   return (
     <div>
-      <PageHeader title="Assistant candidature" subtitle="L'IA rédige, vous mettez en forme dans le Studio et vous validez. Aucun document n'est envoyé en votre nom." />
+      <PageHeader
+        title="Assistant candidature"
+        subtitle="L'IA prépare, vous validez. Aucun document n'est envoyé en votre nom."
+        actions={<Btn variant="primary" icon={Plus} onClick={() => setSpontOpen(true)}>CV ou lettre sans offre</Btn>}
+      />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="p-6 lg:col-span-2">
-          <SectionTitle>Dossiers en cours</SectionTitle>
-          {active.length === 0 ? (
-            <Empty icon={Sparkles} title="Rien en préparation" text="Retenez une offre pour générer son dossier." action={<Btn onClick={() => go("offers")}>Voir les offres</Btn>} />
+          <SectionTitle>Candidatures à préparer</SectionTitle>
+          {inPrep.length === 0 ? (
+            <Empty icon={Sparkles} title="Rien en préparation" text="Retenez une offre, ou partez d'un rôle visé sans offre (candidature spontanée, CV de base)." action={<div className="flex flex-wrap justify-center gap-2"><Btn variant="primary" icon={Plus} onClick={() => setSpontOpen(true)}>CV ou lettre sans offre</Btn><Btn onClick={() => go("offers")}>Voir les offres</Btn></div>} />
           ) : (
             <ul className="space-y-2">
-              {active.map((a) => {
+              {inPrep.map((a) => {
                 const o = offerOf(a);
-                const cvL = docLangs(a, o, "cv"), lL = docLangs(a, o, "letter");
-                const lang = cvL.includes(a.docLanguage) ? a.docLanguage : cvL[0];
-                const cv = lang ? latestDoc(a, o, "cv", lang) : null;
-                const design = resolveDesign(a, settings, cv?.accent);
-                const q = cv ? docQuality(cv.text, { kind: "cv", lang, keywords: cv.keywords, kwLang: o?.language, design }) : null;
+                const n = Object.keys(a.docs || {}).length;
                 return (
-                  <li key={a.id} className={`flex flex-wrap items-center gap-4 rounded-2xl p-3 ${T.sub}`}>
-                    {cv ? <button type="button" onClick={() => openStudio(a.id, "cv")} className={`rounded-lg ${T.ring}`} aria-label="Ouvrir le CV dans le Studio"><DocThumb text={cv.text} kind="cv" design={design} photo={media.photo} lang={lang} width={56} /></button>
-                      : <span className={`rounded-lg flex items-center justify-center ${T.surface}`} style={{ width: 56, height: 79 }}><FileText className={`w-5 h-5 ${T.faint}`} aria-hidden="true" /></span>}
-                    <div className="flex-1 min-w-48">
-                      <div className="text-sm font-medium">{o?.title}{a.demo && <Chip className="ml-2">exemple</Chip>}</div>
-                      <div className={`text-xs ${T.muted}`}>{show(o?.company)} · {STAGE_LABEL[a.stage]}</div>
-                      <div className="flex flex-wrap gap-1 mt-2">
-                        {cvL.length > 0 && <Chip>CV {cvL.map((l) => LANG_FLAG[l]).join(" ")}</Chip>}
-                        {lL.length > 0 && <Chip>Lettre {lL.map((l) => LANG_FLAG[l]).join(" ")}</Chip>}
-                        {q && <Chip tone={q.score >= 85 ? "ok" : q.score >= 65 ? "warn" : "danger"}>qualité {q.score}</Chip>}
-                        {!cvL.length && !lL.length && <Chip tone="warn">dossier à générer</Chip>}
-                      </div>
+                  <li key={a.id} className={`flex flex-wrap items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium">{o?.title}{a.demo && <Chip className="ml-2">exemple</Chip>}{o?.spontaneous && <Chip tone="accent" className="ml-2">spontanée</Chip>}</div>
+                      <div className={`text-xs ${T.muted}`}>{show(o?.company)} · {STAGE_LABEL[a.stage]} · {n}/{DOC_TYPES.length} documents</div>
+                      <div className={`mt-2 h-1 rounded-full overflow-hidden ${T.dark ? "bg-stone-700" : "bg-stone-200"}`}><div className="h-full bg-indigo-600" style={{ width: `${(n / DOC_TYPES.length) * 100}%` }} /></div>
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {cvL.length || lL.length ? <>
-                        <Btn size="sm" variant="primary" icon={Palette} onClick={() => openStudio(a.id, cvL.length ? "cv" : "letter")}>Studio</Btn>
-                        <Btn size="sm" icon={FileDown} onClick={() => openExport(a.id)}>Exporter</Btn>
-                      </> : <Btn size="sm" variant="primary" icon={Sparkles} onClick={() => openApp(a.id, "docs")}>Préparer</Btn>}
-                      <Btn size="sm" variant="ghost" onClick={() => openApp(a.id, "docs")}>Dossier</Btn>
-                    </div>
+                    {n > 0 && <Btn variant="ghost" onClick={() => openApp(a.id, "docs")}>Dossier</Btn>}
+                    <Btn variant="primary" icon={n ? Maximize2 : Sparkles} onClick={() => openStudio(a.id, "cv")}>{n ? "Studio CV & lettre" : "Préparer"}</Btn>
                   </li>
                 );
               })}
@@ -6923,20 +8556,44 @@ function AssistantView() {
           )}
         </Card>
         <Card className="p-6">
-          <SectionTitle>Studio & export</SectionTitle>
+          <SectionTitle>Ce que l'assistant fait — et ne fait pas</SectionTitle>
           <ul className="space-y-3 text-sm">
             {[
-              [true, "7 modèles réglables en direct : polices, tailles, marges, bord à bord, couleurs, traits, puces, colonnes"],
-              [true, "Photo recadrée (cercle, arrondi, carré, hexagone), icônes, sections déplaçables entre colonnes"],
-              [true, "Clic sur un bloc de l'aperçu pour l'éditer sur place ; annuler / rétablir"],
-              [true, "Traduction FR / NL / EN / DE ; export PDF ou Word, séparé ou fusionné"],
-              [true, "Score qualité local et correspondance aux mots-clés de l'annonce"],
-              [false, "Envoyer, soumettre un formulaire ou inventer un chiffre : jamais"],
+              [true, "Analyse de l'annonce : intitulé exact, 20 à 35 mots-clés ATS, exigences et preuves de votre profil"],
+              [true, "CV et lettre rédigés en 3 étapes (analyse, rédaction, contrôle qualité) dans la langue de l'annonce"],
+              [true, "Studio plein écran : éditeur par sections, aperçu A4 fidèle au PDF, score et corrections à valider"],
+              [true, "Candidatures spontanées et CV de base, sans offre : partez d'un rôle visé"],
+              [true, "Message LinkedIn, réponses au formulaire, e-mail et brouillon Gmail (jamais envoyé)"],
+              [false, "Soumettre un formulaire sur le site de l'employeur ou d'un job board"],
+              [false, "Envoyer un e-mail ou un message LinkedIn à votre place"],
+              [false, "Inventer des réalisations ou des chiffres : les manques sont marqués [à compléter]"],
             ].map(([ok, t]) => (
               <li key={t} className="flex gap-2">{ok ? <Check className={`w-4 h-4 mt-0.5 shrink-0 ${T.accentText}`} aria-label="Oui" /> : <X className="w-4 h-4 mt-0.5 shrink-0 text-rose-500" aria-label="Non" />}<span>{t}</span></li>
             ))}
           </ul>
-          <p className={`text-xs mt-4 ${T.faint}`}>Style par défaut des nouveaux dossiers : {def}. Il se change depuis le Studio (« Style par défaut »).</p>
+        </Card>
+        <Card className="p-6 lg:col-span-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setSpontOpen(true)}>Nouveau</Btn>}>Sans offre : candidatures spontanées et CV de base</SectionTitle>
+          <p className={`text-sm mb-4 ${T.muted}`}>Partez d'un rôle visé, avec ou sans entreprise ciblée. Les candidatures spontanées rejoignent le pipeline (relances, contacts) ; les CV de base restent ici, prêts à être déclinés.</p>
+          {baseDocs.length === 0 ? <p className={`text-sm ${T.faint}`}>Aucun CV de base pour l'instant.</p> : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {baseDocs.map((a) => {
+                const o = offerOf(a);
+                const n = Object.keys(a.docs || {}).length;
+                return (
+                  <div key={a.id} className={`flex items-center gap-3 rounded-2xl p-4 ${T.sub}`}>
+                    <FileText className={`w-5 h-5 shrink-0 ${T.muted}`} aria-hidden="true" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">{o?.title || "CV de base"}</div>
+                      <div className={`text-xs truncate ${T.muted}`}>CV de base · {n ? `${n} document(s) · ${fmtDate(a.updatedAt)}` : "pas encore généré"}</div>
+                    </div>
+                    <Btn size="sm" variant="ghost" onClick={() => openApp(a.id, "docs")}>Fiche</Btn>
+                    <Btn size="sm" variant="primary" icon={Maximize2} onClick={() => openStudio(a.id, "cv")}>Studio</Btn>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </Card>
         <Card className="p-6 lg:col-span-3">
           <SectionTitle>Offres au-dessus du seuil, pas encore retenues</SectionTitle>
@@ -6955,6 +8612,7 @@ function AssistantView() {
             </div>
           )}
         </Card>
+        <QualityStats />
       </div>
     </div>
   );
@@ -7350,9 +9008,11 @@ function ProfileView() {
   return (
     <div>
       <PageHeader title="Profil & critères" subtitle={`Version active : ${activeVersion(criteria)?.label}`} />
-      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
+      <div className="mb-6"><Tabs value={tab} onChange={setTab} tabs={[{ id: "criteria", label: "Critères" }, { id: "profile", label: "Profil" }, { id: "motivations", label: "Motivations" }, { id: "rules", label: "Règles d'écriture" }, { id: "history", label: "Historique", count: criteria.versions.length }]} /></div>
       {tab === "criteria" && <CriteriaEditor />}
       {tab === "profile" && <ProfileEditor />}
+      {tab === "motivations" && <MotivationEditor />}
+      {tab === "rules" && <WritingRulesEditor />}
       {tab === "history" && <CriteriaHistory />}
     </div>
   );
@@ -7426,6 +9086,175 @@ function CriteriaEditor() {
           <ListEditor items={d.redFlags} onChange={(v) => set("redFlags", v)} placeholder="Nouveau signal" />
         </Card>
       </div>
+    </div>
+  );
+}
+
+/* ── Motivations : le « pourquoi » (lettre, messages, entretien ; jamais le CV) ── */
+function MotivationEditor() {
+  const T = useT();
+  const { profile, setProfile, draftMotivation, busy, toast } = useApp();
+  const m = motivOf(profile);
+  const setM = (patch) => setProfile((p) => ({ ...p, motivation: { ...motivOf(p), ...patch } }));
+  /* Réponses conservées dans le profil (champ facultatif), pour reprendre l'entretien plus tard. */
+  const answers = profile.motivationAnswers && typeof profile.motivationAnswers === "object" ? profile.motivationAnswers : {};
+  const setAnswer = (id, a) => setProfile((p) => ({ ...p, motivationAnswers: { ...(p.motivationAnswers || {}), [id]: a } }));
+  const [extra, setExtra] = useState([]);
+  const questions = [...MOTIV_QUESTIONS, ...extra];
+  const [step, setStep] = useState(0);
+  const q = questions[Math.min(step, questions.length - 1)];
+  const [prop, setProp] = useState(null);
+  const [pick, setPick] = useState({});
+  const answered = questions.filter((x) => str(answers[x.id])).length;
+  const runDraft = async () => {
+    const r = await draftMotivation(questions.map((x) => ({ field: x.field, q: x.q, a: answers[x.id] || "" })));
+    if (!r) return;
+    setProp(r);
+    setPick({ ...Object.fromEntries(MOTIV_TEXT_FIELDS.map((f) => [f.id, !!r[f.id]])), convictions: r.convictions.length > 0, stories: r.stories.length > 0, sectors: r.sectors.length > 0 });
+    if (r.followUps.length) {
+      const fu = r.followUps.map((f, i) => ({ id: `fu-${Date.now().toString(36)}-${i}`, field: f.field, q: f.q, followUp: true }));
+      setExtra((l) => [...l, ...fu]);
+    }
+  };
+  const apply = () => {
+    const cur = motivOf(profile);
+    const patch = {};
+    for (const f of MOTIV_TEXT_FIELDS) if (pick[f.id] && prop[f.id]) patch[f.id] = prop[f.id];
+    const nid = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+    if (pick.convictions) { const l = [...cur.convictions]; prop.convictions.forEach((t) => { if (!l.some((c) => normText(c.text) === normText(t))) l.push({ id: nid("c", l), text: t }); }); patch.convictions = l; }
+    if (pick.stories) { const l = [...cur.stories]; prop.stories.forEach((st) => l.push({ id: nid("s", l), ...st })); patch.stories = l; }
+    if (pick.sectors) patch.sectors = [...new Set([...cur.sectors, ...prop.sectors])];
+    setM(patch);
+    setProp(null);
+    toast("Motivations mises à jour", "ok");
+  };
+  const upConv = (id, text) => setM({ convictions: m.convictions.map((c) => (c.id === id ? { ...c, text } : c)) });
+  const upStory = (id, k, v) => setM({ stories: m.stories.map((x) => (x.id === id ? { ...x, [k]: v } : x)) });
+  const newId = (pre, list) => { let i = list.length + 1; while (list.some((x) => x.id === `${pre}${i}`)) i++; return `${pre}${i}`; };
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle>Pourquoi cet onglet</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Le CV prouve, la lettre explique. Ce que vous écrivez ici nourrit la lettre, le message LinkedIn, la réponse « Pourquoi nous ? » et la préparation d'entretien. Jamais le CV. L'IA reformule vos mots, elle n'ajoute rien : sans matière, elle écrit [à compléter].</p>
+      </Card>
+
+      <Card className="p-6 space-y-4 lg:col-span-2">
+        <SectionTitle action={<span className={`text-xs ${T.muted}`}>{answered}/{questions.length} réponses</span>}>Entretien de motivation (IA)</SectionTitle>
+        <div className="flex flex-wrap gap-1.5">
+          {questions.map((x, i) => (
+            <button key={x.id} type="button" onClick={() => setStep(i)} aria-current={i === step} className={`w-8 h-8 rounded-full text-xs font-medium ${i === step ? "bg-indigo-600 text-white" : str(answers[x.id]) ? T.accentSoft : T.chip} ${T.ring}`} title={x.q}>{x.followUp ? "+" : i + 1}</button>
+          ))}
+        </div>
+        <div>
+          <div className="text-sm font-medium">{q.followUp ? "Relance : " : `${step + 1}. `}{q.q}</div>
+          <Textarea rows={6} className="mt-2" value={answers[q.id] || ""} onChange={(e) => setAnswer(q.id, e.target.value)} placeholder="Répondez librement, comme à l'oral. Les faits et les chiffres que vous donnez sont repris tels quels." aria-label={q.q} />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Btn variant="ghost" icon={ChevronLeft} disabled={step === 0} onClick={() => setStep((n) => n - 1)}>Précédente</Btn>
+          <Btn variant="soft" icon={ChevronRight} disabled={step >= questions.length - 1} onClick={() => setStep((n) => n + 1)}>Suivante</Btn>
+          <Btn variant="primary" icon={Wand2} loading={busy["motiv-draft"]} disabled={answered < 3} onClick={runDraft}>Ranger mes réponses dans la fiche</Btn>
+        </div>
+        {prop && (
+          <div className={`rounded-2xl p-4 space-y-3 ${T.sub}`}>
+            <div className="text-sm font-medium">Proposition (reformulation de vos réponses)</div>
+            {prop.inventedNumbers.length > 0 && <Notice tone="warn" icon={AlertTriangle}>Chiffres absents de vos réponses : {prop.inventedNumbers.join(", ")}. Décochez ou corrigez après reprise.</Notice>}
+            {[...MOTIV_TEXT_FIELDS.map((f) => [f.id, f.label, prop[f.id]]), ["convictions", "Convictions (ajoutées)", prop.convictions.join(" · ")], ["stories", "Histoires (ajoutées)", prop.stories.map((x) => x.title || x.situation.slice(0, 50)).join(" · ")], ["sectors", "Secteurs (ajoutés)", prop.sectors.join(" · ")]].map(([id, label, val]) => (
+              <label key={id} className={`flex gap-3 items-start text-sm ${val ? "" : "opacity-50"}`}>
+                <input type="checkbox" className="mt-1" disabled={!val} checked={!!pick[id] && !!val} onChange={(e) => setPick({ ...pick, [id]: e.target.checked })} />
+                <span className="min-w-0"><span className="font-medium">{label}</span><span className={`block text-xs ${T.muted}`}>{val || "rien dans vos réponses"}</span></span>
+              </label>
+            ))}
+            {prop.followUps.length > 0 && <p className={`text-xs ${T.muted}`}>{prop.followUps.length} question(s) de relance ajoutée(s) à l'entretien (« + ») pour préciser des réponses trop vagues.</p>}
+            <div className="flex gap-2">
+              <Btn variant="primary" icon={Check} onClick={apply} disabled={!Object.values(pick).some(Boolean)}>Reprendre la sélection</Btn>
+              <Btn variant="ghost" onClick={() => setProp(null)}>Ignorer</Btn>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <SectionTitle>Votre « pourquoi »</SectionTitle>
+        {MOTIV_TEXT_FIELDS.map((f) => (
+          <Field key={f.id} label={f.label} hint={f.hint}><Textarea rows={3} value={m[f.id]} onChange={(e) => setM({ [f.id]: e.target.value })} /></Field>
+        ))}
+        <Field label="Secteurs et organisations qui vous attirent"><ChipInput values={m.sectors} onChange={(v) => setM({ sectors: v })} placeholder="Ajouter…" /></Field>
+      </Card>
+
+      <div className="space-y-4">
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ convictions: [...m.convictions, { id: newId("c", m.convictions), text: "Nouvelle conviction" }] })}>Ajouter</Btn>}>Convictions</SectionTitle>
+          {!m.convictions.length && <p className={`text-xs ${T.faint}`}>Une phrase par conviction, telle que vous la défendriez en entretien.</p>}
+          {m.convictions.map((c) => (
+            <div key={c.id} className="flex gap-2 items-start">
+              <Chip>{c.id}</Chip>
+              <Textarea rows={2} value={c.text} onChange={(e) => upConv(c.id, e.target.value)} aria-label={`Conviction ${c.id}`} />
+              <IconBtn icon={X} label="Retirer" onClick={() => setM({ convictions: m.convictions.filter((x) => x.id !== c.id) })} />
+            </div>
+          ))}
+        </Card>
+        <Card className="p-6 space-y-3">
+          <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => setM({ stories: [...m.stories, { id: newId("s", m.stories), title: "Nouvelle histoire", situation: "", action: "", result: "", lesson: "" }] })}>Ajouter</Btn>}>Banque d'histoires</SectionTitle>
+          {!m.stories.length && <p className={`text-xs ${T.faint}`}>2 à 5 histoires racontables : la lettre en raconte une, l'entretien s'en sert pour les réponses STAR.</p>}
+          {m.stories.map((x) => (
+            <div key={x.id} className={`rounded-2xl p-3 space-y-2 ${T.sub}`}>
+              <div className="flex gap-2 items-center">
+                <Chip>{x.id}</Chip>
+                <Input value={x.title} onChange={(e) => upStory(x.id, "title", e.target.value)} aria-label="Titre" className="h-8" />
+                <IconBtn icon={Trash2} label="Retirer" onClick={() => setM({ stories: m.stories.filter((y) => y.id !== x.id) })} />
+              </div>
+              {[["situation", "Situation"], ["action", "Ce que vous avez fait"], ["result", "Ce que ça a changé"], ["lesson", "Ce que vous en retenez"]].map(([k, l]) => (
+                <Field key={k} label={l}><Textarea rows={2} value={x[k]} onChange={(e) => upStory(x.id, k, e.target.value)} /></Field>
+              ))}
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ── Règles d'écriture (6a) : injectées dans toutes les rédactions ; prioritaires sur le style, jamais sur la vérité ── */
+function WritingRulesEditor() {
+  const T = useT();
+  const { profile, setProfile, learnRules, busy } = useApp();
+  const rules = writingRulesOf(profile);
+  const learning = learningOf(profile);
+  const pending = pendingLearnDocs(profile);
+  const save = (l) => setProfile((p) => ({ ...p, writingRules: l }));
+  const up = (id, patch) => save(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const newId = () => { let i = rules.length + 1; while (rules.some((r) => r.id === `r${i}`)) i++; return `r${i}`; };
+  return (
+    <div className="space-y-4 max-w-4xl">
+      <Card className="p-6 space-y-2">
+        <SectionTitle action={<Btn size="sm" variant="ghost" icon={Plus} onClick={() => save([...rules, { id: newId(), text: "Nouvelle règle", active: true, origin: "manuelle" }])}>Ajouter</Btn>}>Règles d'écriture</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Injectées dans le CV, la lettre, les messages, les corrections, la relecture et la préparation d'entretien. Elles priment sur les consignes de style, jamais sur la vérité : une preuve absente de votre profil reste [à compléter]. Les règles « départ » sont à valider : modifiez-les ou désactivez-les.</p>
+      </Card>
+      <Card className="p-6 space-y-2">
+        <SectionTitle>Apprendre de mes corrections</SectionTitle>
+        <p className={`text-sm ${T.muted}`}>Chaque fois que vous enregistrez un CV ou une lettre retouché à la main, l'écart avec la version IA est mémorisé ({learning.edits.length} correction(s) en mémoire). À partir de 3 documents corrigés, l'IA propose les règles que vous appliquez de façon récurrente. Elles arrivent <strong>inactives</strong> : rien n'est activé sans vous.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Chip tone={pending >= 3 ? "ok" : "neutral"}>{pending} document(s) corrigé(s) depuis le dernier apprentissage</Chip>
+          {learning.lastLearnAt && <span className={`text-xs ${T.faint}`}>dernier : {fmtDate(learning.lastLearnAt)}</span>}
+          <Btn size="sm" variant="primary" icon={Wand2} loading={busy["learn-rules"]} disabled={pending < 3} onClick={learnRules}>Proposer des règles</Btn>
+        </div>
+      </Card>
+      {rules.map((r) => (
+        <Card key={r.id} className="p-4">
+          <div className="flex gap-3 items-start">
+            <input type="checkbox" className="mt-2" checked={!!r.active} onChange={(e) => up(r.id, { active: e.target.checked })} aria-label="Règle active" />
+            <div className="flex-1 min-w-0 space-y-1">
+              <Textarea rows={2} value={r.text} onChange={(e) => up(r.id, { text: e.target.value })} aria-label={`Règle ${r.id}`} />
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <Chip tone={r.active ? "ok" : r.origin === "apprise" ? "warn" : "neutral"}>{r.active ? "active" : r.origin === "apprise" ? "à valider" : "inactive"}</Chip>
+                <Chip>{r.origin || "manuelle"}</Chip>
+                {r.evidence && <span className={`text-xs ${T.muted}`}>Observé : {r.evidence}</span>}
+              </div>
+            </div>
+            <IconBtn icon={Trash2} label="Supprimer" onClick={() => save(rules.filter((x) => x.id !== r.id))} />
+          </div>
+        </Card>
+      ))}
     </div>
   );
 }
@@ -7539,9 +9368,7 @@ function CriteriaHistory() {
 
 function PrivacyView() {
   const T = useT();
-  const { settings, setSettings, exportPayload, importPayload, resetAll, clearDemo, loadDemo, hasDemo, toast, offers, apps, contacts, compactOffers, media } = useApp();
-  const [usage, setUsage] = useState(() => ({ ...USAGE }));
-  useEffect(() => { usageListeners.add(setUsage); return () => usageListeners.delete(setUsage); }, []);
+  const { settings, setSettings, exportPayload, importPayload, resetAll, clearDemo, loadDemo, hasDemo, toast, offers, apps, contacts } = useApp();
   const [showJson, setShowJson] = useState(false);
   const [paste, setPaste] = useState("");
   const [resetOpen, setResetOpen] = useState(false);
@@ -7595,14 +9422,8 @@ function PrivacyView() {
   const testApi = async () => {
     setTest({ state: "loading" });
     try {
-      const tiers = ["deep", "balanced", "fast"];
-      const res = [];
-      for (const tier of tiers) {
-        const r = await callClaude(settings, { system: "Réponds uniquement {\"ok\":true}.", prompt: "Test de connexion.", maxTokens: 400, tier, effort: "low" });
-        res.push(`${TIER_LABEL[tier]} : ${r.model}`);
-        if (RT.mode === "published") break;
-      }
-      setTest({ state: "ok", text: `API joignable · ${res.join(" · ")}` });
+      const r = await callClaude(settings, { system: "Réponds uniquement {\"ok\":true}.", prompt: "Test de connexion.", maxTokens: 50 });
+      setTest({ state: "ok", text: `API joignable · modèle ${r.model}` });
     } catch (e) {
       setTest({ state: "error", text: e.message });
     }
@@ -7626,7 +9447,6 @@ function PrivacyView() {
               <li>• Vers la recherche web : des requêtes génériques (intitulés, zones) — jamais votre nom.</li>
               <li>• Vers Gmail : lecture des alertes emploi (à l'import) et création de brouillons (sur confirmation).</li>
               <li>• Vers Google Calendar : les événements que vous confirmez.</li>
-              <li>• Votre photo reste dans cet espace : elle n'est jamais envoyée à l'IA, seulement intégrée aux PDF et Word que vous exportez.</li>
               <li>• Rien n'est jamais envoyé à un recruteur ni publié.</li>
             </ul>
           </div>
@@ -7642,16 +9462,6 @@ function PrivacyView() {
             <Field label="Fraîcheur des annonces (jours)"><Input type="number" min={3} max={90} value={settings.lookbackDays} onChange={(e) => set("lookbackDays", clamp(Number(e.target.value) || 30, 3, 90))} /></Field>
             <Field label="Offres max par source"><Input type="number" min={3} max={20} value={settings.maxPerSource} onChange={(e) => set("maxPerSource", clamp(Number(e.target.value) || 10, 3, 20))} /></Field>
           </div>
-          <SectionTitle className="mt-6">Surveillance du pipeline</SectionTitle>
-          <Toggle checked={settings.autoReplies} onChange={(v) => set("autoReplies", v)} label="Vérifier Gmail à l'ouverture" description="Réponses, accusés ATS, invitations, refus et candidatures non suivies. Lecture seule, tout est soumis à validation." />
-          <div className="grid grid-cols-2 gap-3 mt-2">
-            <Field label="Intervalle minimum">
-              <Select value={settings.autoRepliesHours} onChange={(e) => set("autoRepliesHours", Number(e.target.value))} className="w-full">
-                {[6, 12, 24, 48].map((h) => <option key={h} value={h}>{h} h</option>)}
-              </Select>
-            </Field>
-            <Field label="Silence avant alerte (jours)"><Input type="number" min={7} max={60} value={settings.ghostDays} onChange={(e) => set("ghostDays", clamp(Number(e.target.value) || 21, 7, 60))} /></Field>
-          </div>
         </Card>
 
         <Card className="p-6">
@@ -7663,21 +9473,9 @@ function PrivacyView() {
           )}
           {test && test.state !== "loading" && <Notice tone={test.state === "ok" ? "ok" : "danger"} className="mb-4">{test.text}</Notice>}
           <div className="grid grid-cols-2 gap-3">
-            <Field label="Profond (scoring, CV, web)"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
-            <Field label="Repli du profond"><Input value={settings.fallbackModel} onChange={(e) => set("fallbackModel", e.target.value.trim())} /></Field>
-            <Field label="Équilibré (traduction, Gmail)"><Input value={settings.modelBalanced} onChange={(e) => set("modelBalanced", e.target.value.trim())} /></Field>
-            <Field label="Rapide (tri, synonymes)"><Input value={settings.modelFast} onChange={(e) => set("modelFast", e.target.value.trim())} /></Field>
+            <Field label="Modèle"><Input value={settings.model} onChange={(e) => set("model", e.target.value.trim())} /></Field>
+            <Field label="Modèle de repli"><Input value={settings.fallbackModel} onChange={(e) => set("fallbackModel", e.target.value.trim())} /></Field>
           </div>
-          <Toggle checked={settings.routing !== false} onChange={(v) => set("routing", v)} label="Routage par tâche" description="Chaque tâche va au modèle le moins cher qui la réussit. Désactivé : tout passe par le modèle profond." />
-          <Toggle checked={settings.promptCache !== false} onChange={(v) => set("promptCache", v)} label="Cache de prompt" description="Profil et critères relus en cache entre les lots de scoring (environ 5 % du prix)." />
-          <Toggle checked={settings.effortTuning !== false} onChange={(v) => set("effortTuning", v)} label="Effort adapté" description="Raisonnement court sur les tâches simples : plus rapide, moins de tokens." />
-          {usage.calls > 0 && (
-            <div className={`rounded-2xl p-4 text-xs mt-2 space-y-1 ${T.sub}`}>
-              <div className="font-medium text-sm">Consommation de la session</div>
-              <div>{usage.calls} appel(s) · {Math.round((usage.input + usage.cacheRead + usage.cacheWrite) / 1000)} k tokens en entrée (dont {Math.round((usage.cacheRead / Math.max(1, usage.input + usage.cacheRead + usage.cacheWrite)) * 100)} % lus en cache) · {Math.round(usage.output / 1000)} k en sortie</div>
-              <div className={T.muted}>{Object.entries(usage.byTier).map(([t, u]) => `${TIER_LABEL[t] || t} : ${u.calls} appel(s)`).join(" · ")}</div>
-            </div>
-          )}
           <Field label="URL MCP Gmail" className="mt-3"><Input value={settings.mcp.gmail} onChange={(e) => set("mcp", { ...settings.mcp, gmail: e.target.value.trim() })} /></Field>
           <Field label="URL MCP Google Calendar" className="mt-3"><Input value={settings.mcp.gcal} onChange={(e) => set("mcp", { ...settings.mcp, gcal: e.target.value.trim() })} /></Field>
           <Field label="Format de connexion MCP" className="mt-3" hint="« Auto » essaie le format des artefacts claude.ai puis le format API récent.">
@@ -7718,10 +9516,6 @@ function PrivacyView() {
           <Btn className="mt-2" size="sm" disabled={!paste.trim()} onClick={() => doImport(paste)}>Importer le JSON collé</Btn>
 
           <div className={`mt-6 pt-6 border-t ${T.line} flex flex-wrap gap-2`}>
-            <Btn variant="ghost" icon={Archive} onClick={() => compactOffers(90)}>Alléger les offres écartées (+ 90 j)</Btn>
-            {media.photo && <span className={`self-center text-xs ${T.faint}`}>Photo : ~{Math.round((media.photo.src.length + (media.photo.original || "").length) / 1370)} Ko</span>}
-          </div>
-          <div className={`mt-3 flex flex-wrap gap-2`}>
             {hasDemo ? <Btn icon={Trash2} onClick={clearDemo}>Supprimer les données d'exemple</Btn> : <Btn variant="ghost" onClick={loadDemo}>Recharger les exemples</Btn>}
             <Btn variant="danger" icon={RotateCcw} onClick={() => setResetOpen(true)}>Réinitialiser</Btn>
           </div>
