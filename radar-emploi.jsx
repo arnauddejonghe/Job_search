@@ -13,7 +13,7 @@ import {
   Info, Clock, Menu, History, FileText, RefreshCw, Building2, Inbox,
   Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Palette, ChevronLeft, Filter, Link2, CalendarClock, CalendarDays, Unlink,
   Maximize2, Minimize2, Redo2, ArrowUp, ArrowDown, Lightbulb, SlidersHorizontal, Circle, Minus,
-  RotateCw, Crop, Star, GripVertical, ArrowLeftRight, Image as ImageIcon, FileDown, Languages,
+  RotateCw, Crop, Star, GripVertical, ArrowLeftRight, FileDown, Languages, MapPin,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -3098,12 +3098,17 @@ GRILLE (identique pour toutes les offres)
 - confidence : "haute" si missions, lieu et conditions sont détaillés ; "moyenne" si partiel ; "faible" si l'annonce est pauvre.
 - redFlags : uniquement avec une preuve textuelle courte tirée de l'annonce.
 
+CLARTÉ (uniquement ce que dit l'annonce, sinon null ou liste vide)
+- tldr : une phrase EN FRANÇAIS de 25 mots max qui dit ce qu'est vraiment le poste, quelle que soit la langue de l'annonce.
+- facts : contract (CDI | CDD | Freelance | Intérim | Stage | Autre), remoteDays (jours de télétravail par semaine, nombre), salaryMin / salaryMax (nombres, en euros), salaryPeriod (an | mois), languages (codes fr, nl, en, de exigés), teamSize (nombre de personnes à manager), reportsTo (rattachement), seniority (Junior | Médior | Senior | Manager | Direction).
+- must : exigences indispensables de l'annonce (5 max, 8 mots chacune) ; nice : atouts souhaités (5 max) ; missions : missions principales (5 max, 10 mots chacune). En français.
+
 ${CACHE_SPLIT}
 OFFRES
 ${JSON.stringify(compact)}
 
 Réponds uniquement avec ce JSON (une entrée par offre, une ligne par identifiant de critère) :
-{"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
+{"scores":[{"id":"","matches":[{"c":"M1","match":50,"note":""}],"fit":"fort|moyen|faible","confidence":"haute|moyenne|faible","confidenceReason":"","summary":"2 phrases max","tldr":"","facts":{"contract":null,"remoteDays":null,"salaryMin":null,"salaryMax":null,"salaryPeriod":null,"languages":[],"teamSize":null,"reportsTo":null,"seniority":null},"must":[],"nice":[],"missions":[],"strengths":[],"gaps":[],"questions":[],"redFlags":[{"type":"stress|turnover|role_flou|autre","evidence":""}]}]}`;
   },
 
   dossier(offer, profile, types, instruction, analysis, extra = {}) {
@@ -3702,10 +3707,59 @@ function finalizeScore(s, ver) {
     gaps: (s.gaps || []).map(String).slice(0, 6),
     questions: (s.questions || []).map(String).slice(0, 5),
     redFlags: (s.redFlags || []).filter((r) => r && r.evidence).map((r) => ({ type: r.type || "autre", evidence: String(r.evidence) })),
+    tldr: str(s.tldr),
+    facts: normFacts(s.facts),
+    must: (s.must || []).map(String).filter(Boolean).slice(0, 6),
+    nice: (s.nice || []).map(String).filter(Boolean).slice(0, 6),
+    missions: (s.missions || []).map(String).filter(Boolean).slice(0, 6),
     caps: calc.caps,
     criteriaVersionId: ver.id,
     scoredAt: nowISO(),
   };
+}
+/* Faits normalisés extraits au scoring : nombres et listes propres, null si absents. */
+function normFacts(f) {
+  if (!f || typeof f !== "object") return null;
+  const num = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) && n > 0 ? n : null; };
+  const contract = str(f.contract);
+  return {
+    contract: contract && /^(CDI|CDD|Freelance|Intérim|Stage|Autre)$/i.test(contract) ? contract : contract,
+    remoteDays: f.remoteDays === 0 ? 0 : num(f.remoteDays) !== null && num(f.remoteDays) <= 5 ? num(f.remoteDays) : null,
+    salaryMin: num(f.salaryMin), salaryMax: num(f.salaryMax),
+    salaryPeriod: /mois|month|maand/i.test(f.salaryPeriod || "") ? "mois" : f.salaryMin || f.salaryMax ? "an" : null,
+    languages: (Array.isArray(f.languages) ? f.languages : []).map((l) => String(l).toLowerCase().slice(0, 2)).filter((l) => DOC_LANGS.includes(l)),
+    teamSize: num(f.teamSize), reportsTo: str(f.reportsTo), seniority: str(f.seniority),
+  };
+}
+const fmtK = (n) => (n >= 1000 ? `${Math.round(n / 100) / 10}`.replace(".", ",") + " k" : String(n));
+function fmtSalary(f, raw) {
+  if (f && (f.salaryMin || f.salaryMax)) {
+    const range = f.salaryMin && f.salaryMax && f.salaryMin !== f.salaryMax ? `${fmtK(f.salaryMin)} – ${fmtK(f.salaryMax)}` : fmtK(f.salaryMin || f.salaryMax);
+    return `${range} € / ${f.salaryPeriod || "an"}`;
+  }
+  return raw || null;
+}
+/* Verdict calculé localement (cohérent avec le score, gratuit) : Postuler, À creuser, Passer. */
+function offerVerdict(o, threshold) {
+  const s = o?.score;
+  if (!s) return null;
+  if ((s.caps || []).some((c) => /plafond/.test(c)) || s.value < 50) return { id: "skip", label: "Passer", tone: "neutral" };
+  if (s.value >= threshold && s.confidence !== "faible" && !(s.redFlags || []).length) return { id: "apply", label: "Postuler", tone: "ok" };
+  return { id: "dig", label: "À creuser", tone: "warn" };
+}
+
+/* Re-pondération locale : si la nouvelle version ne change que le poids des souhaits, les taux de correspondance
+   restent valables et le score est recalculé avec la même formule, sans appel IA. */
+function onlyWeightsChanged(prev, next) {
+  if (!prev || !next) return false;
+  const body = (v, withWeights) => { const { id: _i, label: _l, createdAt: _c, ...b } = v; return JSON.stringify({ ...b, wishes: (b.wishes || []).map((w) => (withWeights ? w : { ...w, weight: null })) }); };
+  return body(prev, false) === body(next, false) && body(prev, true) !== body(next, true);
+}
+function reweightScore(score, ver) {
+  const w = Object.fromEntries(criteriaList(ver).map((c) => [c.id, c.weight]));
+  const breakdown = (score.breakdown || []).map((b) => (b.kind === "souhaité" && b.id in w ? { ...b, weight: w[b.id] } : b));
+  const calc = computeScore(breakdown);
+  return { ...score, breakdown, value: calc.value, wishAvg: calc.wishAvg, mustAvg: calc.mustAvg, caps: calc.caps, criteriaVersionId: ver.id, reweightedAt: nowISO() };
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -5191,8 +5245,17 @@ export default function RadarApp() {
     const c = R.current.criteria;
     const v = { id: uid("crit"), label: label || `v${c.versions.length + 1} — ${fmtDate(nowISO())}`, createdAt: nowISO(), ...deepClone(c.draft) };
     const next = { ...c, versions: [...c.versions, v] };
+    const prev = c.versions[c.versions.length - 1];
     R.current.criteria = next;
     setCriteria(next);
+    if (onlyWeightsChanged(prev, v)) {
+      let n = 0;
+      const list = R.current.offers.map((o) => (o.score?.method === 2 && o.score.criteriaVersionId === prev.id ? (n++, { ...o, score: reweightScore(o.score, v) }) : o));
+      R.current.offers = list;
+      setOffers(list);
+      toast(`Version enregistrée : ${v.label} · ${n} score(s) recalculé(s) sans IA (seuls les poids ont changé)`, "ok");
+      return;
+    }
     toast(`Version enregistrée : ${v.label}`, "ok");
     if (R.current.settings.autoRescore) setTimeout(() => rescoreStale(), 50);
   };
@@ -6443,6 +6506,7 @@ function OffersView() {
   const [f, setF] = useState(DEFAULT_FILTERS);
   const [sel, setSel] = useState(() => new Set());
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [compare, setCompare] = useState(null);
   const anchor = useRef(null);
   useEffect(() => {
     if (offerPreset) { setF({ ...DEFAULT_FILTERS, ...offerPreset }); setOfferPreset(null); }
@@ -6671,7 +6735,7 @@ function OffersView() {
         </Card>
       )}
 
-      {sel.size > 0 && (
+      {sel.size > 0 && !compare && (
         <div className="fixed bottom-4 left-4 right-4 flex justify-center" style={{ zIndex: 60 }}>
           <div className="max-w-full flex flex-wrap items-center gap-1.5 rounded-2xl px-3 py-2" style={{ ...T.glass, ...T.shadow }} role="toolbar" aria-label="Actions sur la sélection">
             <span className="text-sm font-medium px-2 tabular-nums">{sel.size} sélectionnée(s)</span>
@@ -6682,6 +6746,7 @@ function OffersView() {
             {canDecide && <Btn size="sm" icon={Plus} onClick={() => act("pipeline")}>Pipeline</Btn>}
             <Btn size="sm" icon={Gauge} onClick={() => act("score")} loading={busy.score}>Scorer</Btn>
             <Btn size="sm" icon={Link2} onClick={() => act("verify")} loading={busy.verify}>Vérifier les liens</Btn>
+            {sel.size >= 2 && sel.size <= 4 && <Btn size="sm" icon={Columns} onClick={() => setCompare([...sel])}>Comparer</Btn>}
             {sel.size >= 2 && sel.size <= 6 && <Btn size="sm" icon={GitMerge} onClick={() => act("merge")}>Fusionner</Btn>}
             <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => act("remove")}>Supprimer</Btn>
             <IconBtn icon={X} label="Vider la sélection" onClick={() => setSel(new Set())} />
@@ -6690,7 +6755,48 @@ function OffersView() {
       )}
 
       <RulesModal open={rulesOpen} onClose={() => setRulesOpen(false)} />
+      {compare && <CompareModal ids={compare} onClose={() => setCompare(null)} />}
     </div>
+  );
+}
+
+/* ── Comparateur d'offres (2 à 4), côte à côte ── */
+function CompareModal({ ids, onClose }) {
+  const T = useT();
+  const { offers, settings, ratings } = useApp();
+  const list = ids.map((id) => offers.find((o) => o.id === id)).filter(Boolean);
+  if (!list.length) return null;
+  const crits = [...new Set(list.flatMap((o) => (o.score?.breakdown || []).map((b) => b.criterion)))];
+  const row = (label, f) => (
+    <tr key={label} className={`border-t ${T.line}`}>
+      <th scope="row" className={`text-left align-top py-2 pr-3 text-xs font-medium ${T.muted}`} style={{ minWidth: 120 }}>{label}</th>
+      {list.map((o) => <td key={o.id} className="align-top py-2 px-2 text-sm">{f(o)}</td>)}
+    </tr>
+  );
+  const facts = (o) => o.score?.facts || {};
+  return (
+    <Modal open wide onClose={onClose} title={`Comparer ${list.length} offres`}>
+      <div className="overflow-x-auto">
+        <table className="w-full" style={{ borderCollapse: "collapse" }}>
+          <thead><tr><th />{list.map((o) => <th key={o.id} className="text-left align-bottom px-2 pb-2" style={{ minWidth: 180 }}><div className="text-sm font-medium leading-snug">{o.title}</div><div className={`text-xs font-normal ${T.muted}`}>{show(o.company)}</div></th>)}</tr></thead>
+          <tbody>
+            {row("Score", (o) => <span className="inline-flex items-center gap-2"><ScorePill score={o.score} threshold={settings.threshold} />{offerVerdict(o, settings.threshold) && <Chip tone={offerVerdict(o, settings.threshold).tone}>{offerVerdict(o, settings.threshold).label}</Chip>}</span>)}
+            {row("En bref", (o) => o.score?.tldr || o.score?.summary || <span className={T.faint}>{NC}</span>)}
+            {row("Lieu · trajet", (o) => `${show(o.location)} · ${commuteLabel(o.commute)}`)}
+            {row("Contrat", (o) => show(facts(o).contract || o.contract))}
+            {row("Télétravail", (o) => (facts(o).remoteDays != null ? `${facts(o).remoteDays} j / semaine` : show(o.remote)))}
+            {row("Salaire", (o) => show(fmtSalary(facts(o), o.salary)))}
+            {row("Équipe", (o) => (facts(o).teamSize ? `${facts(o).teamSize} pers.${facts(o).reportsTo ? ` · ${facts(o).reportsTo}` : ""}` : show(facts(o).reportsTo)))}
+            {row("Langues", (o) => (facts(o).languages?.length ? facts(o).languages.map((l) => LANG_FLAG[l]).join(" · ") : show(o.language && LANG_FLAG[o.language])))}
+            {row("Note employeur", (o) => fmtRating(ratings[ratingKey(o.company)]) ? `★ ${fmtRating(ratings[ratingKey(o.company)])}` : <span className={T.faint}>{NC}</span>)}
+            {crits.map((c) => row(c, (o) => { const b = (o.score?.breakdown || []).find((x) => x.criterion === c); return b ? <div><MatchBar value={b.match} kind={b.kind} /><div className={`text-xs mt-1 ${T.muted}`}>{b.note || b.match}</div></div> : <span className={T.faint}>—</span>; }))}
+            {row("Points forts", (o) => <ul className="space-y-1">{(o.score?.strengths || []).slice(0, 4).map((x, i) => <li key={i}>+ {x}</li>)}</ul>)}
+            {row("Écarts", (o) => <ul className="space-y-1">{(o.score?.gaps || []).slice(0, 4).map((x, i) => <li key={i}>− {x}</li>)}</ul>)}
+            {row("Alertes", (o) => (o.score?.redFlags?.length ? <span className="text-rose-600">{o.score.redFlags.map((r) => r.evidence).join(" · ")}</span> : <span className={T.faint}>aucune</span>))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
   );
 }
 
@@ -6738,6 +6844,7 @@ function OfferRow({ o, vid, selected, onToggle, onOpen, onKeep, onDismiss, onExp
             <span className="truncate">{show(o.company)} · {show(o.location)} · {(o.sources || []).map((s) => s.name).filter((v, i, a) => a.indexOf(v) === i).join(", ")}</span>
             <RatingChip company={o.company} compact />
           </span>
+          {o.score?.tldr && <span className={`block text-xs mt-0.5 truncate ${T.faint}`}>{o.score.tldr}</span>}
           {(o.autoReason || o.link?.state || (o.status !== "new" && o.status !== "pipeline")) && (
             <span className="flex flex-wrap items-center gap-1.5 mt-1">
               {o.autoReason && <Chip tone={o.status === "expired" ? "warn" : "neutral"} title="Tri automatique — restaurable">auto : {o.autoReason}</Chip>}
@@ -6921,28 +7028,14 @@ function OfferDrawer({ id, onClose }) {
         Passer automatiquement à l'offre suivante après « Écarter », « Expirée » ou « Ajouter » · flèches ← → pour naviguer
       </label>
 
-      <section className="mb-8">
-        <div className="flex items-center gap-4">
-          <ScorePill score={s} threshold={settings.threshold} size="lg" />
-          <div className="flex-1">
-            {s ? (
-              <>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>Confiance {s.confidence}</Chip>
-                  {stale && !o.demo && <Chip tone="warn">critères modifiés depuis</Chip>}
-                  {s.fit && <Chip tone={s.fit === "fort" ? "ok" : s.fit === "faible" ? "warn" : "neutral"}>adéquation {s.fit}</Chip>}
-                  {s.caps?.map((c) => <Chip key={c} tone="danger">{s.method === 2 ? c : `plafonné : ${c}`}</Chip>)}
-                </div>
-                {s.summary && <p className="text-sm mt-2">{s.summary}</p>}
-                {s.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
-                {s.method === 2 && <p className={`text-xs mt-1 ${T.faint}`}>Calcul systématique : 55 % souhaités pondérés{s.wishAvg !== null ? ` (${s.wishAvg})` : ""} + 45 % indispensables{s.mustAvg !== null ? ` (${s.mustAvg})` : ""}, puis plafonds et pénalités.</p>}
-              </>
-            ) : (
-              <p className={`text-sm ${T.muted}`}>Pas encore scorée.</p>
-            )}
-          </div>
-        </div>
-      </section>
+      <DecisionCard o={o} stale={stale} />
+      {s && (s.missions?.length > 0 || s.must?.length > 0 || s.nice?.length > 0) && (
+        <section className="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-8" aria-label="L'annonce en clair">
+          <BulletList title="Missions" items={s.missions || []} icon={Target} />
+          <BulletList title="Exigences" items={s.must || []} icon={Check} />
+          <BulletList title="Atouts" items={s.nice || []} icon={Plus} />
+        </section>
+      )}
 
       {s && (
         <>
@@ -7049,6 +7142,68 @@ function RatingChip({ company, compact }) {
   }
   if (r) return <Chip title={r.note || ""}>note employeur introuvable</Chip>;
   return <Btn size="sm" variant="ghost" className="h-6 px-2" loading={busy.ratings} onClick={() => requestRatings([company])}>★ Note employeur</Btn>;
+}
+
+/* Synthèse de décision : verdict, résumé en français, faits clés normalisés, raisons principales. */
+function DecisionCard({ o, stale }) {
+  const T = useT();
+  const { settings } = useApp();
+  const s = o.score;
+  const f = s?.facts || {};
+  const v = offerVerdict(o, settings.threshold);
+  const facts = [
+    [MapPin, "Lieu", o.location ? `${o.location}${o.commute ? ` · ~${o.commute.minutes} min` : ""}` : null],
+    [FileText, "Contrat", f.contract || o.contract],
+    [Monitor, "Télétravail", f.remoteDays != null ? `${f.remoteDays} j / semaine` : o.remote],
+    [TrendingUp, "Salaire", fmtSalary(f, o.salary)],
+    [Users, "Équipe", f.teamSize ? `${f.teamSize} personne(s)` : null],
+    [Building2, "Rattachement", f.reportsTo],
+    [Target, "Séniorité", f.seniority || o.seniority],
+    [Languages, "Langues exigées", f.languages?.length ? f.languages.map((l) => LANG_FLAG[l]).join(" · ") : null],
+    [Clock, "Publiée", o.publishedAt && !isNaN(new Date(o.publishedAt)) ? `${fmtDate(o.publishedAt)} · ${relDay(o.publishedAt)}` : null],
+  ];
+  const known = facts.filter(([, , val]) => val);
+  const unknown = facts.filter(([, , val]) => !val).map(([, l]) => l.toLowerCase());
+  return (
+    <section className={`rounded-3xl p-5 mb-6 ${T.sub}`} aria-label="Synthèse de décision">
+      <div className="flex items-start gap-4">
+        <ScorePill score={s} threshold={settings.threshold} size="lg" />
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            {v ? <span className={`inline-flex items-center rounded-full px-3 py-1 text-sm font-semibold ${v.id === "apply" ? "bg-emerald-600 text-white" : v.id === "dig" ? (T.dark ? "bg-amber-900 text-amber-100" : "bg-amber-100 text-amber-900") : T.chip}`}>{v.label}</span> : <Chip>non scorée</Chip>}
+            {s && <Chip tone={s.confidence === "faible" ? "warn" : s.confidence === "haute" ? "ok" : "neutral"}>confiance {s.confidence}</Chip>}
+            {stale && !o.demo && s && <Chip tone="warn">critères modifiés depuis</Chip>}
+            {s?.fit && <Chip tone={s.fit === "fort" ? "ok" : s.fit === "faible" ? "warn" : "neutral"}>adéquation {s.fit}</Chip>}
+            {s?.caps?.map((c) => <Chip key={c} tone="danger">{s.method === 2 ? c : `plafonné : ${c}`}</Chip>)}
+            {s?.reweightedAt && <Chip>recalculé sans IA</Chip>}
+          </div>
+          {s?.tldr && <p className="text-base font-medium leading-snug mt-2">{s.tldr}</p>}
+          {s?.summary && <p className={`text-sm mt-1 ${T.muted}`}>{s.summary}</p>}
+          {s?.confidenceReason && <p className={`text-xs mt-1 ${T.faint}`}>{s.confidenceReason}</p>}
+          {s?.method === 2 && <p className={`text-xs mt-1 ${T.faint}`}>Calcul systématique : 55 % souhaités pondérés{s.wishAvg != null ? ` (${s.wishAvg})` : ""} + 45 % indispensables{s.mustAvg != null ? ` (${s.mustAvg})` : ""}, puis plafonds et pénalités.</p>}
+          {!s && <p className={`text-sm mt-2 ${T.muted}`}>Pas encore scorée.</p>}
+        </div>
+      </div>
+      {known.length > 0 && (
+        <dl className="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-5">
+          {known.map(([I, l, val]) => (
+            <div key={l} className={`rounded-2xl px-3 py-2 ${T.surface}`}>
+              <dt className={`flex items-center gap-1.5 text-xs ${T.faint}`}><I className="w-3.5 h-3.5" aria-hidden="true" />{l}</dt>
+              <dd className="text-sm mt-0.5">{val}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {unknown.length > 0 && <p className={`text-xs mt-3 ${T.faint}`}>Non précisé dans l'annonce : {unknown.join(", ")}.</p>}
+      {s && (s.strengths?.length > 0 || s.gaps?.length > 0 || s.redFlags?.length > 0) && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 mt-4 text-sm">
+          {s.strengths.slice(0, 3).map((x, i) => <div key={`s${i}`} className="flex gap-2"><Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" aria-hidden="true" />{x}</div>)}
+          {s.gaps.slice(0, 3).map((x, i) => <div key={`g${i}`} className="flex gap-2"><ArrowRight className={`w-4 h-4 mt-0.5 shrink-0 ${T.faint}`} aria-hidden="true" />{x}</div>)}
+          {s.redFlags.slice(0, 2).map((r, i) => <div key={`r${i}`} className="flex gap-2 text-rose-600"><Flag className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />{r.evidence}</div>)}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function BulletList({ title, items, icon: Icon, danger, empty = "—" }) {
