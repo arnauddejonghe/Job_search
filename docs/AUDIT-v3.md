@@ -2,6 +2,8 @@
 
 Date : 21 octobre 2026 · Périmètre : `radar-emploi.jsx` v2 (5 340 lignes, commit `2db8c84`) · Auteur : revue assistée par Claude
 
+> **Mise à jour.** L'audit a été mené sur la v2. La version en ligne (branche `claude/zen-edison-9drl52`) avait entre-temps ajouté un studio structuré et des contrôles ATS. Les solutions ont donc été **portées sur la version en ligne** sans rien lui retirer : voir la section 9.
+
 ## 1. Méthode
 
 - **Lecture intégrale du code v2** : environnement (chat / page publiée), couche IA, prompts, persistance, 9 vues.
@@ -178,6 +180,23 @@ Reporté : UI multilingue, sorties structurées, polices intégrées, glisser-d�
 | Coût du scoring | Lots 2 et suivants lus en cache ; recalcul local quand seuls les poids changent |
 | Statuts de pipeline justes | Accusés ATS détectés : la date d'envoi est réelle, les relances aussi |
 | Qualité des CV | Score local ≥ 85 avant envoi, 0 élément « à compléter » |
+
+## 9. Portage sur la version en ligne
+
+La version en ligne couvrait déjà une partie des constats : éditeur structuré par sections avec aperçu cliquable (A4), contrôle qualité local et couverture des mots-clés ATS avec corrections proposées par l'IA (A6, A7, S8), CV maître par langue, puces verrouillées, apprentissage des corrections, brouillons automatiques. Ces fonctions sont conservées telles quelles.
+
+| Solution | Portée | Comment |
+|---|---|---|
+| S1, S3, S4, S5 | Oui | Le moteur de mise en page remplace l'aperçu HTML : mêmes positions dans l'aperçu SVG, le PDF vectoriel et le Word. Panneau « Design » à côté du panneau d'optimisation, photo (clé `radar:media`), sections déplaçables entre colonnes, design enregistré sur la candidature. L'accent reste celui de la version, proposé par l'IA ou choisi. |
+| S2 | Adaptée | L'éditeur structuré en ligne est plus riche que l'édition sur place de la v3 : il est gardé. Un clic dans l'aperçu ouvre la section correspondante. |
+| S6, S7 | Oui | Sélecteur de langue dans le studio (bascule ou traduction), export du dossier depuis le studio et la fiche. Allemand ajouté. Les mots-clés ATS ne sont comparés que si la langue du document est celle de l'annonce. |
+| S8 | Non | Le contrôle en ligne (`analyzeDoc`) est plus complet que le score v3 : il est conservé. |
+| S9, S10 | Oui | Vérification incrémentale, accusés ATS, candidatures hors Radar, boîte persistante (`radar:inbox`), vérification automatique à l'ouverture, onglet « E-mails », signaux sur les cartes, issue « Sans réponse ». |
+| S11, S12 | Oui | Carte de décision en tête de la fiche existante, annonce en clair, résumé dans la liste, comparateur depuis la sélection. |
+| S13, S14 | Oui | Trois niveaux, effort par tâche. Version publiée : quick, default et complex (complex pour la rédaction finale du CV et de la lettre), sans rejeu d'une réponse identique. Cache sur le préfixe stable du prompt de scoring (API). |
+| S15 | Oui | Re-pondération avec la même formule que le score en ligne (taux par identifiant de critère). |
+| S16 | Oui | Sous la fiche de préparation, onglet « Entretien ». |
+| S17 | En partie | `pdfSafe` (CP1252 et translittération), notes employeur et photo dans la sauvegarde. Le domicile reste Ohain : le calcul de trajet local en dépend. |
 
 ## Sources du benchmark
 
