@@ -3676,6 +3676,22 @@ evidence : la preuve courte (texte du résultat). publishedAt / deadline : YYYY-
 Réponds uniquement {"results":[{"id":"","state":"open|closed|unknown","evidence":"","publishedAt":null,"deadline":null}]}`;
   },
 
+  practice(question, answer, offer, profile) {
+    return `Mission : évaluer la réponse écrite d'un candidat à une question d'entretien, comme un recruteur exigeant et bienveillant.
+Poste : ${offer?.title || "non communiqué"} chez ${show(offer?.company)}.
+PROFIL (seule source de faits)
+${profileDigest(profile, true)}
+
+QUESTION : ${question}
+RÉPONSE DU CANDIDAT :
+<<<
+${answer}
+>>>
+
+Règles : note de 1 à 5 ; indique les éléments STAR présents (situation, tâche, action, résultat) ; 3 forces et 3 améliorations concrètes maximum ; réponse améliorée de 180 mots maximum, dans la langue de la réponse, qui n'utilise que les faits de la réponse et du profil (chiffre manquant → [à compléter]) ; durée orale estimée en secondes (130 mots par minute).
+Réponds uniquement {"score":1,"star":{"situation":false,"task":false,"action":false,"result":false},"strengths":[],"improvements":[],"improved":"","seconds":0}`;
+  },
+
   today(items) {
     return `Voici les actions candidates d'une recherche d'emploi discrète (JSON). Classe-les par priorité pour aujourd'hui selon les échéances, le score des offres et l'avancement des candidatures. Pour chacune, une raison de 12 mots max. N'ajoute aucune action.
 ${JSON.stringify(items.map(({ id, label, detail, due }) => ({ id, label, detail, due })))}
@@ -5615,6 +5631,20 @@ export default function RadarApp() {
     toast(`« ${term} » ajouté à vos compétences`, "ok");
   };
 
+  /* ── Entraînement à l'entretien : réponse écrite évaluée (note, STAR, version améliorée sans fait inventé) ── */
+  const evaluatePractice = (appId, question, answer) => withBusy(`practice:${appId}`, async () => {
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.practice(question, answer, offer, R.current.profile), maxTokens: 5000, tier: "balanced" });
+    const fb = {
+      score: clamp(Math.round(Number(data?.score) || 1), 1, 5), star: data?.star || {},
+      strengths: (data?.strengths || []).map(String).slice(0, 3), improvements: (data?.improvements || []).map(String).slice(0, 3),
+      improved: str(data?.improved), seconds: Number(data?.seconds) || Math.round((answer.split(/\s+/).length / 130) * 60),
+    };
+    patchApp(appId, (a) => ({ ...a, practice: [...(a.practice || []), { id: uid("pr"), at: nowISO(), question, answer, feedback: fb }] }));
+    return fb;
+  });
+
   /* ── Traduction d'un CV ou d'une lettre : nouvelle version dans la langue cible, balisage et faits conservés ── */
   const translateDoc = (appId, kind, from, to, srcText) => withBusy(`tr:${appId}:${kind}:${to}`, async () => {
     const app = R.current.apps.find((a) => a.id === appId);
@@ -5938,7 +5968,7 @@ export default function RadarApp() {
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
-    media, setMedia, translateDoc, inbox, setReplyOpen, resolveUntracked, monitoredCount,
+    media, setMedia, translateDoc, evaluatePractice, inbox, setReplyOpen, resolveUntracked, monitoredCount,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
@@ -7691,7 +7721,7 @@ function AppDrawer({ id, tab, setTab, onClose }) {
       {tab === "docs" && <DossierPanel app={app} offer={offer} />}
       {tab === "followups" && <AppFollowUps app={app} offer={offer} />}
       {tab === "emails" && <EmailsPanel app={app} />}
-      {tab === "prep" && <PrepPanel app={app} offer={offer} />}
+      {tab === "prep" && <><PrepPanel app={app} offer={offer} /><div className="mt-10"><PracticePanel app={app} offer={offer} /></div></>}
       {tab === "contacts" && <AppContacts app={app} />}
     </Drawer>
   );
@@ -10197,6 +10227,55 @@ function PrepPanel({ app, offer }) {
         ) : <p className={`text-sm ${T.faint}`}>{NC} — aucune source publique chiffrée trouvée.</p>}
       </section>
     </div>
+  );
+}
+
+/* ── Entraînement à l'entretien (évaluation de réponses écrites) ── */
+function PracticePanel({ app, offer }) {
+  const T = useT();
+  const { evaluatePractice, busy } = useApp();
+  const qs = (app.prep?.likelyQuestions || []).map((x) => x.question).filter(Boolean);
+  const [q, setQ] = useState(qs[0] || "");
+  const [a, setA] = useState("");
+  const loading = busy[`practice:${app.id}`];
+  const hist = [...(app.practice || [])].reverse();
+  const words = a.split(/\s+/).filter(Boolean).length;
+  return (
+    <section className="space-y-4">
+      <SectionTitle>Entraînement</SectionTitle>
+      <p className={`text-xs ${T.muted}`}>Répondez par écrit comme à l'oral. L'IA note la réponse, vérifie la structure STAR et propose une version améliorée sans inventer de faits.</p>
+      {qs.length > 0 && (
+        <Select value={qs.includes(q) ? q : ""} onChange={(e) => setQ(e.target.value)} className="w-full" aria-label="Question probable">
+          <option value="">Question personnalisée…</option>
+          {qs.map((x) => <option key={x} value={x}>{x}</option>)}
+        </Select>
+      )}
+      <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Question d'entretien" aria-label="Question" />
+      <Textarea rows={6} value={a} onChange={(e) => setA(e.target.value)} placeholder="Votre réponse…" aria-label="Votre réponse" />
+      <div className="flex flex-wrap items-center gap-3">
+        <Btn variant="primary" icon={Sparkles} loading={loading} disabled={!q.trim() || words < 15} onClick={async () => { if (await evaluatePractice(app.id, q.trim(), a.trim())) setA(""); }}>Évaluer ma réponse</Btn>
+        <span className={`text-xs tabular-nums ${T.faint}`}>{words} mots · ~{Math.round((words / 130) * 60)} s à l'oral</span>
+      </div>
+      {hist.map((p) => (
+        <div key={p.id} className={`rounded-2xl p-4 space-y-2 ${T.sub}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium flex-1 min-w-0">{p.question}</span>
+            <Chip tone={p.feedback.score >= 4 ? "ok" : p.feedback.score >= 3 ? "warn" : "danger"}>{p.feedback.score} / 5</Chip>
+          </div>
+          <div className="flex flex-wrap gap-1.5">{[["situation", "S"], ["task", "T"], ["action", "A"], ["result", "R"]].map(([k, l]) => <Chip key={k} tone={p.feedback.star?.[k] ? "ok" : "neutral"}>{l}{p.feedback.star?.[k] ? " ✓" : " —"}</Chip>)}<Chip>~{p.feedback.seconds} s</Chip></div>
+          {p.feedback.strengths.length > 0 && <ul className="text-sm space-y-0.5">{p.feedback.strengths.map((x, i) => <li key={i}>+ {x}</li>)}</ul>}
+          {p.feedback.improvements.length > 0 && <ul className={`text-sm space-y-0.5 ${T.muted}`}>{p.feedback.improvements.map((x, i) => <li key={i}>→ {x}</li>)}</ul>}
+          {p.feedback.improved && (
+            <details className="text-sm">
+              <summary className={`cursor-pointer text-xs ${T.accentText}`}>Version améliorée</summary>
+              <p className="mt-2 whitespace-pre-line">{p.feedback.improved}</p>
+              <CopyBtn text={p.feedback.improved} />
+            </details>
+          )}
+          <div className={`text-xs ${T.faint}`}>{fmtDate(p.at, { time: true })}</div>
+        </div>
+      ))}
+    </section>
   );
 }
 
