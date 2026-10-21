@@ -2139,7 +2139,15 @@ async function cropPhoto(original, crop, out = 640) {
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
 const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId || (!offer.demo && offer.score.method !== 2);
 const offerLang = (o) => o?.language || "fr";
-const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais" };
+const LANG_NAME = { fr: "français", nl: "néerlandais", en: "anglais", de: "allemand" };
+const LANG_FLAG = { fr: "FR", nl: "NL", en: "EN", de: "DE" };
+/* Versions par langue (CV et lettre) : une version sans langue vaut la langue du dossier. */
+const docLangOf = (app, offer, v) => v?.language || app?.docLanguage || offer?.language || "fr";
+const markupVersions = (app, offer, type, lang) => (app?.docs?.[type] || []).filter((v) => v.format === "markup" && (!lang || docLangOf(app, offer, v) === lang));
+const docLangs = (app, offer, type) => DOC_LANGS.filter((l) => markupVersions(app, offer, type, l).length);
+const latestDoc = (app, offer, type, lang) => markupVersions(app, offer, type, lang).slice(-1)[0] || null;
+/* Texte à exporter : le brouillon en cours s'il porte sur cette version, sinon la version enregistrée. */
+const docTextOf = (app, type, v) => { const d = app?.drafts?.[type]; return d && v && d.baseId === v.id ? { text: d.text, accent: d.accent ?? v.accent } : { text: v?.text || "", accent: v?.accent }; };
 
 /* ════════════════════════════════════════════════════════════════════════
    3. ENVIRONNEMENT & PERSISTANCE
@@ -2807,7 +2815,7 @@ function appMotivationBlock(app, offer, profile, facts) {
     story ? `Histoire à raconter : [${story.id}] ${storyText(story)}` : "Histoire : au choix dans la banque (la plus proche des enjeux de l'entreprise).",
   ].filter(Boolean).join("\n");
 }
-const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
+const longDate = (lang) => new Date().toLocaleDateString({ fr: "fr-BE", nl: "nl-BE", en: "en-GB", de: "de-DE" }[lang] || "fr-BE", { day: "numeric", month: "long", year: "numeric" });
 const adTextOf = (o) => String(o?.fullText || o?.description || "").trim();
 
 /* Cible de rédaction : offre publiée, candidature spontanée (entreprise ciblée, sans offre) ou CV de base (ni offre ni entreprise). */
@@ -2892,7 +2900,7 @@ const lintCtx = ({ offer, analysis, prefs, lang, settings, profile, pages, fallb
   companyFacts: app ? selectedFacts({ ...app, analysis: analysis || app.analysis }, offer, briefs).map((f) => f.text) : analysis?.companyFacts || [],
   employerNamed: app ? appMotivOf(app).employerNamed : null,
   currentOrg: profile?.experiences?.[0]?.org || "",
-  lang, spontaneous: offer?.spontaneous || null, keywords: analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
+  lang, spontaneous: offer?.spontaneous || null, keywords: offer?.language && lang && lang !== offer.language ? [] : analysis?.keywords?.length ? analysis.keywords : fallbackKeywords || [],
   jobTitle: analysis?.jobTitle || offer?.title, titleVariants: analysis?.titleVariants || [],
   company: offer?.company, currentTitle: profile?.headline, employerNames: settings?.employerNames, voice: prefs?.voice, pages,
 });
@@ -2910,6 +2918,31 @@ async function settleLimited(fns, n) {
 }
 
 const P = {
+  translate(text, kind, from, to, offer) {
+    const titles = SECTION_TITLES[to] || SECTION_TITLES.en;
+    const conv = {
+      fr: "Formules belges francophones : « Madame, Monsieur, » ; conclusion sobre (« Je me tiens à votre disposition pour un entretien. ») ; date au format « Ville, le 21 octobre 2026 ».",
+      nl: "Néerlandais de Belgique, vouvoiement « u » : « Geachte heer, mevrouw, » ; « Met vriendelijke groeten, » ; date au format « Ville, 21 oktober 2026 ». Intitulés de fonction usuels en Flandre (souvent en anglais).",
+      en: "Anglais britannique professionnel : « Dear Hiring Manager, » ; « Kind regards, » ; date au format « Ville, 21 October 2026 ».",
+      de: "Allemand standard : « Sehr geehrte Damen und Herren, » ; « Mit freundlichen Grüßen » ; date au format « Ville, 21. Oktober 2026 ».",
+    }[to];
+    return `Mission : traduire ${kind === "cv" ? "un CV" : "une lettre de motivation"} du ${LANG_NAME[from]} vers le ${LANG_NAME[to]}, pour un recruteur ${to === "nl" ? "flamand ou bruxellois" : to === "fr" ? "belge francophone" : "international"}. Poste visé : ${offer?.title || "non communiqué"}${offer?.company ? ` chez ${offer.company}` : ""}.
+
+RÈGLES
+- Conserve EXACTEMENT le balisage en début de ligne (#, >, @, =, ##, ###, -, **Libellé :**, ~), l'ordre des lignes et les lignes vides.
+- Conserve tels quels : noms propres, organisations, outils, certifications, chiffres, e-mails, téléphones, URL. Traduis les mois.
+- Titres de sections standard en ${LANG_NAME[to]} : ${Object.values(titles).join(", ")}.
+- Traduction idiomatique et professionnelle, pas littérale. Garde le ton sobre et orienté résultats ; n'ajoute aucun fait, aucun superlatif.
+- Les éléments [à compléter : …] restent entre crochets, traduits (${to === "nl" ? "[aan te vullen: …]" : to === "en" ? "[to complete: …]" : to === "de" ? "[zu ergänzen: …]" : "[à compléter : …]"}).
+- ${conv}
+
+DOCUMENT
+<<<
+${text}
+>>>
+
+Réponds uniquement {"text":"<document traduit, même balisage>"}.`;
+  },
   search(src, c, s) {
     const target = src.kind === "company"
       ? `la page carrières de l'entreprise « ${src.name} »${src.careersUrl ? ` (${src.careersUrl})` : ""}`
@@ -5376,11 +5409,28 @@ export default function RadarApp() {
     toast(`« ${term} » ajouté à vos compétences`, "ok");
   };
 
+  /* ── Traduction d'un CV ou d'une lettre : nouvelle version dans la langue cible, balisage et faits conservés ── */
+  const translateDoc = (appId, kind, from, to, srcText) => withBusy(`tr:${appId}:${kind}:${to}`, async () => {
+    const app = R.current.apps.find((a) => a.id === appId);
+    const offer = R.current.offers.find((o) => o.id === app?.offerId);
+    const src = latestDoc(app, offer, kind, from);
+    const text0 = srcText || (src ? docTextOf(app, kind, src).text : "");
+    if (!text0) throw new Error(`Aucune version ${LANG_FLAG[from]} à traduire.`);
+    const { data } = await askJSON(R.current.settings, { system: SYSTEM_BASE, prompt: P.translate(text0, kind, from, to, offer), maxTokens: 12000, tier: "balanced", effort: "low" });
+    const raw = typeof data?.text === "string" ? data.text.trim() : "";
+    if (!raw) throw new Error("Traduction vide : réessayez.");
+    const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, edits: _e, subject: _s, ...keep } = src || {};
+    const v = { ...keep, text: normalizeDoc(raw, kind, to), language: to, format: "markup", translatedFrom: from, id: uid("doc"), createdAt: nowISO(), origin: "traduction" };
+    patchApp(appId, (a) => addLogEntry({ ...a, docs: { ...a.docs, [kind]: [...(a.docs?.[kind] || []), v] } }, "doc", `${DOC_LABEL[kind]} traduit : ${LANG_FLAG[from]} → ${LANG_FLAG[to]}`));
+    return v;
+  });
+
   const saveDocVersion = (appId, type, text, subject, extra = {}) => patchApp(appId, (a) => {
     const prev = a.docs?.[type]?.slice(-1)[0];
     const { id: _i, createdAt: _c, origin: _o, instruction: _n, autoFixed: _f, edits: _e, ...keep } = prev || {};
     /* 6b / 7 : écart avec la dernière version IA (mesure des corrections manuelles, matière de l'apprentissage des règles). */
-    const base = [...(a.docs?.[type] || [])].reverse().find((x) => x.origin === "IA");
+    const lang0 = extra.language || prev?.language || a.docLanguage;
+    const base = [...(a.docs?.[type] || [])].reverse().find((x) => (x.origin === "IA" || x.origin === "traduction") && (!lang0 || (x.language || a.docLanguage) === lang0));
     const delta = base && (type === "cv" || type === "letter") ? editDelta(base.text, text) : null;
     if (delta && delta.hunks.length && !a.demo) {
       setProfile((p) => {
@@ -5670,7 +5720,7 @@ export default function RadarApp() {
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
-    media, setMedia,
+    media, setMedia, translateDoc,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
@@ -6909,7 +6959,7 @@ function SpontaneousModal({ open, onClose }) {
           <Field label="Lieu (facultatif)"><Input value={d.location} onChange={(e) => set("location", e.target.value)} placeholder="Bruxelles, Wavre…" /></Field>
           <Field label="Langue des documents">
             <Select value={d.language} onChange={(e) => set("language", e.target.value)} className="w-full">
-              <option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+              <option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option><option value="de">Allemand</option>
             </Select>
           </Field>
         </div>
@@ -7372,6 +7422,8 @@ const MSG_TYPES = DOC_TYPES.filter((d) => d.id !== "cv" && d.id !== "letter");
 function DossierPanel({ app, offer }) {
   const { generateDocs, busy, genStatus } = useApp();
   const [type, setType] = useState("linkedin");
+  const [exportOpen, setExportOpen] = useState(false);
+  const hasDocs = docLangs(app, offer, "cv").length + docLangs(app, offer, "letter").length > 0;
   const docs = app.docs || {};
   const loading = busy[`dossier:${app.id}`];
   const all = DOC_TYPES.filter((d) => docs[d.id]?.length).map((d) => {
@@ -7399,6 +7451,13 @@ function DossierPanel({ app, offer }) {
           <StudioDocCard app={app} offer={offer} type="cv" />
           <StudioDocCard app={app} offer={offer} type="letter" />
         </div>
+        {hasDocs && (
+          <div className="flex flex-wrap items-center gap-2 mt-3">
+            <Btn size="sm" icon={Languages} onClick={() => setExportOpen(true)}>Exporter le dossier</Btn>
+            <span className="text-xs opacity-70">CV + lettre · FR, NL, EN, DE · PDF ou Word · un fichier ou un ZIP</span>
+          </div>
+        )}
+        {exportOpen && <ExportModal app={app} offer={offer} onClose={() => setExportOpen(false)} />}
         {loading && genStatus[app.id] && <div className="mt-3"><GenSteps st={genStatus[app.id]} /></div>}
       </section>
       <section>
@@ -7935,6 +7994,120 @@ function SectionsFold({ sections, design, setDesign, onReorder }) {
   );
 }
 
+/* ── Export : documents × langues × formats, fichiers séparés ou fusionnés (traductions manquantes générées à la demande) ── */
+function ExportModal({ app, offer, onClose, current }) {
+  const T = useT();
+  const { settings, media, profile, translateDoc, toast } = useApp();
+  const avail = { cv: docLangs(app, offer, "cv"), letter: docLangs(app, offer, "letter") };
+  const known = DOC_LANGS.filter((l) => avail.cv.includes(l) || avail.letter.includes(l));
+  const [docs, setDocs] = useState({ cv: avail.cv.length > 0, letter: avail.letter.length > 0 });
+  const [langs, setLangs] = useState(() => (current?.lang ? [current.lang] : known.length ? known : [offer?.language || "fr"]));
+  const [format, setFormat] = useState("pdf");
+  const [group, setGroup] = useState("perLang");
+  const [order, setOrder] = useState("cvFirst");
+  const [wordMode, setWordMode] = useState("design");
+  const [run, setRun] = useState(null);
+  const kinds = (order === "cvFirst" ? ["cv", "letter"] : ["letter", "cv"]).filter((k) => docs[k]);
+  const missing = kinds.flatMap((k) => langs.filter((l) => !avail[k].includes(l)).map((l) => ({ k, l })));
+  const toTranslate = missing.filter((m) => avail[m.k].length);
+  const name = profile.name || "candidat";
+  const base = (k, ls) => `${k === "both" ? "Dossier" : k === "cv" ? "CV" : "Lettre"}_${slugFile(name)}_${slugFile(offer?.company || offer?.title)}_${ls.map((l) => LANG_FLAG[l]).join("-")}`;
+  const nFiles = (group === "merged" ? 1 : group === "perLang" ? langs.length : langs.length * kinds.length) * (format === "both" ? 2 : 1);
+  /* Texte de chaque document : ce qui est affiché dans le studio (modifications non enregistrées comprises), sinon la dernière version. */
+  const textOf = (k, l) => {
+    if (current && current.type === k && current.lang === l) return { text: current.text, accent: current.accent };
+    const v = latestDoc(app, offer, k, l);
+    return v ? docTextOf(app, k, v) : null;
+  };
+  const go = async () => {
+    try {
+      const got = {};
+      for (const { k, l } of toTranslate) {
+        const from = avail[k].includes(current?.lang) ? current.lang : avail[k].includes(app.docLanguage) ? app.docLanguage : avail[k][0];
+        setRun(`Traduction ${k === "cv" ? "du CV" : "de la lettre"} en ${LANG_NAME[l]}…`);
+        const v = await translateDoc(app.id, k, from, l, textOf(k, from)?.text);
+        if (!v) throw new Error(`traduction ${LANG_FLAG[l]} impossible`);
+        got[`${k}:${l}`] = { text: v.text, accent: v.accent };
+      }
+      setRun("Mise en page…");
+      const items = [];
+      for (const l of langs) for (const k of kinds) {
+        const t = got[`${k}:${l}`] || textOf(k, l);
+        if (t?.text) items.push({ kind: k, lang: l, text: t.text, design: designWithAccent(app, settings, t.accent), title: `${k === "cv" ? "CV" : "Lettre de motivation"} (${LANG_FLAG[l]})` });
+      }
+      if (!items.length) throw new Error("aucun document à exporter");
+      const groups = group === "merged" ? [items] : group === "perLang" ? langs.map((l) => items.filter((i) => i.lang === l)).filter((g) => g.length) : items.map((i) => [i]);
+      const kw = (app.analysis?.keywords || latestDoc(app, offer, "cv", offer?.language)?.keywords || []).map((x) => (typeof x === "string" ? x : x?.term)).filter(Boolean).slice(0, 30);
+      const photo = media?.photo || null;
+      const files = [];
+      for (const g of groups) {
+        const ks = [...new Set(g.map((i) => i.kind))];
+        const fname = base(ks.length > 1 ? "both" : ks[0], [...new Set(g.map((i) => i.lang))]);
+        const meta = { title: [ks.length > 1 ? "Dossier de candidature" : g[0].title, profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), author: profile.name, keywords: kw, subject: offer?.title };
+        if (format !== "docx") {
+          setRun(`PDF : ${fname}…`);
+          const pdf = await buildPdf(g.map((i) => ({ ...i, photo, layout: layoutDocument(designModel(i.text, i.kind), i.design, { photo, lang: i.lang }) })), meta);
+          files.push({ name: `${fname}.pdf`, data: new Uint8Array(pdf), mime: "application/pdf" });
+        }
+        if (format !== "pdf") {
+          setRun(`Word : ${fname}…`);
+          files.push({ name: `${fname}${wordMode === "ats" ? "_ATS" : ""}.docx`, data: buildDocx(g, { photo, mode: wordMode, ...meta }), mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+        }
+      }
+      setRun("Téléchargement…");
+      const out = files.length === 1 ? files[0] : { name: `${base(kinds.length > 1 ? "both" : kinds[0], langs)}.zip`, data: zipStore(files.map((f) => ({ name: f.name, data: f.data }))), mime: "application/zip" };
+      const buf = out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength);
+      const r = await saveFile(out.name, buf, out.mime);
+      if (r === "saved") { toast(files.length === 1 ? `${out.name} prêt` : `${files.length} fichiers regroupés dans ${out.name}`, "ok"); onClose(); }
+    } catch (e) {
+      toast(`Export impossible : ${e.message}`, "danger");
+    } finally { setRun(null); }
+  };
+  return (
+    <Modal open wide onClose={() => !run && onClose()} title="Exporter le dossier"
+      footer={<><Btn variant="ghost" onClick={onClose} disabled={!!run}>Annuler</Btn><Btn variant="primary" icon={FileDown} loading={!!run} disabled={!kinds.length || !langs.length || missing.length - toTranslate.length === kinds.length * langs.length} onClick={go}>{toTranslate.length ? `Traduire ${toTranslate.length} et exporter` : `Exporter (${nFiles} fichier${nFiles > 1 ? "s" : ""})`}</Btn></>}>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="space-y-5">
+          <div>
+            <div className={`text-xs mb-2 ${T.muted}`}>Documents</div>
+            <div className="flex flex-wrap gap-2">
+              {[["cv", "CV"], ["letter", "Lettre de motivation"]].map(([k, l]) => (
+                <label key={k} className={`inline-flex items-center gap-2 rounded-xl px-3 h-9 text-sm ${T.sub}`}><input type="checkbox" checked={docs[k]} disabled={!avail[k].length} onChange={(e) => setDocs({ ...docs, [k]: e.target.checked })} />{l}<span className={`text-xs ${T.faint}`}>{avail[k].map((x) => LANG_FLAG[x]).join(" ") || "—"}</span></label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className={`text-xs mb-2 ${T.muted}`}>Langues</div>
+            <div className="flex flex-wrap gap-2">
+              {DOC_LANGS.map((l) => {
+                const on = langs.includes(l);
+                const todo = kinds.some((k) => !avail[k].includes(l));
+                return (
+                  <button key={l} type="button" aria-pressed={on} onClick={() => setLangs(on ? langs.filter((x) => x !== l) : DOC_LANGS.filter((x) => x === l || langs.includes(x)))} className={`h-9 px-3 rounded-xl text-sm ${on ? T.accentSoft : T.btnSoft} ${T.ring}`}>
+                    {LANG_NAME[l]}{on && todo ? " · à traduire" : ""}
+                  </button>
+                );
+              })}
+            </div>
+            {toTranslate.length > 0 && <p className={`text-xs mt-2 ${T.muted}`}>{toTranslate.length} traduction(s) générée(s) puis enregistrée(s) comme nouvelles versions : relisez-les ensuite dans le studio.</p>}
+          </div>
+          <Seg label="Ordre" value={order} onChange={setOrder} options={[["cvFirst", "CV puis lettre"], ["letterFirst", "Lettre puis CV"]]} />
+        </div>
+        <div className="space-y-5">
+          <Seg label="Format" value={format} onChange={setFormat} options={[["pdf", "PDF"], ["docx", "Word"], ["both", "PDF + Word"]]} />
+          {format !== "pdf" && <Seg label="Word" value={wordMode} onChange={setWordMode} options={[["design", "Fidèle au design"], ["ats", "ATS 1 colonne"]]} />}
+          <Seg label="Regroupement" value={group} onChange={setGroup} options={[["perLang", "Un fichier par langue"], ["merged", "Tout en un"], ["separate", "Fichiers séparés"]]} />
+          <Notice icon={Info}>
+            {group === "merged" ? "Un seul fichier avec tous les documents, dans l'ordre choisi (signets PDF par document)." : group === "perLang" ? "Un fichier par langue réunissant CV et lettre : idéal pour un envoi bilingue." : "Un fichier par document et par langue."}
+            {nFiles > 1 ? ` ${nFiles} fichiers, livrés dans un ZIP.` : ""} PDF texte (lisible par les ATS), Word modifiable.
+          </Notice>
+          {run && <p className={`text-sm ${T.muted}`} aria-live="polite"><Loader2 className="inline w-4 h-4 mr-1 animate-spin" aria-hidden="true" />{run}</p>}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function useMedia(q) {
   const get = () => typeof window !== "undefined" && !!window.matchMedia?.(q).matches;
   const [m, setM] = useState(get);
@@ -8142,6 +8315,7 @@ const PRESETS = {
   fr: ["Profil", "Réalisations clés", "Expérience professionnelle", "Compétences", "Langues", "Formation", "Certifications", "Centres d'intérêt", "Section libre"],
   nl: ["Profiel", "Belangrijkste realisaties", "Werkervaring", "Vaardigheden", "Talen", "Opleiding", "Certificaten", "Interesses", "Vrije sectie"],
   en: ["Profile", "Key achievements", "Professional experience", "Skills", "Languages", "Education", "Certifications", "Interests", "Custom section"],
+  de: ["Profil", "Wichtigste Erfolge", "Berufserfahrung", "Kompetenzen", "Sprachen", "Ausbildung", "Zertifikate", "Interessen", "Freier Abschnitt"],
 };
 const newSection = (title, kind) => ({
   id: uid("sec"), title, kind,
@@ -8877,7 +9051,7 @@ function StudioSetup({ app, offer, type, onDone, onCancel }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Langue">
                 <Select value={prefs.language} onChange={(e) => P2("language", e.target.value)} className="w-full">
-                  <option value="auto">{spont ? "Celle choisie pour la cible" : "Celle de l'annonce"}</option><option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option>
+                  <option value="auto">{spont ? "Celle choisie pour la cible" : "Celle de l'annonce"}</option><option value="fr">Français</option><option value="nl">Néerlandais</option><option value="en">Anglais</option><option value="de">Allemand</option>
                 </Select>
               </Field>
               <Field label="Ton">
@@ -8978,7 +9152,7 @@ function DocStudio({ appId, type, setType, onClose }) {
 
 function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
   const T = useT();
-  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs, media, patchApp } = useApp();
+  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs, media, patchApp, translateDoc } = useApp();
   const wide = useMedia("(min-width: 1024px)");
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
@@ -9215,6 +9389,16 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
     }
   };
   const [exportOpen, setExportOpen] = useState(false);
+  /* Langues : bascule vers la dernière version d'une langue, ou traduction de la version affichée (nouvelle version). */
+  const langsHere = docLangs(app, offer, type);
+  const trBusy = DOC_LANGS.find((l) => busy[`tr:${app.id}:${type}:${l}`]);
+  const switchLang = async (l) => {
+    if (!l || l === lang) return;
+    if (langsHere.includes(l)) { const lv = latestDoc(app, offer, type, l); setIdx(versions.findIndex((x) => x.id === lv.id)); return; }
+    if (dirty) save();
+    const nv = await translateDoc(app.id, type, lang, l, text);
+    if (nv) toast(`Version ${LANG_FLAG[l]} prête : relisez-la avant l'envoi`, "ok");
+  };
 
   /* Raccourcis : ⌘/Ctrl+S enregistre, ⌘/Ctrl+Z hors champ annule */
   const keys = useRef({});
@@ -9251,7 +9435,12 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
     <>
       <StudioBar offer={offer} type={type} setType={(t) => { flushRef.current?.(); setType(t); }} onClose={onClose}>
         <Select value={clamp(idx, 0, versions.length - 1)} onChange={(e) => setIdx(Number(e.target.value))} aria-label="Version" className="h-8 text-xs hidden sm:block shrink-0" style={{ maxWidth: 190 }}>
-          {versions.map((x, i) => <option key={x.id} value={i}>v{i + 1} · {x.origin} · {fmtDate(x.createdAt, { time: true })}</option>)}
+          {versions.map((x, i) => <option key={x.id} value={i}>v{i + 1} · {LANG_FLAG[docLangOf(app, offer, x)] || ""} · {x.origin} · {fmtDate(x.createdAt, { time: true })}</option>)}
+        </Select>
+        <Select value={trBusy ? `tr:${trBusy}` : lang} onChange={(e) => switchLang(e.target.value)} disabled={!!trBusy} aria-label="Langue du document" className="h-8 text-xs shrink-0" style={{ maxWidth: 132 }} title="Changer de langue ou traduire">
+          {trBusy && <option value={`tr:${trBusy}`}>Traduction {LANG_FLAG[trBusy]}…</option>}
+          {DOC_LANGS.filter((l) => langsHere.includes(l) || l === lang).map((l) => <option key={l} value={l}>{LANG_FLAG[l]} · {LANG_NAME[l]}</option>)}
+          {DOC_LANGS.filter((l) => !langsHere.includes(l) && l !== lang).map((l) => <option key={l} value={l}>Traduire en {LANG_NAME[l]}…</option>)}
         </Select>
         <span className="hidden 2xl:inline-flex shrink-0 whitespace-nowrap">{dirty ? <Chip tone="warn">brouillon auto-enregistré</Chip> : <Chip tone="ok">version enregistrée</Chip>}</span>
         <div className="flex-1" />
@@ -9263,7 +9452,8 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
         <Btn size="sm" variant="ghost" icon={RefreshCw} onClick={() => setSetupOpen(true)} aria-label="Régénérer" title="Nouvelle version générée par l'IA"><span className="hidden 2xl:inline">Régénérer</span></Btn>
         <Btn size="sm" variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={save} aria-label="Enregistrer une version (⌘S)" title="Enregistrer une version (⌘S)"><span className="hidden lg:inline">Enregistrer</span></Btn>
         <Btn size="sm" icon={Download} loading={pdfBusy} onClick={downloadPdf} aria-label="Télécharger le PDF"><span className="hidden lg:inline">PDF</span></Btn>
-        <Btn size="sm" variant="ghost" icon={FileDown} onClick={downloadWord} aria-label="Télécharger en Word (.docx)" title="Word (.docx) modifiable"><span className="hidden xl:inline">Word</span></Btn>
+        <Btn size="sm" variant="ghost" icon={FileDown} onClick={downloadWord} aria-label="Télécharger en Word (.docx)" title="Word (.docx) modifiable"><span className="hidden 2xl:inline">Word</span></Btn>
+        <Btn size="sm" variant="ghost" icon={Languages} onClick={() => setExportOpen(true)} aria-label="Exporter le dossier (langues, PDF/Word, fusion)" title="CV + lettre, plusieurs langues, PDF ou Word, fichier unique ou ZIP"><span className="hidden 2xl:inline">Exporter</span></Btn>
         {wide && <button
           type="button"
           onClick={() => togglePanel("design")}
@@ -9271,7 +9461,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
           title="Design : modèles, couleurs, colonnes, marges, photo"
           className={`shrink-0 inline-flex items-center gap-1.5 h-8 rounded-xl px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${panelOpen && panelMode === "design" ? T.accentSoft : T.btnSoft} ${T.ring}`}
         >
-          <Palette className="w-3.5 h-3.5" aria-hidden="true" /><span className="hidden xl:inline">Design</span>
+          <Palette className="w-3.5 h-3.5" aria-hidden="true" /><span className="hidden 2xl:inline">Design</span>
         </button>}
         {wide && <button
           type="button"
@@ -9382,6 +9572,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
           </aside>
         )}
 
+        {exportOpen && <ExportModal app={app} offer={offer} current={{ type, lang, text, accent }} onClose={() => setExportOpen(false)} />}
         <PhotoEditor open={photoOpen} onClose={(shape) => { setPhotoOpen(false); if (shape) setDesign({ ...design, photo: { ...design.photo, show: true, shape } }); }} />
         {setupOpen && (
           <div className={`absolute inset-0 z-20 flex flex-col ${T.app}`}>
