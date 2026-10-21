@@ -5,7 +5,7 @@
  * IA : API Claude appelée depuis l'artefact (web_search + serveurs MCP Gmail / Google Calendar).
  * Principe : l'IA prépare, l'utilisateur valide. Rien n'est envoyé sans action explicite.
  */
-import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, useContext, createContext } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, useContext, createContext, useId, useDeferredValue } from "react";
 import {
   LayoutDashboard, Briefcase, Columns, Sparkles, BellRing, Users, Radio, User, ShieldCheck, Search,
   Command, Play, Loader2, Plus, X, ChevronRight, ChevronsLeft, ChevronsRight, ExternalLink, Mail,
@@ -13,6 +13,7 @@ import {
   Info, Clock, Menu, History, FileText, RefreshCw, Building2, Inbox,
   Clipboard, Wand2, Flag, HelpCircle, Eye, EyeOff, Save, Target, Gauge, ArrowRight, CheckCircle2, Linkedin, TrendingUp, Pencil, Phone, GitMerge, Undo2, MailCheck, Palette, ChevronLeft, Filter, Link2, CalendarClock, CalendarDays, Unlink,
   Maximize2, Minimize2, Redo2, ArrowUp, ArrowDown, Lightbulb, SlidersHorizontal, Circle, Minus,
+  RotateCw, Crop, Star, GripVertical, ArrowLeftRight, Image as ImageIcon, FileDown, Languages,
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, LineChart, Line, CartesianGrid, Cell } from "recharts";
 
@@ -34,7 +35,9 @@ const KEYS = {
   contacts: "radar:contacts",
   ratings: "radar:ratings",
   briefs: "radar:briefs",
+  media: "radar:media",
 };
+const DEFAULT_MEDIA = { photo: null };
 
 const STAGES = [
   { id: "new", label: "Nouvelle" },
@@ -658,28 +661,30 @@ function computeScore(rows) {
   return { value: clamp(Math.round(score), 0, 100), caps, wishAvg: wishAvg === null ? null : Math.round(wishAvg), mustAvg: mustAvg === null ? null : Math.round(mustAvg) };
 }
 
-/* ── Documents « prêts à envoyer » : balisage léger → aperçu, texte ATS et PDF ──
+/* ── Documents « prêts à envoyer » : balisage léger → modèle → mise en page ──
    # Nom · > accroche (CV) ou destinataire (lettre) · @ coordonnées · = date · ## section / objet
-   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe */
+   ### Poste | Organisation | Lieu | Période · - puce · **Libellé :** valeur · ~ signature · ligne vide = paragraphe
+   Chaque bloc garde ses lignes sources (l0, l1) : un clic dans l'aperçu édite exactement ces lignes. */
 function parseDoc(text) {
   const blocks = [];
-  let para = [];
-  const flush = () => { if (para.length) { blocks.push({ t: "para", text: para.join(" ") }); para = []; } };
-  for (const raw of String(text || "").split("\n")) {
+  let para = null;
+  const flush = () => { if (para) { blocks.push({ t: "para", text: para.lines.join(" "), l0: para.l0, l1: para.l1 }); para = null; } };
+  const push = (b, i) => { flush(); blocks.push({ ...b, l0: i, l1: i }); };
+  String(text || "").split("\n").forEach((raw, i) => {
     const l = raw.trim();
     let m;
-    if (!l) { flush(); continue; }
-    if (l.startsWith("### ")) { flush(); blocks.push({ t: "h3", text: l.slice(4) }); }
-    else if (l.startsWith("## ")) { flush(); blocks.push({ t: "h2", text: l.slice(3) }); }
-    else if (l.startsWith("# ")) { flush(); blocks.push({ t: "name", text: l.slice(2) }); }
-    else if (/^[-•*] /.test(l)) { flush(); blocks.push({ t: "bullet", text: l.slice(2) }); }
-    else if (l.startsWith("> ")) { flush(); blocks.push({ t: "quote", text: l.slice(2) }); }
-    else if (l.startsWith("@ ")) { flush(); blocks.push({ t: "contact", text: l.slice(2) }); }
-    else if (l.startsWith("= ")) { flush(); blocks.push({ t: "date", text: l.slice(2) }); }
-    else if (l.startsWith("~ ")) { flush(); blocks.push({ t: "sign", text: l.slice(2) }); }
-    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) { flush(); blocks.push({ t: "kv", label: m[1], text: m[2] }); }
-    else para.push(l);
-  }
+    if (!l) { flush(); return; }
+    if (l.startsWith("### ")) push({ t: "h3", text: l.slice(4) }, i);
+    else if (l.startsWith("## ")) push({ t: "h2", text: l.slice(3) }, i);
+    else if (l.startsWith("# ")) push({ t: "name", text: l.slice(2) }, i);
+    else if (/^[-•*] /.test(l)) push({ t: "bullet", text: l.slice(2) }, i);
+    else if (l.startsWith("> ")) push({ t: "quote", text: l.slice(2) }, i);
+    else if (l.startsWith("@ ")) push({ t: "contact", text: l.slice(2) }, i);
+    else if (l.startsWith("= ")) push({ t: "date", text: l.slice(2) }, i);
+    else if (l.startsWith("~ ")) push({ t: "sign", text: l.slice(2) }, i);
+    else if ((m = l.match(/^\*\*(.+?)\*\*\s*(.*)$/))) push({ t: "kv", label: m[1], text: m[2] }, i);
+    else { if (!para) para = { lines: [], l0: i, l1: i }; para.lines.push(l); para.l1 = i; }
+  });
   flush();
   return blocks.map((b) => ({ ...b, text: String(b.text || "").replace(/\*\*/g, ""), label: b.label && b.label.replace(/\*\*/g, "") }));
 }
@@ -696,6 +701,9 @@ function docPlainText(text) {
 const HEX = /^#?([0-9a-f]{6})$/i;
 const cleanHex = (h, fallback = "#3f3d56") => (HEX.test(String(h || "").trim()) ? `#${String(h).trim().replace("#", "").toLowerCase()}` : fallback);
 const hexRgb = (h) => { const x = cleanHex(h).slice(1); return [0, 2, 4].map((i) => parseInt(x.slice(i, i + 2), 16)); };
+const rgbHex = (r) => `#${r.map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("")}`;
+const mixHex = (a, b, t) => { const A = hexRgb(a), B = hexRgb(b); return rgbHex(A.map((v, i) => v + (B[i] - v) * t)); };
+const luminance = (h) => { const [r, g, b] = hexRgb(h).map((v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
 /* ── Document structuré : découpage du balisage, modèle d'édition, ordre de rendu ──
    Le texte balisé reste la source enregistrée (versions, PDF, copie ATS) ; l'éditeur travaille sur un modèle
    (en-tête + sections typées) reconverti en balisage à chaque frappe. */
@@ -1291,98 +1299,14 @@ function loadJsPDF() {
   }
   return jspdfPromise;
 }
+/* Les polices PDF standard couvrent le jeu Windows-1252 (€, œ, ’, “ ”, – …). Hors de ce jeu, on retire
+   les accents (Dvořák → Dvorak) au lieu de supprimer la lettre. */
+const CP1252_EXTRA = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ";
+const TRANSLIT = { "\u0141": "L", "\u0142": "l", "\u0110": "D", "\u0111": "d", "\u0131": "i", "\u2192": "->", "\u2713": "v" };
 const pdfSafe = (t) => String(t || "")
-  .replace(/[\u2018\u2019\u201A\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u2033]/g, '"')
-  .replace(/[\u2013\u2014\u2212]/g, "-").replace(/\u2026/g, "...").replace(/\u20AC/g, "EUR")
-  .replace(/\u0153/g, "oe").replace(/\u0152/g, "OE").replace(/[\u00A0\u202F\u2009]/g, " ").replace(/[\u2022\u25CF\u25AA]/g, "-")
-  .replace(/[^\x00-\xFF]/g, "");
+  .replace(/[\u00A0\u202F\u2009]/g, " ").replace(/\u2212/g, "-").replace(/\u2032/g, "'").replace(/\u2033/g, '"')
+  .replace(/[^\x00-\xFF]/g, (ch) => (CP1252_EXTRA.includes(ch) ? ch : TRANSLIT[ch] ?? ch.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^\x00-\xFF]/g, "")));
 
-async function buildDocPdf(text, { accent, kind, title, keywords, author }) {
-  const { jsPDF } = await loadJsPDF();
-  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
-  doc.setProperties({ title: pdfSafe(title), subject: kind === "cv" ? "Curriculum vitae" : "Lettre de motivation", author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).map((k) => (typeof k === "string" ? k : k?.term)).filter(Boolean).join(", ")), creator: "Radar" });
-  const A = hexRgb(accent);
-  const M = 18, W = 210 - 2 * M, BOTTOM = 297 - 16;
-  const cv = kind === "cv";
-  let y = 18;
-  const lh = (size) => size * 0.3528 * 1.38;
-  const ensure = (h) => { if (y + h > BOTTOM && y > 18) { doc.addPage(); y = 18; } };
-  const font = (size, style = "normal", color = [45, 45, 45]) => { doc.setFont("helvetica", style); doc.setFontSize(size); doc.setTextColor(...color); };
-  const nLines = (txt, size, style = "normal", indent = 0) => { font(size, style); return doc.splitTextToSize(pdfSafe(txt), W - indent).length; };
-  const write = (txt, { size = 10, style = "normal", color = [45, 45, 45], indent = 0, after = 1.4, align } = {}) => {
-    font(size, style, color);
-    const lines = doc.splitTextToSize(pdfSafe(txt), W - indent);
-    for (const line of lines) {
-      ensure(lh(size));
-      if (align === "right") doc.text(line, M + W, y + lh(size) * 0.78, { align: "right" });
-      else doc.text(line, M + indent, y + lh(size) * 0.78);
-      y += lh(size);
-    }
-    y += after;
-  };
-  /* Hauteur d'un bloc (mêmes règles que l'aperçu) : les blocs courts ne sont jamais coupés, les titres restent avec la suite. */
-  const height = (b) => {
-    if (!b) return 0;
-    if (b.t === "para") return nLines(b.text, 10) * lh(10) + (cv ? 1.8 : 3.2);
-    if (b.t === "bullet") return nLines(b.text, 10, "normal", 4.5) * lh(10) + 0.7;
-    if (b.t === "kv") return nLines(`${b.label} ${b.text}`, 10) * lh(10) + 0.9;
-    if (b.t === "h3") { const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean); return 0.8 + nLines(parts[0] || "", 10.5, "bold") * lh(10.5) + 0.2 + (parts.length > 1 ? nLines(parts.slice(1).join("  ·  "), 9) * lh(9) + 1 : 0); }
-    if (b.t === "h2") return cv ? 2.5 + lh(10.5) + 0.4 + 2.6 : 2 + nLines(b.text, 10.5, "bold") * lh(10.5) + 3;
-    return lh(10) * 2;
-  };
-  const blocks = layoutBlocks(text, kind);
-  blocks.forEach((b, i) => {
-    const h = height(b);
-    if (b.t === "h2" || b.t === "h3") ensure(h + Math.min(height(blocks[i + 1]), 50));
-    else if (["para", "bullet", "kv"].includes(b.t) && h < 50) ensure(h);
-    if (b.t === "name") write(b.text, { size: cv ? 22 : 16, style: "bold", color: A, after: 0.6 });
-    else if (b.t === "quote") {
-      if (cv) write(b.text, { size: 11, color: [70, 70, 70], after: 1.2 });
-      else write(b.text, { size: 10, after: 0.2 });
-    }
-    else if (b.t === "contact") {
-      write(b.text, { size: 9, color: [110, 110, 110], after: 1.6 });
-      doc.setDrawColor(...A); doc.setLineWidth(0.7); doc.line(M, y, M + W, y); y += 5;
-    }
-    else if (b.t === "date") { y += 2; write(b.text, { size: 10, color: [90, 90, 90], align: "right", after: 3 }); }
-    else if (b.t === "h2") {
-      if (cv) {
-        y += 2.5;
-        write(b.text.toUpperCase(), { size: 10.5, style: "bold", color: A, after: 0.4 });
-        doc.setDrawColor(215, 215, 215); doc.setLineWidth(0.25); doc.line(M, y, M + W, y); y += 2.6;
-      } else { y += 2; write(b.text, { size: 10.5, style: "bold", color: [30, 30, 30], after: 3 }); }
-    }
-    else if (b.t === "h3") {
-      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-      y += 0.8;
-      write(parts[0] || "", { size: 10.5, style: "bold", color: [25, 25, 25], after: 0.2 });
-      if (parts.length > 1) write(parts.slice(1).join("  ·  "), { size: 9, color: [115, 115, 115], after: 1 });
-    }
-    else if (b.t === "bullet") {
-      ensure(lh(10));
-      doc.setFillColor(...A); doc.circle(M + 1.3, y + lh(10) * 0.5, 0.65, "F");
-      write(b.text, { indent: 4.5, after: 0.7 });
-    }
-    else if (b.t === "kv") {
-      font(10, "bold", [30, 30, 30]);
-      const label = `${pdfSafe(b.label)} `;
-      const lw = doc.getTextWidth(label);
-      font(10);
-      const first = doc.splitTextToSize(pdfSafe(b.text), W - lw);
-      ensure(lh(10));
-      font(10, "bold", [30, 30, 30]); doc.text(label, M, y + lh(10) * 0.78);
-      font(10); doc.text(first[0] || "", M + lw, y + lh(10) * 0.78);
-      y += lh(10);
-      const rest = first.slice(1).join(" ");
-      if (rest) write(rest, { after: 0.9 }); else y += 0.9;
-    }
-    else if (b.t === "sign") { y += 4; write(b.text, { style: "bold", after: 1 }); }
-    else write(b.text, { after: cv ? 1.8 : 3.2 });
-  });
-  const pages = doc.getNumberOfPages();
-  if (pages > 1) for (let i = 1; i <= pages; i++) { doc.setPage(i); font(8, "normal", [150, 150, 150]); doc.text(`${i} / ${pages}`, M + W, 297 - 9, { align: "right" }); }
-  return doc.output("arraybuffer");
-}
 
 async function saveFile(filename, data, mime) {
   if (RT.mode === "published") {
@@ -1397,6 +1321,820 @@ async function saveFile(filename, data, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   return "saved";
 }
+
+/* ── Langues, sections, icônes ─────────────────────────────────────────── */
+const DOC_LANGS = ["fr", "nl", "en", "de"];
+const SECTION_ALIASES = {
+  profile: ["profil", "profiel", "profile", "summary", "professional summary", "résumé", "à propos", "about me", "over mij", "kurzprofil", "profil professionnel"],
+  achievements: ["réalisations clés", "réalisations", "belangrijkste realisaties", "realisaties", "key achievements", "achievements", "wichtigste erfolge", "erfolge"],
+  experience: ["expérience professionnelle", "expérience", "expériences", "parcours professionnel", "werkervaring", "beroepservaring", "ervaring", "professional experience", "work experience", "experience", "berufserfahrung", "berufliche erfahrung"],
+  skills: ["compétences", "compétences clés", "vaardigheden", "competenties", "skills", "core skills", "key skills", "kompetenzen", "kenntnisse", "fähigkeiten"],
+  languages: ["langues", "talen", "talenkennis", "languages", "sprachen", "sprachkenntnisse"],
+  education: ["formation", "formations", "études", "opleiding", "opleidingen", "education", "ausbildung", "bildung"],
+  certifications: ["certifications", "certificats", "certificaties", "certificaten", "certificates", "zertifikate", "zertifizierungen"],
+  interests: ["centres d'intérêt", "intérêts", "loisirs", "interesses", "hobby's", "interests", "hobbies", "interessen"],
+  projects: ["projets", "projets clés", "projecten", "projects", "key projects", "projekte"],
+};
+const SECTION_TITLES = {
+  fr: { profile: "Profil", achievements: "Réalisations clés", experience: "Expérience professionnelle", skills: "Compétences", languages: "Langues", education: "Formation", certifications: "Certifications", interests: "Centres d'intérêt", projects: "Projets" },
+  nl: { profile: "Profiel", achievements: "Belangrijkste realisaties", experience: "Werkervaring", skills: "Vaardigheden", languages: "Talen", education: "Opleiding", certifications: "Certificaten", interests: "Interesses", projects: "Projecten" },
+  en: { profile: "Profile", achievements: "Key achievements", experience: "Professional experience", skills: "Skills", languages: "Languages", education: "Education", certifications: "Certifications", interests: "Interests", projects: "Projects" },
+  de: { profile: "Profil", achievements: "Wichtigste Erfolge", experience: "Berufserfahrung", skills: "Kompetenzen", languages: "Sprachen", education: "Ausbildung", certifications: "Zertifikate", interests: "Interessen", projects: "Projekte" },
+};
+const ALIAS_INDEX = Object.entries(SECTION_ALIASES).flatMap(([k, l]) => l.map((a) => [normText(a), k]));
+function sectionKey(title) {
+  const n = normText(title);
+  const hit = ALIAS_INDEX.find(([a]) => a === n) || ALIAS_INDEX.find(([a]) => a.length > 5 && n.startsWith(a));
+  return hit ? hit[1] : `x_${n.replace(/\s+/g, "_").slice(0, 30) || "section"}`;
+}
+const baseKey = (k) => String(k || "").replace(/_\d+$/, "");
+const sectionLabel = (sec) => sec?.title || SECTION_TITLES.fr[baseKey(sec?.key)] || "Introduction";
+const SIDE_DEFAULT = ["skills", "languages", "certifications", "interests"];
+const PHOTO_SRC = { l0: -1, l1: -1, photo: true };
+
+/* Icônes vectorielles (24 × 24, trait), dessinées à l'identique dans l'aperçu, le PDF et le Word. */
+const DOC_ICONS = {
+  mail: ["M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M22 6l-10 7L2 6"],
+  phone: ["M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"],
+  pin: ["M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z", "M12 7a3 3 0 1 0 0 6a3 3 0 1 0 0-6z"],
+  linkedin: ["M16 8a6 6 0 0 1 6 6v7h-4v-7a2 2 0 0 0-4 0v7h-4v-7a6 6 0 0 1 6-6z", "M2 9h4v12H2z", "M4 2a2 2 0 1 0 0 4a2 2 0 1 0 0-4z"],
+  globe: ["M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20z", "M2 12h20", "M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"],
+  user: ["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 3a4 4 0 1 0 0 8a4 4 0 1 0 0-8z"],
+  award: ["M12 2a7 7 0 1 0 0 14a7 7 0 1 0 0-14z", "M8.21 13.89L7 23l5-3 5 3-1.21-9.12"],
+  briefcase: ["M4 7h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z", "M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"],
+  zap: ["M13 2L3 14h9l-1 8 10-12h-9l1-8z"],
+  chat: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
+  cap: ["M22 10L12 5 2 10l10 5 10-5z", "M6 12v5c3 3 9 3 12 0v-5"],
+  check: ["M22 11.08V12a10 10 0 1 1-5.93-9.14", "M22 4L12 14.01l-3-3"],
+  heart: ["M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"],
+  folder: ["M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"],
+};
+const SECTION_ICON = { profile: "user", achievements: "award", experience: "briefcase", skills: "zap", languages: "chat", education: "cap", certifications: "check", interests: "heart", projects: "folder" };
+const contactIcon = (s) => (/^\S+@\S+\.\S+$/.test(s) ? "mail" : /linkedin\./i.test(s) ? "linkedin" : /^\+?[\d\s().\/-]{7,}$/.test(s) ? "phone" : /^(https?:\/\/|www\.)|\.(com|be|eu|net|org|io|dev|me|lu|nl|fr)(\/\S*)?$/i.test(s) ? "globe" : "pin");
+
+/* ── Modèle de document ────────────────────────────────────────────────── */
+function designModel(text, kind) {
+  const blocks = parseDoc(text);
+  const head = { name: null, headline: [], contact: [] };
+  const letter = { date: null, recipient: [], subject: null, body: [], sign: null };
+  const sections = [];
+  const seen = {};
+  let cur = null;
+  for (const b of blocks) {
+    if (kind === "letter") {
+      if (b.t === "name" && !head.name) head.name = b;
+      else if (b.t === "contact" && !letter.body.length) head.contact.push(b);
+      else if (b.t === "date" && !letter.date) letter.date = b;
+      else if (b.t === "quote" && !letter.subject && !letter.body.length) letter.recipient.push(b);
+      else if (b.t === "h2" && !letter.subject && !letter.body.length) letter.subject = b;
+      else if (b.t === "sign") letter.sign = b;
+      else letter.body.push(b);
+      continue;
+    }
+    if (b.t === "h2") {
+      let key = sectionKey(b.text);
+      seen[key] = (seen[key] || 0) + 1;
+      if (seen[key] > 1) key = `${key}_${seen[key]}`;
+      cur = { key, title: b.text, heading: b, blocks: [] };
+      sections.push(cur);
+      continue;
+    }
+    if (!cur) {
+      if (b.t === "name" && !head.name) { head.name = b; continue; }
+      if (b.t === "quote") { head.headline.push(b); continue; }
+      if (b.t === "contact") { head.contact.push(b); continue; }
+      cur = { key: "intro", title: null, heading: null, blocks: [] };
+      sections.push(cur);
+    }
+    cur.blocks.push(b);
+  }
+  return { kind, head, sections, letter, blocks };
+}
+const contactItems = (head) => head.contact.flatMap((b) => b.text.split(/\s*[|·•]\s*/).map((s) => s.trim()).filter(Boolean).map((s) => ({ text: s, icon: contactIcon(s), src: b })));
+
+function arrangeSections(sections, layout, two) {
+  const L = layout || {};
+  const keys = sections.map((s) => s.key);
+  const order = [...(L.order || []).filter((k) => keys.includes(k)), ...keys.filter((k) => !(L.order || []).includes(k))];
+  const hidden = new Set(L.hidden || []);
+  const isSide = (k) => (Array.isArray(L.side) ? L.side.includes(k) : SIDE_DEFAULT.includes(baseKey(k)));
+  const byKey = Object.fromEntries(sections.map((s) => [s.key, s]));
+  const main = [], side = [];
+  order.forEach((k) => { if (!hidden.has(k)) (two && isSide(k) ? side : main).push(byKey[k]); });
+  return { main, side, order, hidden, isSide };
+}
+
+/* ── Design : base, gabarits ───────────────────────────────────────────── */
+const PAGE_SIZES = { a4: [210, 297], letter: [215.9, 279.4] };
+const MMPT = 0.3528; // mm par point typographique
+const FONT_CSS = { sans: 'Helvetica, Arial, "Liberation Sans", sans-serif', serif: '"Times New Roman", Times, "Liberation Serif", serif', mono: '"Courier New", Courier, "Liberation Mono", monospace' };
+const FONT_PDF = { sans: "helvetica", serif: "times", mono: "courier" };
+const FONT_DOCX = { sans: "Arial", serif: "Times New Roman", mono: "Courier New" };
+
+const DESIGN_BASE = {
+  template: "ats", page: "a4",
+  font: "sans", headingFont: "sans", size: 10, lineHeight: 1.35, nameSize: 2.3, headingSize: 1.08, headingCase: "upper", headingSpacing: 0.4,
+  margin: { t: 16, r: 17, b: 15, l: 17 }, sectionGap: 5, itemGap: 2.2, paraGap: 1.6,
+  colors: { accent: "#1f3a5f", text: "#262626", muted: "#6b6b6b", rule: "#d4d4d4", side: "#f1f5f9", sideText: "#262626", band: "#1f3a5f", bandText: "#ffffff" },
+  header: "left", headingStyle: "line", rule: 0.3, bullet: "dot",
+  icons: false, sectionIcons: false, datesRight: true, skillsAsTags: false, justify: false,
+  columns: 1, side: "left", sideWidth: 32, colGap: 7, sideFull: false,
+  photo: { show: false, shape: "circle", size: 28, border: 0, borderColor: "#ffffff" },
+  layout: { order: [], side: null, hidden: [] },
+};
+const TEMPLATES = [
+  { id: "ats", label: "Classique ATS", hint: "1 colonne, sobre, lu par tous les logiciels de tri", d: { colors: { accent: "#1f3a5f", rule: "#1f3a5f" }, rule: 0.35 } },
+  { id: "modern", label: "Moderne", hint: "2 colonnes, photo ronde, icônes", d: { columns: 2, side: "right", sideWidth: 31, header: "left", headingStyle: "bar", icons: true, photo: { show: true, shape: "circle", size: 26 }, colors: { accent: "#2563eb", side: "#f1f5f9", rule: "#e2e8f0", band: "#2563eb" } } },
+  { id: "executive", label: "Exécutif", hint: "bandeau bord à bord, titres serif", d: { header: "band", headingFont: "serif", headingStyle: "line", icons: true, nameSize: 2.4, photo: { show: true, shape: "rounded", size: 27, border: 0.8, borderColor: "#ffffff" }, colors: { accent: "#1e293b", band: "#1e293b", bandText: "#ffffff", rule: "#94a3b8" } } },
+  { id: "minimal", label: "Minimal", hint: "centré, aéré, sans filet", d: { header: "center", headingStyle: "plain", headingSpacing: 1.4, headingSize: 0.95, sectionGap: 6.5, lineHeight: 1.45, colors: { accent: "#111827", muted: "#6b7280", rule: "#e5e7eb" } } },
+  { id: "compact", label: "Compact", hint: "dense, tient sur une page", d: { columns: 2, side: "left", sideWidth: 30, size: 9.2, lineHeight: 1.25, sectionGap: 3.6, itemGap: 1.6, paraGap: 1.1, headingStyle: "pill", skillsAsTags: true, margin: { t: 12, r: 12, b: 12, l: 12 }, colors: { accent: "#0f766e", side: "#f0fdfa", rule: "#99f6e4", band: "#0f766e" } } },
+  { id: "creative", label: "Créatif", hint: "colonne colorée bord à bord, photo", d: { columns: 2, side: "left", sideWidth: 33, sideFull: true, header: "side", headingStyle: "line", icons: true, sectionIcons: true, skillsAsTags: true, photo: { show: true, shape: "circle", size: 34, border: 1, borderColor: "#ffffff" }, colors: { accent: "#0f766e", side: "#134e4a", sideText: "#f0fdfa", rule: "#5eead4", band: "#0f766e" } } },
+  { id: "elegant", label: "Élégant", hint: "serif, centré, filets doubles", d: { font: "serif", headingFont: "serif", header: "center", headingStyle: "double", headingSpacing: 1.6, headingSize: 1.0, nameSize: 2.5, lineHeight: 1.4, colors: { accent: "#7c2d12", rule: "#d6c7b8", band: "#7c2d12" } } },
+];
+const TEMPLATE_BY_ID = Object.fromEntries(TEMPLATES.map((t) => [t.id, t]));
+function mergeDesign(a, b) {
+  const o = { ...a, ...(b || {}) };
+  ["colors", "margin", "photo", "layout"].forEach((k) => { o[k] = { ...(a?.[k] || {}), ...(b?.[k] || {}) }; });
+  return o;
+}
+function designFromTemplate(id, keep) {
+  const d = mergeDesign(DESIGN_BASE, TEMPLATE_BY_ID[id]?.d);
+  d.template = TEMPLATE_BY_ID[id] ? id : "ats";
+  if (keep?.layout) d.layout = deepClone(keep.layout);
+  if (keep?.accent) d.colors = { ...d.colors, accent: keep.accent, ...(TEMPLATE_BY_ID[id]?.d?.colors?.band === TEMPLATE_BY_ID[id]?.d?.colors?.accent ? { band: keep.accent } : {}) };
+  if (keep?.photoShow !== undefined) d.photo = { ...d.photo, show: keep.photoShow };
+  if (keep?.page) d.page = keep.page;
+  return d;
+}
+/* ── Mesure du texte (canvas : Arial ≈ Helvetica, Times New Roman ≈ Times, métriques compatibles) ── */
+let measureCtx = null;
+const measureCache = new Map();
+function textWidth(s, f) {
+  const key = `${f.font}|${f.bold ? 1 : 0}|${f.italic ? 1 : 0}|${s}`;
+  let r = measureCache.get(key);
+  if (r === undefined) {
+    if (measureCtx === null && typeof document !== "undefined") { try { measureCtx = document.createElement("canvas").getContext("2d") || false; } catch { measureCtx = false; } }
+    if (measureCtx) {
+      measureCtx.font = `${f.italic ? "italic " : ""}${f.bold ? "bold " : ""}100px ${FONT_CSS[f.font] || FONT_CSS.sans}`;
+      r = measureCtx.measureText(s).width / 100;
+    } else r = s.length * (f.bold ? 0.56 : 0.52);
+    if (measureCache.size > 30000) measureCache.clear();
+    measureCache.set(key, r);
+  }
+  return r * f.size * MMPT + (f.cs ? f.cs * Math.max(0, s.length - 1) : 0);
+}
+function wrapText(s, firstW, f, restW = firstW) {
+  const words = String(s || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  const width = () => (lines.length ? restW : firstW) * 0.99;
+  for (const w of words) {
+    const t = cur ? `${cur} ${w}` : w;
+    if (textWidth(t, f) <= width()) { cur = t; continue; }
+    if (cur) { lines.push(cur); cur = ""; }
+    if (textWidth(w, f) <= width()) { cur = w; continue; }
+    let part = "";
+    for (const ch of w) {
+      if (part && textWidth(part + ch, f) > width()) { lines.push(part); part = ch; } else part += ch;
+    }
+    cur = part;
+  }
+  if (cur || !lines.length) lines.push(cur);
+  return lines;
+}
+
+/* ── Mise en page : positions en mm, pages, zones cliquables ─────────────
+   Opérations : rect, line, circle, text (ligne de base), icon, photo. Zones : blocs (l0..l1) et sections. */
+function layoutDocument(model, design, { photo, lang = "fr" } = {}) {
+  const D = mergeDesign(DESIGN_BASE, design);
+  const C = D.colors;
+  const [W, H] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
+  const M = D.margin;
+  const isCv = model.kind === "cv";
+  const two = isCv && Number(D.columns) === 2;
+  const contentW = W - M.l - M.r;
+  const sideW = two ? (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100 : 0;
+  const mainW = two ? contentW - sideW - D.colGap : contentW;
+  const sideLeft = D.side !== "right";
+  const sideX = sideLeft ? M.l : M.l + mainW + D.colGap;
+  const mainX = two && sideLeft ? M.l + sideW + D.colGap : M.l;
+  const bottom = H - Math.max(M.b, 6) - 3;
+  const sideDark = luminance(C.side) < 0.35;
+  const sideBg = two && cleanHex(C.side) !== "#ffffff";
+  const pad = sideBg && !D.sideFull ? 4 : 0;
+  const headerMode = D.header === "side" && !two ? "left" : D.header;
+  const hasPhoto = !!(photo && D.photo.show);
+  const pages = [];
+  const page = (i) => { while (pages.length <= i) pages.push({ ops: [], hits: [], secs: [], sideTop: 0, sideBottom: 0 }); return pages[i]; };
+  const lh = (size) => size * MMPT * D.lineHeight;
+  const base = (size) => (lh(size) - size * MMPT) / 2 + size * MMPT * 0.8;
+  const boxes = new Map();
+  const track = (src, p, x, y0, w, y1, kind = "block") => {
+    if (!src) return;
+    const id = kind === "section" ? `s:${src.key}:${p}` : `b:${src.l0}:${p}`;
+    const b = boxes.get(id);
+    if (b) { b.x = Math.min(b.x, x); b.y0 = Math.min(b.y0, y0); b.x1 = Math.max(b.x1, x + w); b.y1 = Math.max(b.y1, y1); }
+    else boxes.set(id, { kind, p, x, y0, x1: x + w, y1, src });
+  };
+  const caseOf = (s) => (D.headingCase === "upper" ? String(s).toLocaleUpperCase(lang === "de" ? "de-DE" : "fr-BE") : s);
+  const palette = (inSide) => ({
+    text: inSide && sideBg ? C.sideText : C.text,
+    muted: inSide && sideBg ? (sideDark ? mixHex(C.sideText, C.side, 0.28) : C.muted) : C.muted,
+    accent: inSide && sideDark ? C.sideText : C.accent,
+    rule: inSide && sideDark ? mixHex(C.sideText, C.side, 0.45) : C.rule,
+    tag: inSide && sideDark ? mixHex(C.side, "#ffffff", 0.16) : mixHex(C.accent, "#ffffff", 0.88),
+    tagText: inSide && sideDark ? C.sideText : mixHex(C.accent, "#000000", 0.15),
+  });
+
+  /* Flux de colonne : y courant, page courante, saut de page automatique. */
+  const flow = (x, w, top, inSide) => ({ x, w, y: top, p: 0, top, inSide, first: true });
+  const ensure = (fl, h) => { if (fl.y + h > bottom && fl.y > M.t + 0.5) { fl.p += 1; fl.y = M.t + (fl.inSide && pad ? pad : 0); fl.first = true; } };
+  const text = (fl, s, x, f, anchor = "start", size = f.size) => {
+    page(fl.p).ops.push({ t: "text", x, y: fl.y + base(size), s, font: f.font, bold: !!f.bold, italic: !!f.italic, size: f.size, color: f.color, anchor, cs: f.cs || 0 });
+  };
+  const lines = (fl, arr, f, { x = fl.x, w = fl.w, src, justify = false, align = "start" } = {}) => {
+    const h = lh(f.size);
+    arr.forEach((ln, i) => {
+      ensure(fl, h);
+      if (justify && i < arr.length - 1 && ln.includes(" ")) {
+        const words = ln.split(" ");
+        const gap = (w - words.reduce((n, wd) => n + textWidth(wd, f), 0)) / (words.length - 1);
+        let cx = x;
+        if (gap < textWidth(" ", f) * 3) words.forEach((wd) => { text(fl, wd, cx, f); cx += textWidth(wd, f) + gap; });
+        else text(fl, ln, x, f);
+      } else if (align === "end") text(fl, ln, x + w, f, "end");
+      else if (align === "middle") text(fl, ln, x + w / 2, f, "middle");
+      else text(fl, ln, x, f);
+      track(src, fl.p, x, fl.y, w, fl.y + h);
+      fl.y += h;
+    });
+  };
+  const icon = (p, name, x, y, s, color) => { if (DOC_ICONS[name]) page(p).ops.push({ t: "icon", name, x, y, s, color }); };
+
+  /* ── Blocs ── */
+  const bulletMark = (fl, f, cy, color) => {
+    const x = fl.x + 0.9;
+    const o = page(fl.p).ops;
+    if (D.bullet === "dot") o.push({ t: "circle", cx: x + 0.3, cy, r: 0.55, fill: color });
+    else if (D.bullet === "square") o.push({ t: "rect", x: x - 0.25, y: cy - 0.55, w: 1.1, h: 1.1, fill: color });
+    else if (D.bullet === "dash") o.push({ t: "line", x1: x - 0.4, y1: cy, x2: x + 1.2, y2: cy, color, w: 0.3 });
+    else if (D.bullet === "arrow") o.push({ t: "text", x: x - 0.4, y: cy + f.size * MMPT * 0.32, s: "›", font: f.font, bold: true, italic: false, size: f.size * 1.15, color, anchor: "start", cs: 0 });
+  };
+  const block = (fl, b, sec) => {
+    const P = palette(fl.inSide);
+    const body = { font: D.font, size: D.size, color: P.text };
+    const key = baseKey(sec?.key);
+    if (b.t === "h3") {
+      const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+      const role = parts[0] || "";
+      let rest = parts.slice(1);
+      const last = rest[rest.length - 1];
+      const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel|nu\b/i.test(last) ? last : null;
+      if (period) rest = rest.slice(0, -1);
+      const fRole = { font: D.font, bold: true, size: D.size * 1.03, color: P.text };
+      const fMeta = { font: D.font, size: D.size * 0.9, color: P.muted };
+      if (!fl.first) fl.y += D.itemGap * 0.8;
+      ensure(fl, lh(fRole.size) * 2 + lh(D.size));
+      const right = D.datesRight && period && fl.w > 60;
+      const pw = right ? textWidth(period, fMeta) + 3 : 0;
+      const rl = wrapText(role, fl.w - pw, fRole);
+      if (right) {
+        ensure(fl, lh(fRole.size));
+        page(fl.p).ops.push({ t: "text", x: fl.x + fl.w, y: fl.y + base(fRole.size), s: period, font: fMeta.font, bold: false, italic: false, size: fMeta.size, color: P.muted, anchor: "end", cs: 0 });
+      }
+      lines(fl, rl, fRole, { src: b, w: fl.w });
+      const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
+      if (meta) lines(fl, wrapText(meta, fl.w, fMeta), fMeta, { src: b });
+      fl.y += 0.6;
+    } else if (b.t === "bullet") {
+      const ind = D.bullet === "none" ? 0 : 3.6;
+      const arr = wrapText(b.text, fl.w - ind, body);
+      ensure(fl, lh(D.size));
+      if (D.bullet !== "none") bulletMark(fl, body, fl.y + lh(D.size) / 2, P.accent);
+      lines(fl, arr, body, { x: fl.x + ind, w: fl.w - ind, src: b });
+      track(b, fl.p, fl.x, fl.y - lh(D.size), ind, fl.y);
+      fl.y += D.itemGap * 0.25;
+    } else if (b.t === "kv") {
+      const fL = { ...body, bold: true };
+      if (D.skillsAsTags && key === "skills") {
+        const fT = { font: D.font, size: D.size * 0.86, color: P.tagText };
+        if (b.label) { lines(fl, wrapText(b.label.replace(/\s*:\s*$/, ""), fl.w, { ...fL, size: D.size * 0.92, color: P.muted }), { ...fL, size: D.size * 0.92, color: P.muted }, { src: b }); fl.y += 0.4; }
+        const tags = b.text.split(/\s*[,;·]\s*/).filter(Boolean);
+        const th = lh(fT.size) + 0.9;
+        let cx = fl.x;
+        ensure(fl, th + 1);
+        tags.forEach((tg) => {
+          const tw = Math.min(textWidth(tg, fT) + 3.4, fl.w);
+          if (cx > fl.x && cx + tw > fl.x + fl.w) { cx = fl.x; fl.y += th + 1.1; ensure(fl, th + 1); }
+          page(fl.p).ops.push({ t: "rect", x: cx, y: fl.y, w: tw, h: th, fill: P.tag, r: 1.2 });
+          page(fl.p).ops.push({ t: "text", x: cx + 1.7, y: fl.y + 0.45 + base(fT.size), s: tg, font: fT.font, bold: false, italic: false, size: fT.size, color: fT.color, anchor: "start", cs: 0 });
+          track(b, fl.p, cx, fl.y, tw, fl.y + th);
+          cx += tw + 1.3;
+        });
+        fl.y += th + 1.6;
+      } else {
+        const label = `${b.label} `;
+        const lw = textWidth(label, fL);
+        const arr = wrapText(b.text, Math.max(10, fl.w - lw), body, fl.w);
+        ensure(fl, lh(D.size));
+        text(fl, label.trim(), fl.x, fL);
+        lines(fl, arr.slice(0, 1), body, { x: fl.x + lw, w: fl.w - lw, src: b });
+        track(b, fl.p, fl.x, fl.y - lh(D.size), lw, fl.y);
+        if (arr.length > 1) lines(fl, arr.slice(1), body, { src: b });
+        fl.y += D.itemGap * 0.3;
+      }
+    } else if (b.t === "quote") {
+      const f = { ...body, italic: true, color: P.muted };
+      lines(fl, wrapText(b.text, fl.w, f), f, { src: b });
+      fl.y += D.paraGap;
+    } else {
+      lines(fl, wrapText(b.text, fl.w, body), body, { src: b, justify: !isCv && D.justify });
+      fl.y += isCv ? D.paraGap : Math.max(D.paraGap * 1.8, 3);
+    }
+    fl.first = false;
+  };
+
+  const heading = (fl, sec) => {
+    const P = palette(fl.inSide);
+    const f = { font: D.headingFont, bold: true, size: D.size * D.headingSize, color: P.accent, cs: D.headingCase === "upper" ? D.headingSpacing * MMPT : 0 };
+    const hh = lh(f.size);
+    ensure(fl, hh + 4 + lh(D.size) * 2);
+    const o = () => page(fl.p).ops;
+    const y0 = fl.y;
+    let x = fl.x;
+    const label = caseOf(sectionLabel(sec));
+    if (D.headingStyle === "double" && D.rule > 0) { o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: P.rule, w: D.rule }); fl.y += 1.4; }
+    if (D.headingStyle === "pill") { o().push({ t: "rect", x: fl.x, y: fl.y - 0.3, w: fl.w, h: hh + 0.6, fill: P.tag, r: 1.4 }); x += 2.2; }
+    if (D.headingStyle === "bar") { o().push({ t: "rect", x: fl.x, y: fl.y + hh * 0.18, w: 1.2, h: hh * 0.64, fill: P.accent, r: 0.3 }); x += 3.4; }
+    const icName = D.sectionIcons && SECTION_ICON[baseKey(sec.key)];
+    if (icName) { const s = f.size * MMPT * 1.15; icon(fl.p, icName, x, fl.y + (hh - s) / 2, s, P.accent); x += s + 1.8; }
+    const ls = wrapText(label, fl.x + fl.w - x, f);
+    const center = D.headingStyle !== "pill" && D.headingStyle !== "bar" && D.header === "center" && !two && !icName;
+    ls.forEach((ln) => { center ? text(fl, ln, fl.x + fl.w / 2, f, "middle") : text(fl, ln, x, f); fl.y += hh; });
+    if ((D.headingStyle === "line" || D.headingStyle === "double") && D.rule > 0) { fl.y += 0.9; o().push({ t: "line", x1: fl.x, y1: fl.y, x2: fl.x + fl.w, y2: fl.y, color: D.headingStyle === "line" ? P.rule : P.rule, w: D.rule }); fl.y += D.rule; }
+    fl.y += D.headingStyle === "plain" ? 1.2 : 2;
+    if (sec.heading) track(sec.heading, fl.p, fl.x, y0, fl.w, fl.y);
+    fl.first = true;
+  };
+  const section = (fl, sec) => {
+    if (!sec) return;
+    if (!fl.firstSection) fl.y += D.sectionGap; else fl.firstSection = false;
+    const p0 = fl.p, y0 = fl.y;
+    if (sec.heading) heading(fl, sec);
+    sec.blocks.forEach((b) => block(fl, b, sec));
+    for (let p = p0; p <= fl.p; p++) track(sec, p, fl.x, p === p0 ? y0 : M.t, fl.w, p === fl.p ? fl.y : bottom, "section");
+    page(fl.p).secs.push(sec.key);
+  };
+
+  /* ── En-tête ── */
+  const header = (x, w, y, mode, inSide) => {
+    const fl = { x, w, y, p: 0, inSide, first: true };
+    const P = palette(inSide);
+    const band = mode === "band";
+    const nameColor = band ? C.bandText : P.accent;
+    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : P.muted;
+    const center = mode === "center" || mode === "side";
+    const S = D.photo.size;
+    let tx = x, tw = w;
+    const y0 = y;
+    if (hasPhoto) {
+      if (center) { page(0).ops.push({ t: "photo", x: x + (w - S) / 2, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); fl.y += S + 4; }
+      else { page(0).ops.push({ t: "photo", x, y: fl.y, s: S, shape: D.photo.shape, border: D.photo.border, borderColor: D.photo.borderColor }); tx = x + S + 6; tw = w - S - 6; }
+      track(PHOTO_SRC, 0, center ? x + (w - S) / 2 : x, center ? fl.y - S - 4 : fl.y, S, center ? fl.y - 4 : fl.y + S);
+    }
+    const opStart = page(0).ops.length;
+    const al = center ? "middle" : "start";
+    const ax = center ? tx + tw / 2 : tx;
+    const put = (arr, f, src) => arr.forEach((ln) => { text(fl, ln, ax, f, al); track(src, 0, tx, fl.y, tw, fl.y + lh(f.size)); fl.y += lh(f.size); });
+    if (model.head.name) {
+      const f = { font: D.headingFont, bold: true, size: D.size * D.nameSize, color: nameColor };
+      put(wrapText(model.head.name.text, tw, f), f, model.head.name);
+    }
+    model.head.headline.forEach((hb) => { const f = { font: D.font, size: D.size * 1.12, color: subColor }; fl.y += 0.6; put(wrapText(hb.text, tw, f), f, hb); });
+    const items = contactItems(model.head);
+    if (items.length) {
+      fl.y += 1.6;
+      const f = { font: D.font, size: D.size * 0.88, color: band ? subColor : P.muted };
+      const is = D.icons ? f.size * MMPT * 1.15 : 0;
+      const sep = D.icons ? 4 : textWidth("  ·  ", f);
+      const h = lh(f.size) + 0.4;
+      if (inSide) {
+        items.forEach((it) => {
+          const iw = textWidth(it.text, f);
+          const cw = Math.min(tw, iw + (is ? is + 1.4 : 0));
+          const cx = tx + (tw - cw) / 2;
+          if (is) icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent);
+          const arr = wrapText(it.text, tw - (is ? is + 1.4 : 0), f);
+          arr.forEach((ln, i) => { text(fl, ln, is ? cx + is + 1.4 : tx + tw / 2, f, is ? "start" : "middle"); if (i < arr.length - 1) fl.y += lh(f.size); });
+          track(it.src, 0, tx, fl.y, tw, fl.y + h);
+          fl.y += h;
+        });
+      } else {
+        const rows = [[]];
+        let rw = 0;
+        items.forEach((it) => {
+          const iw = Math.min(textWidth(it.text, f), tw) + (is ? is + 1.2 : 0);
+          if (rows[rows.length - 1].length && rw + sep + iw > tw) { rows.push([]); rw = 0; }
+          rows[rows.length - 1].push({ ...it, iw });
+          rw += (rw ? sep : 0) + iw;
+        });
+        rows.forEach((row) => {
+          const total = row.reduce((n, it, i) => n + it.iw + (i ? sep : 0), 0);
+          let cx = center ? tx + (tw - total) / 2 : tx;
+          row.forEach((it, i) => {
+            if (i && !D.icons) text(fl, "·", cx + sep / 2, { ...f, bold: true }, "middle");
+            if (i) cx += sep;
+            if (is) { icon(0, it.icon, cx, fl.y + (h - is) / 2, is, band ? C.bandText : P.accent); }
+            text(fl, it.text, cx + (is ? is + 1.2 : 0), f);
+            track(it.src, 0, cx, fl.y, it.iw, fl.y + h);
+            cx += it.iw;
+          });
+          fl.y += h;
+        });
+      }
+    }
+    // Texte centré verticalement sur la photo quand celle-ci est plus haute.
+    if (hasPhoto && !center && fl.y - y0 < S) {
+      const dy = (S - (fl.y - y0)) / 2;
+      page(0).ops.slice(opStart).forEach((o) => { o.y += dy; });
+      const heads = new Set([model.head.name, ...model.head.headline, ...model.head.contact].filter(Boolean));
+      boxes.forEach((b) => { if (b.p === 0 && heads.has(b.src)) { b.y0 += dy; b.y1 += dy; } });
+    }
+    return Math.max(fl.y, hasPhoto && !center ? y0 + S : 0);
+  };
+
+  /* ── Assemblage ── */
+  let mainTop = M.t, sideTop = M.t;
+  if (headerMode === "band") {
+    page(0);
+    const bandIdx = pages[0].ops.length;
+    const end = header(M.l, contentW, Math.max(M.t * 0.75, 8), "band", false);
+    const bh = end + Math.max(M.t * 0.6, 6);
+    pages[0].ops.splice(bandIdx, 0, { t: "rect", x: 0, y: 0, w: W, h: bh, fill: C.band });
+    mainTop = sideTop = bh + Math.max(D.sectionGap, 5);
+  } else if (headerMode === "side" && two) {
+    sideTop = header(sideX + pad, sideW - 2 * pad, M.t + pad, "side", true) + D.sectionGap + 1;
+    mainTop = M.t;
+  } else if (isCv || model.head.name || model.head.contact.length) {
+    const end = header(M.l, contentW, M.t, headerMode === "center" ? "center" : "left", false);
+    const rule = headerMode !== "center" && D.headingStyle !== "plain" && D.rule > 0;
+    if (rule) pages[0].ops.push({ t: "line", x1: M.l, y1: end + 2.2, x2: M.l + contentW, y2: end + 2.2, color: C.accent, w: Math.max(D.rule, 0.5) });
+    mainTop = sideTop = end + (rule ? 2.2 + D.sectionGap + 0.6 : D.sectionGap + 1);
+  }
+
+  if (isCv) {
+    const arr = arrangeSections(model.sections, D.layout, two);
+    const main = flow(mainX, mainW, mainTop, false);
+    main.firstSection = true;
+    arr.main.forEach((sec) => section(main, sec));
+    if (two) {
+      const side = flow(sideX + pad, sideW - 2 * pad, sideTop + (headerMode === "side" ? 0 : pad), true);
+      side.firstSection = true;
+      arr.side.forEach((sec) => section(side, sec));
+      page(side.p);
+      pages.forEach((pg, i) => {
+        const top = i === 0 ? (headerMode === "side" ? 0 : headerMode === "band" ? mainTop - Math.max(D.sectionGap, 5) : (D.sideFull ? sideTop - D.sectionGap * 0.5 : sideTop)) : 0;
+        if (!sideBg) return;
+        const rect = D.sideFull
+          ? { x: sideLeft ? 0 : sideX - D.colGap / 2, y: top, w: sideLeft ? sideX + sideW + D.colGap / 2 : W - (sideX - D.colGap / 2), h: H - top }
+          : { x: sideX, y: i === 0 && headerMode !== "side" ? sideTop : M.t, w: sideW, h: (i === side.p ? side.y + pad : bottom) - (i === 0 && headerMode !== "side" ? sideTop : M.t), r: 2.5 };
+        if (rect.h > 0) pg.ops.unshift({ t: "rect", ...rect, fill: C.side });
+      });
+    }
+    page(main.p);
+  } else {
+    const L = model.letter;
+    const fl = flow(M.l, contentW, mainTop + 2, false);
+    const body = { font: D.font, size: D.size, color: C.text };
+    if (L.date) { lines(fl, [L.date.text], { ...body, color: C.muted }, { align: "end", src: L.date }); fl.y += 3; }
+    L.recipient.forEach((r) => lines(fl, wrapText(r.text, contentW * 0.6, body), body, { src: r }));
+    if (L.recipient.length) fl.y += 5;
+    if (L.subject) { const f = { ...body, bold: true }; lines(fl, wrapText(L.subject.text, contentW, f), f, { src: L.subject }); fl.y += 4; }
+    L.body.forEach((b) => block(fl, b, null));
+    if (L.sign) { fl.y += 3; const f = { ...body, bold: true }; lines(fl, wrapText(L.sign.text, contentW, f), f, { src: L.sign }); }
+    page(fl.p);
+  }
+
+  /* Numéros de page, zones cliquables */
+  if (pages.length > 1) pages.forEach((pg, i) => pg.ops.push({ t: "text", x: W - Math.max(M.r, 8), y: H - Math.max(M.b * 0.45, 4), s: `${i + 1} / ${pages.length}`, font: D.font, bold: false, italic: false, size: 7.5, color: C.muted, anchor: "end", cs: 0 }));
+  boxes.forEach((b) => page(b.p).hits.push({ kind: b.kind, x: b.x - 0.8, y: b.y0 - 0.4, w: b.x1 - b.x + 1.6, h: b.y1 - b.y0 + 0.8, src: b.src }));
+  return { W, H, pages, design: D, two };
+}
+
+/* ── Rendu PDF vectoriel (jsPDF) ───────────────────────────────────────── */
+const iconPngCache = new Map();
+function iconPng(name, color, px = 96) {
+  const key = `${name}|${color}|${px}`;
+  if (iconPngCache.has(key)) return iconPngCache.get(key);
+  const c = document.createElement("canvas");
+  c.width = c.height = px;
+  const ctx = c.getContext("2d");
+  ctx.scale(px / 24, px / 24);
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  (DOC_ICONS[name] || []).forEach((d) => ctx.stroke(new Path2D(d)));
+  const url = c.toDataURL("image/png");
+  iconPngCache.set(key, url);
+  return url;
+}
+const hexPoints = (x, y, s) => [[x + s / 2, y], [x + s, y + s * 0.25], [x + s, y + s * 0.75], [x + s / 2, y + s], [x, y + s * 0.75], [x, y + s * 0.25]];
+function pdfShape(pdf, o, style) {
+  if (o.shape === "circle") pdf.circle(o.x + o.s / 2, o.y + o.s / 2, o.s / 2, style);
+  else if (o.shape === "rounded") pdf.roundedRect(o.x, o.y, o.s, o.s, o.s * 0.18, o.s * 0.18, style);
+  else if (o.shape === "hexagon") {
+    const pts = hexPoints(o.x, o.y, o.s);
+    pdf.lines(pts.slice(1).map((p, i) => [p[0] - pts[i][0], p[1] - pts[i][1]]), pts[0][0], pts[0][1], [1, 1], style, true);
+  } else pdf.rect(o.x, o.y, o.s, o.s, style);
+}
+function drawPdfPage(pdf, pg, { photo }) {
+  for (const o of pg.ops) {
+    if (o.t === "rect") {
+      pdf.setFillColor(...hexRgb(o.fill));
+      if (o.r) pdf.roundedRect(o.x, o.y, o.w, o.h, o.r, o.r, "F"); else pdf.rect(o.x, o.y, o.w, o.h, "F");
+    } else if (o.t === "circle") { pdf.setFillColor(...hexRgb(o.fill)); pdf.circle(o.cx, o.cy, o.r, "F"); }
+    else if (o.t === "line") { pdf.setDrawColor(...hexRgb(o.color)); pdf.setLineWidth(o.w); pdf.line(o.x1, o.y1, o.x2, o.y2); }
+    else if (o.t === "text") {
+      pdf.setFont(FONT_PDF[o.font] || "helvetica", o.bold && o.italic ? "bolditalic" : o.bold ? "bold" : o.italic ? "italic" : "normal");
+      pdf.setFontSize(o.size);
+      pdf.setTextColor(...hexRgb(o.color));
+      const opt = {};
+      if (o.anchor === "end") opt.align = "right"; else if (o.anchor === "middle") opt.align = "center";
+      if (o.cs) opt.charSpace = o.cs;
+      pdf.text(pdfSafe(o.s), o.x, o.y, opt);
+    } else if (o.t === "icon") {
+      try { pdf.addImage(iconPng(o.name, o.color), "PNG", o.x, o.y, o.s, o.s, `ic_${o.name}_${o.color.slice(1)}`, "FAST"); } catch { /* icône facultative */ }
+    } else if (o.t === "photo" && photo?.src) {
+      pdf.saveGraphicsState();
+      pdfShape(pdf, o, null);
+      pdf.clip();
+      pdf.discardPath();
+      pdf.addImage(photo.src, "JPEG", o.x, o.y, o.s, o.s, "photo", "FAST");
+      pdf.restoreGraphicsState();
+      if (o.border > 0) { pdf.setDrawColor(...hexRgb(o.borderColor)); pdf.setLineWidth(o.border); pdfShape(pdf, o, "S"); }
+    }
+  }
+}
+async function buildPdf(items, { title, author, keywords, subject } = {}) {
+  const { jsPDF } = await loadJsPDF();
+  const first = items[0].layout;
+  const pdf = new jsPDF({ unit: "mm", format: [first.W, first.H], compress: true });
+  let n = 0;
+  for (const it of items) {
+    const start = n + 1;
+    it.layout.pages.forEach((pg) => { if (n > 0) pdf.addPage([it.layout.W, it.layout.H]); n += 1; drawPdfPage(pdf, pg, it); });
+    if (items.length > 1) { try { pdf.outline.add(null, pdfSafe(it.title), { pageNumber: start }); } catch { /* signets facultatifs */ } }
+  }
+  pdf.setProperties({ title: pdfSafe(title), subject: pdfSafe(subject || ""), author: pdfSafe(author || ""), keywords: pdfSafe((keywords || []).join(", ")), creator: "Radar" });
+  return pdf.output("arraybuffer");
+}
+
+/* ── ZIP (méthode « stockée », sans compression) : sert au .docx et aux exports groupés ── */
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+const toBytes = (d) => (typeof d === "string" ? new TextEncoder().encode(d) : d instanceof Uint8Array ? d : new Uint8Array(d));
+function zipStore(files) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const time = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff;
+  const date = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const data = toBytes(f.data);
+    const crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]]
+      .forEach(([o, v, s]) => (s === 4 ? lh.setUint32(o, v, true) : lh.setUint16(o, v, true)));
+    parts.push(new Uint8Array(lh.buffer), name, data);
+    const ch = new DataView(new ArrayBuffer(46));
+    [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [30, 0, 2], [32, 0, 2], [34, 0, 2], [36, 0, 2], [38, 0, 4], [42, offset, 4]]
+      .forEach(([o, v, s]) => (s === 4 ? ch.setUint32(o, v, true) : ch.setUint16(o, v, true)));
+    central.push(new Uint8Array(ch.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, p) => n + p.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  all.forEach((p) => { out.set(p, o); o += p.length; });
+  return out;
+}
+const dataUrlBytes = (u) => { const b = atob(String(u).split(",")[1] || ""); const a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+
+/* ── Word (.docx) natif : styles Titre 1 / Titre 2 (lus par les ATS), colonnes en tableau, photo en forme native ── */
+const TW = 56.6929; // twips par mm
+const EMU = 36000; // EMU par mm
+const xmlEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const hexW = (h) => cleanHex(h).slice(1).toUpperCase();
+const DOCX_LANG = { fr: "fr-BE", nl: "nl-BE", en: "en-GB", de: "de-DE" };
+function buildDocx(items, { photo, title, author, keywords, mode = "design" } = {}) {
+  const media = [];
+  let drawId = 1;
+  const rels = [];
+  const mediaRel = (key, name, bytes) => {
+    let m = media.find((x) => x.key === key);
+    if (!m) { m = { key, name, bytes, rid: `rIdM${media.length + 1}` }; media.push(m); rels.push(`<Relationship Id="${m.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${name}"/>`); }
+    return m.rid;
+  };
+  const drawing = (rid, wmm, hmm, prst = "rect", ln) => {
+    const id = drawId++;
+    const cx = Math.round(wmm * EMU), cy = Math.round(hmm * EMU);
+    const line = ln ? `<a:ln w="${Math.round(ln.w * EMU)}"><a:solidFill><a:srgbClr val="${hexW(ln.color)}"/></a:solidFill></a:ln>` : "";
+    return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${id}" name="Image ${id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="${id}" name="img${id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="${prst}"><a:avLst/></a:prstGeom>${line}</pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+  };
+  const body = [];
+  let sect = null;
+  items.forEach((it, idx) => {
+    const D = mergeDesign(DESIGN_BASE, it.design);
+    const C = D.colors;
+    const lang = DOCX_LANG[it.lang] || "fr-BE";
+    const fBody = FONT_DOCX[D.font], fHead = FONT_DOCX[D.headingFont];
+    const [W] = PAGE_SIZES[D.page] || PAGE_SIZES.a4;
+    const contentW = W - D.margin.l - D.margin.r;
+    const ats = mode === "ats";
+    const two = !ats && it.kind === "cv" && Number(D.columns) === 2;
+    if (!sect) sect = D;
+    const run = (t, o = {}) => `<w:r><w:rPr><w:rFonts w:ascii="${o.font || fBody}" w:hAnsi="${o.font || fBody}" w:cs="${o.font || fBody}"/>${o.bold ? "<w:b/>" : ""}${o.italic ? "<w:i/>" : ""}${o.caps ? "<w:caps/>" : ""}<w:color w:val="${hexW(o.color || C.text)}"/>${o.cs ? `<w:spacing w:val="${Math.round(o.cs * 20)}"/>` : ""}<w:sz w:val="${Math.round((o.size || D.size) * 2)}"/><w:szCs w:val="${Math.round((o.size || D.size) * 2)}"/><w:lang w:val="${lang}"/></w:rPr><w:t xml:space="preserve">${xmlEsc(t)}</w:t></w:r>`;
+    const tab = (o = {}) => `<w:r><w:rPr><w:sz w:val="${Math.round((o.size || D.size) * 2)}"/></w:rPr><w:tab/></w:r>`;
+    const p = (runs, o = {}) => {
+      const sp = `<w:spacing w:before="${Math.round((o.before || 0) * TW)}" w:after="${Math.round((o.after ?? 0) * TW)}" w:line="${Math.round(240 * (o.line || D.lineHeight) * 0.86)}" w:lineRule="auto"/>`;
+      const bdr = o.border || "";
+      return `<w:p><w:pPr>${o.style ? `<w:pStyle w:val="${o.style}"/>` : ""}${o.keepNext ? "<w:keepNext/>" : ""}${bdr}${o.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(o.shade)}"/>` : ""}${o.tabs || ""}${sp}${o.ind ? `<w:ind w:left="${Math.round(o.ind.left * TW)}" w:hanging="${Math.round((o.ind.hanging || 0) * TW)}"/>` : ""}${o.align ? `<w:jc w:val="${o.align}"/>` : ""}</w:pPr>${runs}</w:p>`;
+    };
+    const colors = (inSide) => {
+      const dark = luminance(C.side) < 0.35;
+      return { text: inSide && two ? C.sideText : C.text, muted: inSide && two && dark ? mixHex(C.sideText, C.side, 0.28) : C.muted, accent: inSide && two && dark ? C.sideText : C.accent, rule: inSide && two && dark ? mixHex(C.sideText, C.side, 0.45) : C.rule };
+    };
+    const sectionXml = (sec, inSide, colW) => {
+      const K = colors(inSide);
+      const out = [];
+      if (sec.heading) {
+        const rulePt = Math.max(2, Math.round((D.rule / MMPT) * 8));
+        const bd = ats ? "" : D.headingStyle === "line" && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
+          : D.headingStyle === "double" && D.rule > 0 ? `<w:pBdr><w:top w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/><w:bottom w:val="single" w:sz="${rulePt}" w:space="2" w:color="${hexW(K.rule)}"/></w:pBdr>`
+          : D.headingStyle === "bar" ? `<w:pBdr><w:left w:val="single" w:sz="24" w:space="6" w:color="${hexW(K.accent)}"/></w:pBdr>` : "";
+        out.push(p(run(sectionLabel(sec), { font: fHead, bold: true, caps: D.headingCase === "upper", cs: D.headingCase === "upper" ? D.headingSpacing : 0, size: D.size * D.headingSize, color: K.accent }), { style: "Heading1", keepNext: true, before: D.sectionGap, after: 1.6, border: bd, shade: !ats && D.headingStyle === "pill" ? mixHex(C.accent, "#ffffff", 0.88) : null }));
+      }
+      sec.blocks.forEach((b) => {
+        if (b.t === "h3") {
+          const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
+          let rest = parts.slice(1);
+          const last = rest[rest.length - 1];
+          const period = last && /\d{4}|aujourd|présent|present|heden|heute|actuel/i.test(last) ? last : null;
+          if (period) rest = rest.slice(0, -1);
+          const right = D.datesRight && period && colW > 60;
+          out.push(p(run(parts[0] || "", { bold: true, size: D.size * 1.03, color: K.text }) + (right ? tab() + run(period, { size: D.size * 0.9, color: K.muted }) : ""), { style: "Heading2", keepNext: true, before: D.itemGap * 0.8, tabs: right ? `<w:tabs><w:tab w:val="right" w:pos="${Math.round(colW * TW)}"/></w:tabs>` : "" }));
+          const meta = [...rest, ...(right ? [] : period ? [period] : [])].join("  ·  ");
+          if (meta) out.push(p(run(meta, { size: D.size * 0.9, color: K.muted }), { after: 0.6 }));
+        } else if (b.t === "bullet") {
+          const mark = { dot: "•", square: "▪", dash: "–", arrow: "›", none: "" }[D.bullet] ?? "•";
+          out.push(p((mark ? run(mark, { color: K.accent }) + tab() : "") + run(b.text, { color: K.text }), { ind: mark ? { left: 3.6, hanging: 3.6 } : null, after: 0.4 }));
+        } else if (b.t === "kv") {
+          out.push(p(run(`${b.label} `, { bold: true, color: K.text }) + run(b.text, { color: K.text }), { after: 0.5 }));
+        } else if (b.t === "quote") out.push(p(run(b.text, { italic: true, color: K.muted }), { after: D.paraGap }));
+        else out.push(p(run(b.text, { color: K.text }), { after: D.paraGap }));
+      });
+      return out.join("");
+    };
+    const m = designModel(it.text, it.kind);
+    const showPhoto = !ats && photo?.src && D.photo.show;
+    const prst = { circle: "ellipse", rounded: "roundRect", hexagon: "hexagon", square: "rect" }[D.photo.shape] || "rect";
+    const photoRun = showPhoto ? drawing(mediaRel("photo", "photo.jpg", dataUrlBytes(photo.src)), D.photo.size, D.photo.size, prst, D.photo.border > 0 ? { w: D.photo.border, color: D.photo.borderColor } : null) : "";
+    const band = !ats && D.header === "band";
+    const center = D.header === "center" || (D.header === "side" && !two);
+    const nameColor = band ? C.bandText : C.accent;
+    const subColor = band ? mixHex(C.bandText, C.band, 0.22) : C.muted;
+    const headParas = (align, inSide) => {
+      const out = [];
+      const K = colors(inSide);
+      if (m.head.name) out.push(p(run(m.head.name.text, { font: fHead, bold: true, size: D.size * D.nameSize, color: inSide ? K.accent : nameColor }), { style: "Title", align, after: 0.6, line: 1.05 }));
+      m.head.headline.forEach((h) => out.push(p(run(h.text, { size: D.size * 1.12, color: inSide ? K.muted : subColor }), { align, after: 0.6 })));
+      const items = contactItems(m.head);
+      if (items.length) {
+        const col = inSide ? K.muted : band ? subColor : C.muted;
+        const icCol = inSide ? K.accent : band ? C.bandText : C.accent;
+        const runs = items.map((x, i) => {
+          const ic = !ats && D.icons ? drawing(mediaRel(`ic_${x.icon}_${icCol}`, `ic_${x.icon}_${hexW(icCol)}.png`, dataUrlBytes(iconPng(x.icon, icCol))), D.size * 0.88 * MMPT * 1.15, D.size * 0.88 * MMPT * 1.15) + run(" ", { size: D.size * 0.88 }) : "";
+          return (inSide ? "" : i ? run(D.icons && !ats ? "     " : "  ·  ", { size: D.size * 0.88, color: col }) : "") + ic + run(x.text, { size: D.size * 0.88, color: col });
+        });
+        if (inSide) runs.forEach((r) => out.push(p(r, { align, after: 0.5 })));
+        else out.push(p(runs.join(""), { align, before: 1.2, after: 0.4 }));
+      }
+      return out.join("");
+    };
+    const tbl = (cells, { indent = 0, width } = {}) => {
+      const total = width || contentW;
+      return `<w:tbl><w:tblPr><w:tblW w:w="${Math.round(total * TW)}" w:type="dxa"/>${indent ? `<w:tblInd w:w="${Math.round(indent * TW)}" w:type="dxa"/>` : ""}<w:tblBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/><w:insideH w:val="nil"/><w:insideV w:val="nil"/></w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${cells.map((c) => `<w:gridCol w:w="${Math.round(c.w * TW)}"/>`).join("")}</w:tblGrid><w:tr>${cells.map((c) => `<w:tc><w:tcPr><w:tcW w:w="${Math.round(c.w * TW)}" w:type="dxa"/>${c.shade ? `<w:shd w:val="clear" w:color="auto" w:fill="${hexW(c.shade)}"/>` : ""}<w:tcMar><w:top w:w="${Math.round((c.pad?.[0] || 0) * TW)}" w:type="dxa"/><w:left w:w="${Math.round((c.pad?.[1] || 0) * TW)}" w:type="dxa"/><w:bottom w:w="${Math.round((c.pad?.[2] || 0) * TW)}" w:type="dxa"/><w:right w:w="${Math.round((c.pad?.[3] || 0) * TW)}" w:type="dxa"/></w:tcMar><w:vAlign w:val="${c.valign || "top"}"/></w:tcPr>${c.xml || p("")}</w:tc>`).join("")}</w:tr></w:tbl>`;
+    };
+    if (idx > 0) body.push(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`);
+    // En-tête
+    if (!(two && D.header === "side")) {
+      const align = center ? "center" : "left";
+      if (band) {
+        const inner = photoRun && !center
+          ? tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: W - D.photo.size - 6 - D.margin.l - D.margin.r, xml: headParas("left", false), valign: "center" }], { width: W - D.margin.l - D.margin.r }) + p("", { line: 0.5 })
+          : (photoRun ? p(photoRun, { align: "center" }) : "") + headParas(align, false);
+        body.push(tbl([{ w: W, shade: C.band, pad: [Math.max(D.margin.t * 0.6, 6), D.margin.l, Math.max(D.margin.t * 0.6, 6), D.margin.r], xml: inner }], { indent: -D.margin.l, width: W }));
+        body.push(p("", { after: 1 }));
+      } else if (photoRun && !center) {
+        body.push(tbl([{ w: D.photo.size + 6, xml: p(photoRun), valign: "center" }, { w: contentW - D.photo.size - 6, xml: headParas("left", false), valign: "center" }]));
+        body.push(p("", { after: 1, border: !ats && D.rule > 0 ? `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / MMPT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` : "" }));
+      } else {
+        if (photoRun) body.push(p(photoRun, { align: "center", after: 2 }));
+        body.push(headParas(align, false));
+        if (!center && !ats && D.rule > 0) body.push(p("", { after: 1, border: `<w:pBdr><w:bottom w:val="single" w:sz="${Math.max(4, Math.round((Math.max(D.rule, 0.5) / MMPT) * 8))}" w:space="1" w:color="${hexW(C.accent)}"/></w:pBdr>` }));
+      }
+    }
+    if (it.kind === "letter") {
+      const L = m.letter;
+      if (L.date) body.push(p(run(L.date.text, { color: C.muted }), { align: "right", before: 4, after: 3 }));
+      L.recipient.forEach((r) => body.push(p(run(r.text))));
+      if (L.subject) body.push(p(run(L.subject.text, { bold: true }), { before: 5, after: 4 }));
+      L.body.forEach((b) => {
+        if (b.t === "bullet") body.push(p(run("•", { color: C.accent }) + tab() + run(b.text), { ind: { left: 3.6, hanging: 3.6 }, after: 0.4 }));
+        else body.push(p(run(b.text), { after: Math.max(D.paraGap * 1.8, 3), align: D.justify ? "both" : null }));
+      });
+      if (L.sign) body.push(p(run(L.sign.text, { bold: true }), { before: 4 }));
+    } else {
+      const arr = arrangeSections(m.sections, D.layout, two);
+      if (!two) {
+        // ATS : une seule colonne, colonne principale puis secondaire, dans l'ordre choisi dans le Studio.
+        const flat = ats && Number(D.columns) === 2 ? (({ main, side }) => [...main, ...side])(arrangeSections(m.sections, D.layout, true)) : arr.main;
+        flat.forEach((sec) => body.push(sectionXml(sec, false, contentW)));
+      }
+      else {
+        const sideW = (contentW * clamp(Number(D.sideWidth) || 32, 20, 45)) / 100;
+        const mainW = contentW - sideW;
+        const pad = 3.5;
+        let sideXml = arr.side.map((sec) => sectionXml(sec, true, sideW - 2 * pad)).join("");
+        if (D.header === "side") sideXml = (photoRun ? p(photoRun, { align: "center", after: 3 }) : "") + headParas("center", true) + sideXml;
+        const mainXml = arr.main.map((sec) => sectionXml(sec, false, mainW - D.colGap)).join("");
+        const sideCell = { w: sideW, shade: cleanHex(C.side) !== "#ffffff" ? C.side : null, pad: [pad, pad, pad, pad], xml: sideXml || p("") };
+        const mainCell = { w: mainW, pad: [0, D.side === "left" ? D.colGap : 0, 0, D.side === "left" ? 0 : D.colGap], xml: mainXml || p("") };
+        body.push(tbl(D.side === "left" ? [sideCell, mainCell] : [mainCell, sideCell]));
+        body.push(p(""));
+      }
+    }
+  });
+  const D0 = mergeDesign(DESIGN_BASE, sect);
+  const [PW, PH] = PAGE_SIZES[D0.page] || PAGE_SIZES.a4;
+  const sectPr = `<w:sectPr><w:pgSz w:w="${Math.round(PW * TW)}" w:h="${Math.round(PH * TW)}"/><w:pgMar w:top="${Math.round(D0.margin.t * TW)}" w:right="${Math.round(D0.margin.r * TW)}" w:bottom="${Math.round(D0.margin.b * TW)}" w:left="${Math.round(D0.margin.l * TW)}" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>`;
+  const NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
+  const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${body.join("")}${sectPr}</w:body></w:document>`;
+  const f0 = FONT_DOCX[D0.font];
+  const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${f0}" w:hAnsi="${f0}" w:cs="${f0}" w:eastAsia="${f0}"/><w:sz w:val="${Math.round(D0.size * 2)}"/><w:szCs w:val="${Math.round(D0.size * 2)}"/><w:lang w:val="${DOCX_LANG[items[0]?.lang] || "fr-BE"}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="264" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style></w:styles>`;
+  const settingsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="709"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat></w:settings>`;
+  const docRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdS" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rIdT" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>${rels.join("")}</Relationships>`;
+  const ct = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>`;
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>`;
+  const iso = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${xmlEsc(title || "")}</dc:title><dc:creator>${xmlEsc(author || "")}</dc:creator><cp:keywords>${xmlEsc((keywords || []).join(", "))}</cp:keywords><dcterms:created xsi:type="dcterms:W3CDTF">${iso}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">${iso}</dcterms:modified></cp:coreProperties>`;
+  const app = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Radar</Application></Properties>`;
+  return zipStore([
+    { name: "[Content_Types].xml", data: ct },
+    { name: "_rels/.rels", data: rootRels },
+    { name: "docProps/core.xml", data: core },
+    { name: "docProps/app.xml", data: app },
+    { name: "word/document.xml", data: doc },
+    { name: "word/styles.xml", data: styles },
+    { name: "word/settings.xml", data: settingsXml },
+    { name: "word/_rels/document.xml.rels", data: docRels },
+    ...media.map((m) => ({ name: `word/media/${m.name}`, data: m.bytes })),
+  ]);
+}
+
+/* ── Photo : recadrage local (jamais envoyée à l'IA) ──────────────────── */
+const loadImg = (src) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Image illisible")); i.src = src; });
+function drawCrop(ctx, img, size, crop) {
+  const { zoom = 1, x = 0, y = 0, rot = 0 } = crop || {};
+  const r = ((rot % 360) + 360) % 360;
+  const iw = r % 180 ? img.height : img.width, ih = r % 180 ? img.width : img.height;
+  const s = Math.max(size / iw, size / ih) * zoom;
+  ctx.save();
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, size, size);
+  ctx.translate(size / 2 + x * size, size / 2 + y * size);
+  ctx.rotate((r * Math.PI) / 180);
+  ctx.drawImage(img, (-img.width * s) / 2, (-img.height * s) / 2, img.width * s, img.height * s);
+  ctx.restore();
+}
+async function downscaleImage(src, max = 1200) {
+  const img = await loadImg(src);
+  const k = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.88);
+}
+async function cropPhoto(original, crop, out = 640) {
+  const img = await loadImg(original);
+  const c = document.createElement("canvas");
+  c.width = c.height = out;
+  drawCrop(c.getContext("2d"), img, out, crop);
+  return c.toDataURL("image/jpeg", 0.9);
+}
+
 
 const activeVersion = (criteria) => criteria?.versions?.[criteria.versions.length - 1] || null;
 const isStale = (offer, versionId) => !offer.score || offer.score.criteriaVersionId !== versionId || (!offer.demo && offer.score.method !== 2);
@@ -3454,6 +4192,7 @@ export default function RadarApp() {
   const [contacts, setContacts] = useState([]);
   const [ratings, setRatings] = useState({});
   const [briefs, setBriefs] = useState({});
+  const [media, setMedia] = useState(DEFAULT_MEDIA);
   const [offerQueue, setOfferQueue] = useState([]);
 
   const [view, setView] = useState("dashboard");
@@ -3595,6 +4334,7 @@ export default function RadarApp() {
           }
           if (out.ratings) setRatings(out.ratings);
           if (out.briefs) setBriefs(out.briefs);
+          if (out.media) setMedia({ ...DEFAULT_MEDIA, ...out.media });
           setApps(out.apps || []);
           setContacts(out.contacts || []);
         }
@@ -3630,6 +4370,7 @@ export default function RadarApp() {
   usePersist(KEYS.contacts, contacts, persistOn, setSaveState);
   usePersist(KEYS.ratings, ratings, persistOn, setSaveState);
   usePersist(KEYS.briefs, briefs, persistOn, setSaveState);
+  usePersist(KEYS.media, media, persistOn, setSaveState);
 
   /* ── Utilitaires d'état ─────────────────────────────────────────── */
   const toast = useCallback((text, tone = "neutral") => {
@@ -4768,7 +5509,7 @@ export default function RadarApp() {
   });
 
   /* ── Données : export / import / réinitialisation ──────────────── */
-  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs });
+  const exportPayload = () => ({ app: "radar-emploi", version: DATA_VERSION, exportedAt: nowISO(), settings, profile, criteria, sources, offers, apps, contacts, briefs, ratings, media });
   const importPayload = (obj) => {
     if (!obj || obj.app !== "radar-emploi") throw new Error("Fichier non reconnu (sauvegarde Radar attendue).");
     setSettings({ ...DEFAULT_SETTINGS, ...(obj.settings || {}), mcp: { ...DEFAULT_SETTINGS.mcp, ...(obj.settings?.mcp || {}) }, mcpTools: { ...DEFAULT_SETTINGS.mcpTools, ...(obj.settings?.mcpTools || {}) }, followUp: { ...DEFAULT_SETTINGS.followUp, ...(obj.settings?.followUp || {}) } });
@@ -4779,6 +5520,8 @@ export default function RadarApp() {
     setApps(obj.apps || []);
     setContacts(obj.contacts || []);
     if (obj.briefs && typeof obj.briefs === "object") setBriefs(obj.briefs);
+    if (obj.ratings && typeof obj.ratings === "object") setRatings(obj.ratings);
+    if (obj.media && typeof obj.media === "object") setMedia({ ...DEFAULT_MEDIA, ...obj.media });
     toast("Sauvegarde importée", "ok");
   };
   const resetAll = async () => {
@@ -4793,6 +5536,8 @@ export default function RadarApp() {
     setApps([]);
     setContacts([]);
     setBriefs({});
+    setRatings({});
+    setMedia(DEFAULT_MEDIA);
     setTodayAI(null);
     toast("Plateforme réinitialisée", "ok");
   };
@@ -4925,6 +5670,7 @@ export default function RadarApp() {
     setFollowUp, draftFollowUp, completeFollowUp, addFollowUp, prepareInterview,
     saveContact, deleteContact, toggleAppContact, prioritizeToday,
     exportPayload, importPayload, resetAll, clearDemo, loadDemo, setManualOpen, setConfirm, storageState, saveState,
+    media, setMedia,
     openStageDialog: (appId) => setStageDialog({ appId, stage: "interview" }),
     importOffersJSON, detectDuplicates, undoMerge, checkReplies, veille,
     ratings, requestRatings, briefs, requestBrief, addManualBrief, removeBriefFact, setAppMotivation, offerQueue, setOfferQueue, triageOffer, nextOfferId, setOfferSel,
@@ -6737,113 +7483,455 @@ function DocEditor({ app, type }) {
    13 bis. STUDIO CV & LETTRE — plein écran : éditeur structuré, aperçu A4 paginé, optimisation
    ════════════════════════════════════════════════════════════════════════ */
 
-/* Aperçu papier : mêmes métriques que le PDF (Helvetica, tailles en points, marges en mm, pagination par blocs). */
-const MM = 96 / 25.4, PT = 96 / 72;
-const PAPER_FONT = { fontFamily: 'Helvetica, "Helvetica Neue", Arial, sans-serif', color: "#2d2d2d", fontSize: 10 * PT, lineHeight: 1.38, textAlign: "left" };
-const PAGE_BODY = 263 * MM;
+const MM = 96 / 25.4; // pixels CSS par mm à 100 %
 
-function Marked({ text }) {
-  return String(text || "").split(/(\[à compléter[^\]]*\])/gi).map((x, i) => (/^\[à compléter/i.test(x)
-    ? <mark key={i} style={{ background: "#fef3c7", color: "#92400e", borderRadius: 3 }}>{x}</mark>
-    : <React.Fragment key={i}>{x}</React.Fragment>));
+/* ── Design du document : modèles, couleurs, colonnes, photo — rendu vectoriel commun à l'aperçu, au PDF et au Word ── */
+
+/* Couleur d'accent de la version (proposée par l'IA ou choisie) appliquée au design ; bandeau et filets la suivent
+   quand le modèle les aligne sur l'accent. */
+function designWithAccent(app, settings, accent) {
+  const base = app?.design ? mergeDesign(DESIGN_BASE, app.design) : settings?.designDefault ? mergeDesign(DESIGN_BASE, settings.designDefault) : designFromTemplate("ats");
+  const a = cleanHex(accent, null);
+  if (!a) return base;
+  const C = base.colors;
+  return { ...base, colors: { ...C, accent: a, ...(cleanHex(C.band) === cleanHex(C.accent) ? { band: a } : {}), ...(cleanHex(C.rule) === cleanHex(C.accent) ? { rule: a } : {}) } };
 }
 
-function PaperBlock({ b, kind, A }) {
-  const cv = kind === "cv";
-  const pad = (before, after) => ({ paddingTop: before * MM, paddingBottom: after * MM });
-  const fs = (pt) => ({ fontSize: pt * PT, lineHeight: 1.38 });
-  if (b.t === "name") return <div style={{ ...pad(0, 0.6), ...fs(cv ? 22 : 16), fontWeight: 700, color: A }}><Marked text={b.text} /></div>;
-  if (b.t === "quote") return cv
-    ? <div style={{ ...pad(0, 1.2), ...fs(11), color: "#464646" }}><Marked text={b.text} /></div>
-    : <div style={{ ...pad(0, 0.2), ...fs(10) }}><Marked text={b.text} /></div>;
-  if (b.t === "contact") return <div style={pad(0, 5)}><div style={{ ...fs(9), color: "#6e6e6e", paddingBottom: 1.6 * MM, borderBottom: `${0.7 * MM}px solid ${A}` }}><Marked text={b.text} /></div></div>;
-  if (b.t === "date") return <div style={{ ...pad(2, 3), ...fs(10), color: "#5a5a5a", textAlign: "right" }}><Marked text={b.text} /></div>;
-  if (b.t === "h2") return cv
-    ? <div style={pad(2.5, 2.6)}><div style={{ ...fs(10.5), fontWeight: 700, color: A, textTransform: "uppercase", paddingBottom: 0.4 * MM, borderBottom: `${0.25 * MM}px solid #d7d7d7` }}>{b.text}</div></div>
-    : <div style={{ ...pad(2, 3), ...fs(10.5), fontWeight: 700, color: "#1e1e1e" }}><Marked text={b.text} /></div>;
-  if (b.t === "h3") {
-    const parts = b.text.split("|").map((x) => x.trim()).filter(Boolean);
-    return (
-      <div style={pad(0.8, parts.length > 1 ? 1 : 0)}>
-        <div style={{ ...fs(10.5), fontWeight: 700, color: "#191919", paddingBottom: 0.2 * MM }}><Marked text={parts[0]} /></div>
-        {parts.length > 1 && <div style={{ ...fs(9), color: "#737373" }}><Marked text={parts.slice(1).join("  ·  ")} /></div>}
-      </div>
-    );
-  }
-  if (b.t === "bullet") return (
-    <div style={{ ...pad(0, 0.7), ...fs(10), paddingLeft: 4.5 * MM, position: "relative" }}>
-      <span style={{ position: "absolute", left: 0.65 * MM, top: (10 * PT * 1.38) / 2 - 0.65 * MM, width: 1.3 * MM, height: 1.3 * MM, borderRadius: 9, background: A }} />
-      <Marked text={b.text} />
+/* Ligne du balisage → section de l'éditeur (même découpage que docOutline : « head », index, « sign »). */
+function lineSections(text) {
+  const lines = String(text || "").split("\n");
+  const firstH2 = lines.findIndex((l) => l.trim().startsWith("## "));
+  const headEnd = firstH2 < 0 ? lines.length : firstH2;
+  const pre = lines.slice(0, headEnd).some((l) => { const t = l.trim(); return t && !/^(# |> |@ |= |~ )/.test(t); });
+  let sec = pre ? 0 : -1;
+  return lines.map((raw, i) => {
+    const t = raw.trim();
+    if (t.startsWith("~ ")) return "sign";
+    if (i < headEnd) return /^(# |> |@ |= )/.test(t) ? "head" : 0;
+    if (t.startsWith("## ")) sec += 1;
+    return sec;
+  });
+}
+const TODO_RE = /\[à compl|à compléter|compléter :/i;
+
+/* Une page du moteur de mise en page, en SVG (mêmes coordonnées que le PDF). */
+function PageSvg({ page, W, H, photo, idp, secOf, hoverSec, activeSec, onHoverSec, onPickSec }) {
+  const shapeEl = (o, props) => {
+    if (o.shape === "circle") return <circle cx={o.x + o.s / 2} cy={o.y + o.s / 2} r={o.s / 2} {...props} />;
+    if (o.shape === "rounded") return <rect x={o.x} y={o.y} width={o.s} height={o.s} rx={o.s * 0.18} {...props} />;
+    if (o.shape === "hexagon") return <polygon points={hexPoints(o.x, o.y, o.s).map((p) => p.join(",")).join(" ")} {...props} />;
+    return <rect x={o.x} y={o.y} width={o.s} height={o.s} {...props} />;
+  };
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="100%" style={{ display: "block", background: "#ffffff" }} xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Aperçu de la page">
+      <defs>
+        {page.ops.map((o, i) => (o.t === "photo" ? <clipPath key={i} id={`${idp}-c${i}`}>{shapeEl(o, {})}</clipPath> : null))}
+      </defs>
+      {page.ops.map((o, i) => {
+        if (o.t === "rect") return <rect key={i} x={o.x} y={o.y} width={o.w} height={o.h} rx={o.r || 0} fill={o.fill} />;
+        if (o.t === "circle") return <circle key={i} cx={o.cx} cy={o.cy} r={o.r} fill={o.fill} />;
+        if (o.t === "line") return <line key={i} x1={o.x1} y1={o.y1} x2={o.x2} y2={o.y2} stroke={o.color} strokeWidth={o.w} />;
+        if (o.t === "text") {
+          const todo = TODO_RE.test(o.s);
+          const tw = todo ? textWidth(o.s, o) : 0;
+          return (
+            <React.Fragment key={i}>
+              {todo && <rect x={o.anchor === "end" ? o.x - tw : o.anchor === "middle" ? o.x - tw / 2 : o.x} y={o.y - o.size * MMPT * 0.85} width={tw} height={o.size * MMPT * 1.15} rx={0.6} fill="#fef3c7" />}
+              <text x={o.x} y={o.y} fontFamily={FONT_CSS[o.font]} fontSize={o.size * MMPT} fontWeight={o.bold ? 700 : 400} fontStyle={o.italic ? "italic" : "normal"} fill={todo ? "#92400e" : o.color} textAnchor={o.anchor} letterSpacing={o.cs || undefined} style={{ whiteSpace: "pre" }}>
+                {o.s}
+              </text>
+            </React.Fragment>
+          );
+        }
+        if (o.t === "icon") {
+          return (
+            <g key={i} transform={`translate(${o.x} ${o.y}) scale(${o.s / 24})`} fill="none" stroke={o.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              {(DOC_ICONS[o.name] || []).map((d, k) => <path key={k} d={d} />)}
+            </g>
+          );
+        }
+        if (o.t === "photo") {
+          return (
+            <g key={i}>
+              {photo?.src ? <image href={photo.src} x={o.x} y={o.y} width={o.s} height={o.s} preserveAspectRatio="xMidYMid slice" clipPath={`url(#${idp}-c${i})`} /> : shapeEl(o, { fill: "#e7e5e4" })}
+              {o.border > 0 && shapeEl(o, { fill: "none", stroke: o.borderColor, strokeWidth: o.border })}
+            </g>
+          );
+        }
+        return null;
+      })}
+      {secOf && page.hits.filter((h) => h.kind === "block").map((h, i) => {
+        const sec = secOf(h);
+        if (sec === null || sec === undefined || sec === -1) return null;
+        const on = hoverSec === sec || activeSec === sec;
+        return (
+          <rect key={`b${i}`} x={h.x - 1.2} y={h.y} width={h.w + 2.4} height={h.h} rx={0.8} fill={on ? "rgba(79,70,229,0.08)" : "transparent"} style={{ cursor: "pointer" }}
+            onClick={() => onPickSec?.(sec)} onMouseEnter={() => onHoverSec?.(sec)} onMouseLeave={() => onHoverSec?.(null)}>
+            <title>Modifier ce passage</title>
+          </rect>
+        );
+      })}
+    </svg>
+  );
+}
+
+/* Aperçu paginé (remplace l'ancien aperçu HTML) : même API, clic sur un passage → section correspondante dans l'éditeur. */
+function DesignPages({ text, kind, design, photo, lang = "fr", zoom = 1, maxPages, onPages, onPick, activeSec }) {
+  const idp = `dp${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
+  const deferred = useDeferredValue(text);
+  const lay = useMemo(() => layoutDocument(designModel(deferred, kind), design, { photo, lang }), [deferred, kind, design, photo, lang]);
+  const secs = useMemo(() => (onPick ? lineSections(deferred) : null), [deferred, !!onPick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const n = lay.pages.length;
+  useEffect(() => { onPages?.(n); }, [n]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [hover, setHover] = useState(null);
+  const secOf = secs ? (h) => (h.src.photo ? "head" : secs[h.src.l0]) : null;
+  return (
+    <div className="flex flex-col items-center" style={{ gap: Math.round(28 * zoom) + 4 }}>
+      {lay.pages.slice(0, maxPages || undefined).map((pg, pi) => (
+        <div key={pi} style={{ width: lay.W * MM * zoom, height: lay.H * MM * zoom, flexShrink: 0, background: "#ffffff", boxShadow: "0 1px 3px rgba(0,0,0,.08), 0 18px 40px -22px rgba(0,0,0,.35)" }}>
+          <PageSvg page={pg} W={lay.W} H={lay.H} photo={photo} idp={`${idp}-${pi}`} secOf={secOf} hoverSec={hover} activeSec={activeSec} onHoverSec={setHover} onPickSec={onPick} />
+        </div>
+      ))}
     </div>
   );
-  if (b.t === "kv") return <div style={{ ...pad(0, 0.9), ...fs(10) }}><strong style={{ color: "#1e1e1e" }}>{b.label}</strong> <Marked text={b.text} /></div>;
-  if (b.t === "sign") return <div style={{ ...pad(4, 1), ...fs(10), fontWeight: 700 }}>{b.text}</div>;
-  return <div style={{ ...pad(0, cv ? 1.8 : 3.2), ...fs(10) }}><Marked text={b.text} /></div>;
 }
 
-function paginate(hs, blocks) {
-  const pages = [[]];
-  const KEEP = 50 * MM;
-  let y = 0;
-  blocks.forEach((b, i) => {
-    let need = hs[i];
-    if ((b.t === "h2" || b.t === "h3") && i + 1 < blocks.length) need += Math.min(hs[i + 1], KEEP);
-    else if (!(["para", "bullet", "kv"].includes(b.t) && hs[i] < KEEP)) need = Math.min(hs[i], 14 * PT * 1.38);
-    if (y > 0 && y + need > PAGE_BODY) { pages.push([]); y = 0; }
-    pages[pages.length - 1].push(i);
-    y += hs[i];
-  });
-  return pages;
-}
-
-function PaperPages({ text, accent, kind, zoom = 1, maxPages, onPages, onPick, activeSec }) {
-  const A = cleanHex(accent);
-  const blocks = useMemo(() => layoutBlocks(text, kind), [text, kind]);
-  const mRef = useRef(null);
-  const [layout, setLayout] = useState(null);
-  const [hover, setHover] = useState(null);
-  useLayoutEffect(() => {
-    const el = mRef.current;
-    if (!el) return;
-    const p = paginate([...el.children].map((c) => c.getBoundingClientRect().height), blocks);
-    setLayout({ blocks, pages: p });
-    onPages?.(p.length);
-  }, [blocks, A]); // eslint-disable-line react-hooks/exhaustive-deps
-  /* La pagination n'est utilisée que si elle correspond aux blocs courants (sinon : une page, le temps de la mesure). */
-  const pages = layout && layout.blocks === blocks ? layout.pages : null;
-  const list = (pages || [blocks.map((_, i) => i)]).slice(0, maxPages || undefined);
-  const W = 210 * MM, H = 297 * MM;
+/* Schéma d'un gabarit (aperçu instantané, sans calcul de mise en page). */
+function TemplateThumb({ tpl, accent, active, onClick }) {
+  const T = useT();
+  const d = mergeDesign(DESIGN_BASE, tpl.d);
+  const a = accent || d.colors.accent;
+  const two = Number(d.columns) === 2;
+  const sw = two ? 34 * (d.sideWidth / 100) : 0;
+  const sx = d.side === "right" ? 34 - sw : 0;
+  const mx = two && d.side !== "right" ? sw + 2 : 3;
+  const mw = two ? 34 - sw - 5 : 28;
+  const sideFill = two ? (luminance(d.colors.side) < 0.35 ? a : d.colors.side) : null;
   return (
-    <>
-      <div ref={mRef} aria-hidden="true" style={{ position: "fixed", left: -20000, top: 0, width: 174 * MM, visibility: "hidden", pointerEvents: "none", ...PAPER_FONT }}>
-        {blocks.map((b, i) => <PaperBlock key={i} b={b} kind={kind} A={A} />)}
-      </div>
-      <div className="flex flex-col items-center" style={{ gap: Math.round(28 * zoom) + 4 }}>
-        {list.map((pg, pi) => (
-          <div key={pi} style={{ width: W * zoom, height: H * zoom, flexShrink: 0 }}>
-            <div style={{ width: W, height: H, transform: `scale(${zoom})`, transformOrigin: "top left", background: "#ffffff", boxShadow: "0 1px 3px rgba(0,0,0,.08), 0 18px 40px -22px rgba(0,0,0,.35)", padding: `${18 * MM}px ${18 * MM}px 0`, boxSizing: "border-box", position: "relative", overflow: "hidden", ...PAPER_FONT }}>
-              {pg.map((i) => {
-                const b = blocks[i];
-                const on = onPick && (hover === b.sec || activeSec === b.sec);
-                return (
-                  <div
-                    key={i}
-                    onMouseEnter={onPick ? () => setHover(b.sec) : undefined}
-                    onMouseLeave={onPick ? () => setHover(null) : undefined}
-                    onClick={onPick ? () => onPick(b.sec) : undefined}
-                    title={onPick ? "Modifier ce passage" : undefined}
-                    style={{ cursor: onPick ? "pointer" : undefined, background: on ? "rgba(79,70,229,0.07)" : undefined, boxShadow: on ? "-8px 0 0 rgba(79,70,229,0.07), 8px 0 0 rgba(79,70,229,0.07)" : undefined }}
-                  >
-                    <PaperBlock b={b} kind={kind} A={A} />
-                  </div>
-                );
-              })}
-              {pages && pages.length > 1 && <div style={{ position: "absolute", right: 18 * MM, top: 288 * MM - 8 * PT, fontSize: 8 * PT, color: "#969696" }}>{pi + 1} / {pages.length}</div>}
-            </div>
-          </div>
+    <button type="button" onClick={onClick} aria-pressed={active} className={`rounded-2xl p-2 text-left transition-colors duration-150 ${active ? T.accentSoft : T.subHover} ${T.ring}`}>
+      <svg viewBox="0 0 34 48" className="w-full" style={{ background: "#fff", borderRadius: 6, border: active ? `1.5px solid ${a}` : "1px solid #e7e5e4" }} aria-hidden="true">
+        {d.header === "band" && <rect x="0" y="0" width="34" height="9" fill={a} />}
+        {two && <rect x={sx} y={d.header === "side" || d.sideFull ? 0 : 10} width={sw} height={d.header === "side" || d.sideFull ? 48 : 36} fill={sideFill} rx={d.sideFull ? 0 : 1} />}
+        {d.photo.show && <circle cx={d.header === "center" ? 17 : d.header === "side" ? sx + sw / 2 : 6} cy={d.header === "side" ? 6 : 5} r="2.6" fill={d.header === "band" ? "#fff" : "#d6d3d1"} />}
+        <rect x={d.header === "center" ? 9 : d.header === "side" ? sx + 2 : d.photo.show ? 10 : 3} y={d.header === "side" ? 10 : 3} width={d.header === "side" ? sw - 4 : 16} height="2" rx="0.6" fill={d.header === "band" ? "#fff" : a} />
+        {[0, 1, 2, 3].map((i) => <rect key={i} x={mx} y={14 + i * 8} width={mw} height="1.4" rx="0.5" fill={a} opacity={0.9} />)}
+        {[0, 1, 2, 3].map((i) => <rect key={`l${i}`} x={mx} y={17 + i * 8} width={mw * 0.85} height="0.9" rx="0.4" fill="#c7c7c7" />)}
+        {two && [0, 1, 2].map((i) => <rect key={`s${i}`} x={sx + 2} y={20 + i * 7} width={sw - 4} height="0.9" rx="0.4" fill={luminance(d.colors.side) < 0.35 ? "#fff" : "#bdbdbd"} />)}
+      </svg>
+      <div className="text-xs font-medium mt-1.5">{tpl.label}</div>
+      <div className={`text-xs leading-snug ${T.faint}`}>{tpl.hint}</div>
+    </button>
+  );
+}
+
+/* Petits contrôles du panneau Design. */
+function Slider({ label, value, min, max, step = 1, unit = "", onChange }) {
+  const T = useT();
+  return (
+    <label className="block">
+      <span className="flex items-center justify-between text-xs mb-1"><span className={T.muted}>{label}</span><span className="tabular-nums">{String(Math.round(value * 100) / 100).replace(".", ",")}{unit}</span></span>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full" aria-label={label} />
+    </label>
+  );
+}
+function Seg({ label, value, options, onChange }) {
+  const T = useT();
+  return (
+    <div>
+      {label && <div className={`text-xs mb-1 ${T.muted}`}>{label}</div>}
+      <div role="radiogroup" aria-label={label} className={`flex flex-wrap gap-1 p-1 rounded-xl ${T.sub}`}>
+        {options.map(([v, l]) => (
+          <button key={String(v)} type="button" role="radio" aria-checked={value === v} onClick={() => onChange(v)} className={`flex-1 min-w-0 px-2 h-7 rounded-lg text-xs truncate transition-colors duration-150 ${value === v ? `${T.navActive} font-medium` : T.muted} ${T.ring}`} style={value === v ? T.shadow : undefined}>{l}</button>
         ))}
       </div>
-    </>
+    </div>
+  );
+}
+const SWATCHES = ["#1f3a5f", "#1e293b", "#2563eb", "#0f766e", "#047857", "#7c2d12", "#9f1239", "#6d28d9", "#c2410c", "#111827", "#ffffff", "#f1f5f9"];
+function ColorField({ label, value, onChange, swatches = SWATCHES }) {
+  const T = useT();
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <span className={`text-xs ${T.muted}`}>{label}</span>
+        <input type="color" value={cleanHex(value)} onChange={(e) => onChange(e.target.value)} aria-label={label} style={{ width: 34, height: 24, border: "none", background: "transparent", cursor: "pointer" }} />
+      </div>
+      <div className="flex flex-wrap gap-1 mt-1">
+        {swatches.map((c) => (
+          <button key={c} type="button" onClick={() => onChange(c)} aria-label={`${label} ${c}`} className={`w-5 h-5 rounded-full ${T.ring}`} style={{ background: c, border: cleanHex(value) === c ? "2px solid #4f46e5" : "1px solid #d6d3d1" }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+function Fold({ title, children, open: open0 = false }) {
+  const T = useT();
+  const [open, setOpen] = useState(open0);
+  return (
+    <section className={`border-b ${T.line}`}>
+      <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} className={`w-full flex items-center justify-between py-3 text-sm font-medium ${T.ring} rounded-lg`}>
+        {title}<ChevronRight className={`w-4 h-4 transition-transform duration-150 ${open ? "rotate-90" : ""} ${T.faint}`} aria-hidden="true" />
+      </button>
+      {open && <div className="pb-4 space-y-4">{children}</div>}
+    </section>
+  );
+}
+
+/* ── Photo : import, recadrage, rotation (locale, jamais envoyée à l'IA) ── */
+function PhotoEditor({ open, onClose }) {
+  const T = useT();
+  const { media, setMedia, toast } = useApp();
+  const [orig, setOrig] = useState(null);
+  const [crop, setCrop] = useState({ zoom: 1, x: 0, y: 0, rot: 0 });
+  const [shape, setShape] = useState("circle");
+  const cv = useRef(null);
+  const img = useRef(null);
+  const drag = useRef(null);
+  const file = useRef(null);
+  const V = 260;
+  useEffect(() => {
+    if (!open) return;
+    setOrig(media.photo?.original || null);
+    setCrop(media.photo?.crop || { zoom: 1, x: 0, y: 0, rot: 0 });
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    let off = false;
+    if (!orig) { img.current = null; return undefined; }
+    loadImg(orig).then((i) => { if (!off) { img.current = i; draw(); } }).catch(() => toast("Image illisible", "danger"));
+    return () => { off = true; };
+  }, [orig]); // eslint-disable-line react-hooks/exhaustive-deps
+  const draw = () => { const c = cv.current; if (c && img.current) drawCrop(c.getContext("2d"), img.current, V * 2, crop); };
+  useEffect(draw, [crop]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onFile = (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    if (!/^image\//.test(f.type)) { toast("Choisissez une image (JPEG, PNG…)", "warn"); return; }
+    const r = new FileReader();
+    r.onload = async () => { try { setOrig(await downscaleImage(String(r.result))); setCrop({ zoom: 1, x: 0, y: 0, rot: 0 }); } catch (err) { toast(err.message, "danger"); } };
+    r.readAsDataURL(f);
+  };
+  const save = async () => {
+    if (!orig) return;
+    const src = await cropPhoto(orig, crop);
+    setMedia((m) => ({ ...m, photo: { src, original: orig, crop, updatedAt: nowISO() } }));
+    toast("Photo enregistrée (jamais envoyée à l'IA)", "ok");
+    onClose(shape);
+  };
+  const clip = { circle: "circle(50% at 50% 50%)", rounded: "inset(0 round 18%)", square: "none", hexagon: "polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%)" }[shape];
+  return (
+    <Modal open={open} onClose={() => onClose()} title="Photo de profil" footer={<><Btn variant="ghost" onClick={() => onClose()}>Annuler</Btn><Btn variant="primary" icon={Check} disabled={!orig} onClick={save}>Valider le recadrage</Btn></>}>
+      <div className="space-y-4">
+        <div className="flex flex-col items-center gap-3">
+          <div
+            className="relative rounded-2xl overflow-hidden"
+            style={{ width: V, height: V, background: T.dark ? "#292524" : "#f5f5f4", cursor: orig ? "grab" : "default", touchAction: "none" }}
+            onPointerDown={(e) => { if (!orig) return; e.currentTarget.setPointerCapture(e.pointerId); drag.current = { x: e.clientX, y: e.clientY, c: crop }; }}
+            onPointerMove={(e) => { const d = drag.current; if (!d) return; setCrop({ ...d.c, x: clamp(d.c.x + (e.clientX - d.x) / V, -1, 1), y: clamp(d.c.y + (e.clientY - d.y) / V, -1, 1) }); }}
+            onPointerUp={() => { drag.current = null; }}
+            onWheel={(e) => { if (orig) setCrop((c) => ({ ...c, zoom: clamp(c.zoom * (e.deltaY < 0 ? 1.06 : 0.94), 1, 4) })); }}
+          >
+            {orig ? (
+              <>
+                <canvas ref={cv} width={V * 2} height={V * 2} style={{ width: V, height: V, opacity: 0.35, position: "absolute", inset: 0 }} aria-hidden="true" />
+                <canvas width={V * 2} height={V * 2} style={{ width: V, height: V, position: "absolute", inset: 0, clipPath: clip }} ref={(el) => { if (el && img.current) drawCrop(el.getContext("2d"), img.current, V * 2, crop); }} aria-label="Aperçu du recadrage" />
+              </>
+            ) : (
+              <button type="button" onClick={() => file.current?.click()} className={`absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm ${T.muted} ${T.ring}`}>
+                <Upload className="w-6 h-6" aria-hidden="true" />Importer une photo
+              </button>
+            )}
+          </div>
+          <input ref={file} type="file" accept="image/*" className="hidden" onChange={onFile} aria-label="Fichier photo" />
+          <p className={`text-xs text-center ${T.faint}`}>Glissez pour cadrer, molette ou curseur pour zoomer. La forme finale se règle aussi dans le panneau Design.</p>
+        </div>
+        {orig && (
+          <>
+            <Slider label="Zoom" value={crop.zoom} min={1} max={4} step={0.01} unit="×" onChange={(zoom) => setCrop({ ...crop, zoom })} />
+            <div className="flex flex-wrap gap-2">
+              <Btn size="sm" icon={RotateCw} onClick={() => setCrop({ ...crop, rot: (crop.rot + 90) % 360 })}>Pivoter</Btn>
+              <Btn size="sm" variant="ghost" onClick={() => setCrop({ zoom: 1, x: 0, y: 0, rot: 0 })}>Recentrer</Btn>
+              <Btn size="sm" variant="ghost" icon={Upload} onClick={() => file.current?.click()}>Autre photo</Btn>
+            </div>
+            <Seg label="Aperçu de forme" value={shape} onChange={setShape} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
+          </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Panneau Design ── */
+function DesignPanel({ design, setDesign, accentSuggested, onPhoto, hasPhoto, kind, sections, onReorder }) {
+  const T = useT();
+  const { settings, setSettings, toast, setMedia } = useApp();
+  const D = design;
+  const set = (patch) => setDesign({ ...D, ...patch });
+  const setC = (k, v) => setDesign({ ...D, colors: { ...D.colors, [k]: v } });
+  const setM = (k, v) => setDesign({ ...D, margin: D.linkMargins ? { t: v, r: v, b: v, l: v } : { ...D.margin, [k]: v } });
+  const setP = (k, v) => setDesign({ ...D, photo: { ...D.photo, [k]: v } });
+  const [keepAccent, setKeepAccent] = useState(true);
+  return (
+    <div>
+      <Fold title="Modèles" open>
+        <label className={`flex items-center gap-2 text-xs ${T.muted}`}><input type="checkbox" checked={keepAccent} onChange={(e) => setKeepAccent(e.target.checked)} />Garder ma couleur d'accent</label>
+        <div className="grid grid-cols-2 gap-2">
+          {TEMPLATES.map((t) => (
+            <TemplateThumb key={t.id} tpl={t} accent={keepAccent ? D.colors.accent : null} active={D.template === t.id}
+              onClick={() => setDesign(designFromTemplate(t.id, { layout: D.layout, accent: keepAccent ? D.colors.accent : null, page: D.page }))} />
+          ))}
+        </div>
+      </Fold>
+      <Fold title="Couleurs" open>
+        {accentSuggested && cleanHex(accentSuggested) !== cleanHex(D.colors.accent) && (
+          <button type="button" onClick={() => setDesign({ ...D, colors: { ...D.colors, accent: accentSuggested, ...(D.colors.band === D.colors.accent ? { band: accentSuggested } : {}) } })} className={`w-full flex items-center gap-2 rounded-xl px-3 py-2 text-xs ${T.sub} ${T.ring}`}>
+            <span className="w-4 h-4 rounded-full" style={{ background: accentSuggested }} />Appliquer la couleur de l'entreprise (suggestion IA)
+          </button>
+        )}
+        <ColorField label="Accent (titres, puces)" value={D.colors.accent} onChange={(v) => setC("accent", v)} />
+        <ColorField label="Texte" value={D.colors.text} onChange={(v) => setC("text", v)} swatches={["#111827", "#262626", "#374151", "#1f2937", "#0f172a"]} />
+        <ColorField label="Texte secondaire" value={D.colors.muted} onChange={(v) => setC("muted", v)} swatches={["#6b6b6b", "#6b7280", "#64748b", "#78716c", "#57534e"]} />
+        <ColorField label="Filets" value={D.colors.rule} onChange={(v) => setC("rule", v)} swatches={["#d4d4d4", "#e5e7eb", "#94a3b8", D.colors.accent]} />
+        {Number(D.columns) === 2 && <>
+          <ColorField label="Fond de colonne" value={D.colors.side} onChange={(v) => setC("side", v)} swatches={["#ffffff", "#f1f5f9", "#f5f5f4", "#f0fdfa", "#eff6ff", "#134e4a", "#1e293b", "#1f3a5f", D.colors.accent]} />
+          <ColorField label="Texte de colonne" value={D.colors.sideText} onChange={(v) => setC("sideText", v)} swatches={["#262626", "#ffffff", "#f0fdfa", "#e2e8f0"]} />
+        </>}
+        {D.header === "band" && <>
+          <ColorField label="Bandeau" value={D.colors.band} onChange={(v) => setC("band", v)} />
+          <ColorField label="Texte du bandeau" value={D.colors.bandText} onChange={(v) => setC("bandText", v)} swatches={["#ffffff", "#f8fafc", "#111827"]} />
+        </>}
+      </Fold>
+      <Fold title="Typographie">
+        <Seg label="Police des titres" value={D.headingFont} onChange={(v) => set({ headingFont: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
+        <Seg label="Police du texte" value={D.font} onChange={(v) => set({ font: v })} options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
+        <Slider label="Taille du texte" value={D.size} min={8.5} max={12} step={0.25} unit=" pt" onChange={(size) => set({ size })} />
+        <Slider label="Interligne" value={D.lineHeight} min={1.05} max={1.8} step={0.05} onChange={(lineHeight) => set({ lineHeight })} />
+        <Slider label="Taille du nom" value={D.nameSize} min={1.5} max={3.4} step={0.05} unit="×" onChange={(nameSize) => set({ nameSize })} />
+        <Slider label="Taille des titres" value={D.headingSize} min={0.85} max={1.6} step={0.01} unit="×" onChange={(headingSize) => set({ headingSize })} />
+        <Seg label="Casse des titres" value={D.headingCase} onChange={(v) => set({ headingCase: v })} options={[["upper", "MAJUSCULES"], ["normal", "Normale"]]} />
+        {D.headingCase === "upper" && <Slider label="Espacement des lettres (titres)" value={D.headingSpacing} min={0} max={2.5} step={0.1} unit=" pt" onChange={(headingSpacing) => set({ headingSpacing })} />}
+      </Fold>
+      <Fold title="Mise en page">
+        <Seg label="Format" value={D.page} onChange={(v) => set({ page: v })} options={[["a4", "A4"], ["letter", "US Letter"]]} />
+        {kind === "cv" && <Seg label="Colonnes" value={Number(D.columns)} onChange={(v) => set({ columns: v })} options={[[1, "Une"], [2, "Deux"]]} />}
+        {kind === "cv" && Number(D.columns) === 2 && <>
+          <Seg label="Colonne secondaire" value={D.side} onChange={(v) => set({ side: v })} options={[["left", "À gauche"], ["right", "À droite"]]} />
+          <Slider label="Largeur de la colonne" value={D.sideWidth} min={22} max={42} step={1} unit=" %" onChange={(sideWidth) => set({ sideWidth })} />
+          <Slider label="Écart entre colonnes" value={D.colGap} min={3} max={14} step={0.5} unit=" mm" onChange={(colGap) => set({ colGap })} />
+          <Toggle checked={!!D.sideFull} onChange={(v) => set({ sideFull: v })} label="Fond de colonne bord à bord" description="Le fond va jusqu'au bord de la feuille." />
+        </>}
+        <Seg label="En-tête" value={D.header} onChange={(v) => set({ header: v })} options={[["left", "Gauche"], ["center", "Centré"], ["band", "Bandeau"], ...(kind === "cv" && Number(D.columns) === 2 ? [["side", "Colonne"]] : [])]} />
+        <Toggle checked={!!D.linkMargins} onChange={(v) => setDesign({ ...D, linkMargins: v, margin: v ? { t: D.margin.l, r: D.margin.l, b: D.margin.l, l: D.margin.l } : D.margin })} label="Marges identiques" />
+        <div className="grid grid-cols-2 gap-3">
+          {(D.linkMargins ? [["l", "Marges"]] : [["t", "Haut"], ["b", "Bas"], ["l", "Gauche"], ["r", "Droite"]]).map(([k, l]) => (
+            <Slider key={k} label={l} value={D.margin[k]} min={0} max={30} step={0.5} unit=" mm" onChange={(v) => setM(k, v)} />
+          ))}
+        </div>
+        <Slider label="Espace entre sections" value={D.sectionGap} min={1} max={12} step={0.25} unit=" mm" onChange={(sectionGap) => set({ sectionGap })} />
+        <Slider label="Espace entre éléments" value={D.itemGap} min={0} max={6} step={0.1} unit=" mm" onChange={(itemGap) => set({ itemGap })} />
+        <Slider label="Espace entre paragraphes" value={D.paraGap} min={0} max={6} step={0.1} unit=" mm" onChange={(paraGap) => set({ paraGap })} />
+      </Fold>
+      {kind === "cv" && sections?.length > 0 && (
+        <Fold title="Sections et colonnes" open={Number(D.columns) === 2}>
+          <SectionsFold sections={sections} design={D} setDesign={setDesign} onReorder={onReorder} />
+        </Fold>
+      )}
+      <Fold title="Éléments">
+        <Seg label="Style des titres" value={D.headingStyle} onChange={(v) => set({ headingStyle: v })} options={[["line", "Trait"], ["bar", "Barre"], ["pill", "Pastille"], ["double", "Double"], ["plain", "Simple"]]} />
+        <Slider label="Épaisseur des traits" value={D.rule} min={0} max={2} step={0.05} unit=" mm" onChange={(rule) => set({ rule })} />
+        <Seg label="Puces" value={D.bullet} onChange={(v) => set({ bullet: v })} options={[["dot", "●"], ["square", "■"], ["dash", "–"], ["arrow", "›"], ["none", "Aucune"]]} />
+        <Toggle checked={!!D.icons} onChange={(v) => set({ icons: v })} label="Icônes des coordonnées" />
+        {kind === "cv" && <Toggle checked={!!D.sectionIcons} onChange={(v) => set({ sectionIcons: v })} label="Icônes des sections" />}
+        {kind === "cv" && <Toggle checked={!!D.datesRight} onChange={(v) => set({ datesRight: v })} label="Dates alignées à droite" />}
+        {kind === "cv" && <Toggle checked={!!D.skillsAsTags} onChange={(v) => set({ skillsAsTags: v })} label="Compétences en étiquettes" />}
+        {kind === "letter" && <Toggle checked={!!D.justify} onChange={(v) => set({ justify: v })} label="Paragraphes justifiés" />}
+      </Fold>
+      <Fold title="Photo">
+        <Toggle checked={!!D.photo.show} onChange={(v) => setP("show", v)} label="Afficher la photo" description={hasPhoto ? "Courant en Belgique ; déconseillé pour l'anglais." : "Aucune photo importée."} />
+        <div className="flex flex-wrap gap-2">
+          <Btn size="sm" icon={hasPhoto ? Crop : Upload} onClick={onPhoto}>{hasPhoto ? "Recadrer / changer" : "Importer une photo"}</Btn>
+          {hasPhoto && <Btn size="sm" variant="ghost" icon={Trash2} onClick={() => { setMedia((m) => ({ ...m, photo: null })); toast("Photo supprimée", "ok"); }}>Supprimer</Btn>}
+        </div>
+        <Seg label="Forme" value={D.photo.shape} onChange={(v) => setP("shape", v)} options={[["circle", "Cercle"], ["rounded", "Arrondi"], ["square", "Carré"], ["hexagon", "Hexagone"]]} />
+        <Slider label="Taille" value={D.photo.size} min={16} max={48} step={0.5} unit=" mm" onChange={(v) => setP("size", v)} />
+        <Slider label="Bordure" value={D.photo.border} min={0} max={3} step={0.1} unit=" mm" onChange={(v) => setP("border", v)} />
+        {D.photo.border > 0 && <ColorField label="Couleur de bordure" value={D.photo.borderColor} onChange={(v) => setP("borderColor", v)} swatches={["#ffffff", "#e7e5e4", D.colors.accent, "#111827"]} />}
+      </Fold>
+      <div className="flex flex-wrap gap-2 pt-4">
+        <Btn size="sm" icon={Star} onClick={() => { const { layout, ...rest } = D; setSettings((s) => ({ ...s, designDefault: rest })); toast("Style enregistré par défaut pour les prochains dossiers", "ok"); }}>Style par défaut</Btn>
+        <Btn size="sm" variant="ghost" icon={RotateCcw} onClick={() => setDesign(designFromTemplate(D.template, { layout: D.layout, accent: D.colors.accent, page: D.page }))}>Réinitialiser le modèle</Btn>
+      </div>
+      {settings.designDefault && <p className={`text-xs mt-2 ${T.faint}`}>Style par défaut : {TEMPLATE_BY_ID[settings.designDefault.template]?.label || "personnalisé"}.</p>}
+    </div>
+  );
+}
+
+/* ── Panneau Structure : ordre, colonne, visibilité des sections ── */
+
+/* Sections : ordre (celui du texte), colonne, visibilité dans l'aperçu et les exports. Glisser-déposer entre colonnes. */
+function SectionsFold({ sections, design, setDesign, onReorder }) {
+  const T = useT();
+  const two = Number(design.columns) === 2;
+  const L = design.layout || {};
+  const arr = arrangeSections(sections, { ...L, order: [] }, two);
+  const sideList = Array.isArray(L.side) ? L.side : sections.filter((s) => arr.isSide(s.key)).map((s) => s.key);
+  const colOf = (k) => (two && sideList.includes(k) ? "side" : "main");
+  const setLayout = (patch) => setDesign({ ...design, layout: { ...L, order: [], side: sideList, ...patch } });
+  const toggleHide = (k) => setLayout({ hidden: arr.hidden.has(k) ? [...arr.hidden].filter((x) => x !== k) : [...arr.hidden, k] });
+  const setCol = (k, col) => setLayout({ side: col === "side" ? [...new Set([...sideList, k])] : sideList.filter((x) => x !== k) });
+  const idx = (k) => sections.findIndex((s) => s.key === k);
+  const movable = (k) => !!onReorder && k !== "intro";
+  const step = (k, dir) => {
+    const same = sections.filter((s) => colOf(s.key) === colOf(k) && movable(s.key)).map((s) => s.key);
+    const j = same.indexOf(k) + dir;
+    if (j >= 0 && j < same.length) onReorder(idx(k), idx(same[j]));
+  };
+  const [drag, setDrag] = useState(null);
+  const [over, setOver] = useState(null);
+  const drop = (col, beforeKey) => {
+    if (drag) {
+      if (two && colOf(drag) !== col) setCol(drag, col);
+      if (beforeKey && beforeKey !== drag && movable(drag) && movable(beforeKey)) onReorder(idx(drag), idx(beforeKey));
+    }
+    setDrag(null); setOver(null);
+  };
+  const cols = two ? [["main", "Colonne principale"], ["side", "Colonne secondaire"]] : [["main", "Sections"]];
+  return (
+    <div className="space-y-3">
+      <p className={`text-xs ${T.muted}`}>Glissez une section pour la déplacer{two ? " ou la changer de colonne" : ""}. Une section masquée reste dans le texte mais n'apparaît ni dans l'aperçu ni dans les exports.</p>
+      {cols.map(([col, label]) => {
+        const keys = sections.filter((s) => colOf(s.key) === col);
+        return (
+          <div key={col}
+            onDragOver={(e) => { e.preventDefault(); setOver(col); }}
+            onDragLeave={() => setOver((c) => (c === col ? null : c))}
+            onDrop={(e) => { e.preventDefault(); drop(col, null); }}
+            className={`rounded-2xl p-2 transition-colors duration-150 ${over === col ? T.accentSoft : T.sub}`}>
+            <div className={`px-2 pb-2 text-xs font-semibold uppercase tracking-wider ${T.faint}`}>{label}</div>
+            <ul className="space-y-1">
+              {keys.map((s) => {
+                const hidden = arr.hidden.has(s.key);
+                return (
+                  <li key={s.key} draggable
+                    onDragStart={(e) => { setDrag(s.key); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", s.key); }}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => { e.preventDefault(); e.stopPropagation(); drop(col, s.key); }}
+                    className={`flex items-center gap-0.5 rounded-xl pl-1 pr-1 py-1 ${T.surface} ${hidden ? "opacity-50" : ""}`} style={T.shadow}>
+                    <GripVertical className={`w-4 h-4 shrink-0 cursor-grab ${T.faint}`} aria-hidden="true" />
+                    <span className="flex-1 min-w-0 text-sm truncate">{sectionLabel(s)}</span>
+                    {movable(s.key) && <MiniBtn icon={ArrowUp} label="Monter" onClick={() => step(s.key, -1)} />}
+                    {movable(s.key) && <MiniBtn icon={ArrowDown} label="Descendre" onClick={() => step(s.key, 1)} />}
+                    {two && <MiniBtn icon={ArrowLeftRight} label={col === "side" ? "Vers la colonne principale" : "Vers la colonne secondaire"} onClick={() => setCol(s.key, col === "side" ? "main" : "side")} />}
+                    <MiniBtn icon={hidden ? EyeOff : Eye} label={hidden ? "Afficher" : "Masquer dans l'aperçu et les exports"} onClick={() => toggleHide(s.key)} active={hidden} />
+                  </li>
+                );
+              })}
+              {!keys.length && <li className={`text-xs text-center py-4 ${T.faint}`}>Déposez une section ici</li>}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -7861,7 +8949,7 @@ function DocStudio({ appId, type, setType, onClose }) {
   closeRef.current = () => { flushRef.current?.(); onClose(); };
   useFocusTrap(true, ref, () => closeRef.current());
   /* Disposition partagée entre CV et lettre (le changement de document ne la réinitialise pas). */
-  const [ui, setUi] = useState(() => ({ layout: "split", pane: "edit", tab: "checks", zoomMode: "fit", panelOpen: typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1536px)").matches }));
+  const [ui, setUi] = useState(() => ({ layout: "split", pane: "edit", tab: "checks", panelMode: "optim", zoomMode: "fit", panelOpen: typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1536px)").matches }));
   const app = apps.find((a) => a.id === appId);
   const offer = offers.find((o) => o.id === app?.offerId);
   const close = () => closeRef.current();
@@ -7890,7 +8978,7 @@ function DocStudio({ appId, type, setType, onClose }) {
 
 function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, setUi }) {
   const T = useT();
-  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs } = useApp();
+  const { saveDocVersion, saveDocDraft, settings, profile, busy, docAI, toast, declareSkill, genStatus, briefs, media, patchApp } = useApp();
   const wide = useMedia("(min-width: 1024px)");
   const versions = app.docs?.[type] || [];
   const [idx, setIdx] = useState(versions.length - 1);
@@ -7905,6 +8993,20 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   const [restoredAt, setRestoredAt] = useState(() => pickDraft()?.at || null);
   const text = useMemo(() => modelToDoc(model, type, lang), [model, type, lang]);
   const dirty = text !== baseline || accent !== cleanHex(v.accent);
+
+  /* Design (modèle, couleurs, colonnes, photo) : propre à la candidature, commun au CV et à la lettre. L'accent reste celui de la version. */
+  const [designOwn, setDesignOwn] = useState(() => app.design || null);
+  const design = useMemo(() => designWithAccent({ design: designOwn }, settings, accent), [designOwn, settings.designDefault, accent]); // eslint-disable-line react-hooks/exhaustive-deps
+  const setDesign = (d) => {
+    if (cleanHex(d.colors?.accent) !== cleanHex(accent)) setAccent(cleanHex(d.colors.accent));
+    setDesignOwn(d);
+  };
+  const designSaved = useRef(app.design || null);
+  const flushDesign = () => { if (designOwn && designOwn !== designSaved.current) { designSaved.current = designOwn; patchApp(app.id, (a) => ({ ...a, design: designOwn })); } };
+  useEffect(() => { const t = setTimeout(flushDesign, 600); return () => clearTimeout(t); }, [designOwn]); // eslint-disable-line react-hooks/exhaustive-deps
+  const photo = media?.photo || null;
+  const [photoOpen, setPhotoOpen] = useState(false);
+  const dModel = useMemo(() => designModel(text, type), [text, type]);
 
   /* Historique (annuler / rétablir) : un instantané après chaque pause de frappe ou action de l'IA. */
   const hist = useRef({ list: [text], pos: 0 });
@@ -7959,7 +9061,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
     }, 1200);
     return () => clearTimeout(t);
   }, [text, accent, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
-  flushRef.current = () => { if (dirty) saveDocDraft(app.id, type, { text, accent, baseId: v.id }); };
+  flushRef.current = () => { flushDesign(); if (dirty) saveDocDraft(app.id, type, { text, accent, baseId: v.id }); };
 
   const save = () => {
     if (!dirty) return;
@@ -7975,7 +9077,10 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   const setLayout = uiSet("layout"), setPane = uiSet("pane"), setPanelOpen = uiSet("panelOpen"), setTab = uiSet("tab"), setZoomMode = uiSet("zoomMode");
   const showEditor = wide ? layout !== "preview" : pane === "edit";
   const showPreview = wide ? layout !== "edit" : pane === "preview";
-  const showPanel = wide ? panelOpen : pane === "panel";
+  const showPanel = wide ? panelOpen : pane === "panel" || pane === "design";
+  const panelMode = wide ? ui.panelMode || "optim" : pane === "design" ? "design" : "optim";
+  const togglePanel = (mode) => setUi((u) => ({ ...u, panelOpen: !(u.panelOpen && (u.panelMode || "optim") === mode), panelMode: mode }));
+  const openDesign = () => { if (wide) setUi((u) => ({ ...u, panelOpen: true, panelMode: "design" })); else setPane("design"); };
 
   /* Aperçu : zoom ajusté à la largeur */
   const [fitZoom, setFitZoom] = useState(0.8);
@@ -7983,10 +9088,10 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   useEffect(() => {
     const el = prevRef.current;
     if (!el || typeof ResizeObserver === "undefined") return undefined;
-    const ro = new ResizeObserver(() => setFitZoom(clamp((el.clientWidth - 48) / (210 * MM), 0.3, 1.2)));
+    const ro = new ResizeObserver(() => setFitZoom(clamp((el.clientWidth - 48) / ((PAGE_SIZES[design.page] || PAGE_SIZES.a4)[0] * MM), 0.3, 1.2)));
     ro.observe(el);
     return () => ro.disconnect();
-  }, [showPreview]);
+  }, [showPreview, design.page]);
   const zoom = zoomMode === "fit" ? fitZoom : Number(zoomMode);
   const [pages, setPages] = useState(null);
 
@@ -8012,6 +9117,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
   const setHead = (patch) => setModel((m) => ({ ...m, ...patch }));
   const setSection = (id, s) => setModel((m) => ({ ...m, sections: m.sections.map((x) => (x.id === id ? s : x)) }));
   const moveSection = (i, d) => setModel((m) => ({ ...m, sections: moveIn(m.sections, i, d) }));
+  const reorderSection = (from, to) => { pushNow(); setModel((m) => { const l = [...m.sections]; const [s] = l.splice(from, 1); l.splice(to, 0, s); return { ...m, sections: l }; }); };
   const removeSection = (id) => setModel((m) => ({ ...m, sections: m.sections.filter((x) => x.id !== id) }));
   const addSection = (title, kind) => { const s = newSection(title, kind); setModel((m) => ({ ...m, sections: [...m.sections, s] })); setTimeout(() => goTo(model.sections.length), 60); };
 
@@ -8081,17 +9187,34 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 
   /* PDF */
   const [pdfBusy, setPdfBusy] = useState(false);
+  const docMeta = () => ({
+    title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "),
+    author: profile.name, subject: type === "cv" ? "Curriculum vitae" : "Lettre de motivation",
+    keywords: (app.analysis?.keywords || v.keywords || []).map((k) => (typeof k === "string" ? k : k?.term)).filter(Boolean).slice(0, 30),
+  });
+  const fileBase = () => `${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}_${lang.toUpperCase()}`;
   const downloadPdf = async () => {
     setPdfBusy(true);
     try {
-      const kws = (app.analysis?.keywords || v.keywords || []).map((k) => (typeof k === "string" ? k : k.term));
-      const data = await buildDocPdf(text, { accent, kind: type, title: [type === "cv" ? "CV" : "Lettre de motivation", profile.name, offer?.title, offer?.company].filter(Boolean).join(" - "), keywords: kws.slice(0, 30), author: profile.name });
-      const r = await saveFile(`${type === "cv" ? "CV" : "Lettre"}_${slugFile(profile.name || "candidat")}_${slugFile(offer?.company || offer?.title)}.pdf`, data, "application/pdf");
+      const meta = docMeta();
+      const data = await buildPdf([{ layout: layoutDocument(designModel(text, type), design, { photo, lang }), photo, title: meta.title }], meta);
+      const r = await saveFile(`${fileBase()}.pdf`, data, "application/pdf");
       if (r === "saved") toast(report.blockers ? "PDF prêt — attention, des points restent à corriger" : "PDF prêt", report.blockers ? "warn" : "ok");
     } catch (e) {
       toast(`PDF impossible : ${e.message}`, "danger");
     } finally { setPdfBusy(false); }
   };
+  const downloadWord = async () => {
+    try {
+      const meta = docMeta();
+      const data = buildDocx([{ text, kind: type, lang, design }], { photo, ...meta, mode: "design" });
+      const r = await saveFile(`${fileBase()}.docx`, data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      if (r === "saved") toast("Document Word prêt (styles Titre lus par les ATS)", "ok");
+    } catch (e) {
+      toast(`Word impossible : ${e.message}`, "danger");
+    }
+  };
+  const [exportOpen, setExportOpen] = useState(false);
 
   /* Raccourcis : ⌘/Ctrl+S enregistre, ⌘/Ctrl+Z hors champ annule */
   const keys = useRef({});
@@ -8140,12 +9263,22 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
         <Btn size="sm" variant="ghost" icon={RefreshCw} onClick={() => setSetupOpen(true)} aria-label="Régénérer" title="Nouvelle version générée par l'IA"><span className="hidden 2xl:inline">Régénérer</span></Btn>
         <Btn size="sm" variant={dirty ? "primary" : "soft"} icon={Save} disabled={!dirty} onClick={save} aria-label="Enregistrer une version (⌘S)" title="Enregistrer une version (⌘S)"><span className="hidden lg:inline">Enregistrer</span></Btn>
         <Btn size="sm" icon={Download} loading={pdfBusy} onClick={downloadPdf} aria-label="Télécharger le PDF"><span className="hidden lg:inline">PDF</span></Btn>
+        <Btn size="sm" variant="ghost" icon={FileDown} onClick={downloadWord} aria-label="Télécharger en Word (.docx)" title="Word (.docx) modifiable"><span className="hidden xl:inline">Word</span></Btn>
         {wide && <button
           type="button"
-          onClick={() => setPanelOpen((o) => !o)}
-          aria-pressed={panelOpen}
-          title={panelOpen ? "Masquer le panneau d'optimisation" : "Afficher le panneau d'optimisation"}
-          className={`shrink-0 inline-flex items-center gap-1.5 h-8 rounded-xl px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${panelOpen && wide ? T.accentSoft : T.btnSoft} ${T.ring}`}
+          onClick={() => togglePanel("design")}
+          aria-pressed={panelOpen && panelMode === "design"}
+          title="Design : modèles, couleurs, colonnes, marges, photo"
+          className={`shrink-0 inline-flex items-center gap-1.5 h-8 rounded-xl px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${panelOpen && panelMode === "design" ? T.accentSoft : T.btnSoft} ${T.ring}`}
+        >
+          <Palette className="w-3.5 h-3.5" aria-hidden="true" /><span className="hidden xl:inline">Design</span>
+        </button>}
+        {wide && <button
+          type="button"
+          onClick={() => togglePanel("optim")}
+          aria-pressed={panelOpen && panelMode === "optim"}
+          title={panelOpen && panelMode === "optim" ? "Masquer le panneau d'optimisation" : "Afficher le panneau d'optimisation"}
+          className={`shrink-0 inline-flex items-center gap-1.5 h-8 rounded-xl px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${panelOpen && panelMode === "optim" ? T.accentSoft : T.btnSoft} ${T.ring}`}
         >
           <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
           <span className="tabular-nums">{report.scores.total}/100</span>
@@ -8212,10 +9345,15 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
               <Select value={zoomMode} onChange={(e) => setZoomMode(e.target.value)} aria-label="Zoom" className="h-8 text-xs">
                 <option value="fit">Ajuster</option><option value="0.75">75 %</option><option value="1">100 %</option><option value="1.25">125 %</option>
               </Select>
+              <Select value={design.template} onChange={(e) => setDesign(designFromTemplate(e.target.value, { layout: design.layout, accent, page: design.page, photoShow: design.photo.show }))} aria-label="Modèle" className="h-8 text-xs">
+                {TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                {!TEMPLATE_BY_ID[design.template] && <option value={design.template}>Personnalisé</option>}
+              </Select>
               <label className={`inline-flex items-center gap-1.5 text-xs ${T.muted}`}>
                 <Palette className="w-4 h-4" aria-hidden="true" /> Couleur
                 <input type="color" value={cleanHex(accent)} onChange={(e) => setAccent(e.target.value)} aria-label="Couleur d'accent" style={{ width: 28, height: 22, border: "none", background: "transparent" }} />
               </label>
+              <button type="button" onClick={openDesign} className={`text-xs underline underline-offset-4 ${T.muted} ${T.ring} rounded`}>Plus de réglages</button>
               {v.accentSource && accent === cleanHex(v.accent) && <span className={`text-xs ${T.faint}`}>({v.accentSource})</span>}
               <span className="flex-1" />
               <Chip tone={pages && pages > (type === "cv" ? 2 : 1) ? "warn" : "neutral"}>{pages || "…"} page{pages > 1 ? "s" : ""}</Chip>
@@ -8223,18 +9361,28 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
               <CopyBtn text={docPlainText(text)} label="Copier le texte" />
             </div>
             <div className="px-4 py-6">
-              <PaperPages text={text} accent={accent} kind={type} zoom={zoom} onPages={setPages} onPick={goTo} activeSec={flash} />
-              <p className={`text-xs text-center mt-4 ${T.faint}`}>Cliquez sur un passage pour le modifier. Aperçu fidèle au PDF (texte sélectionnable, lisible par les ATS).</p>
+              <DesignPages text={text} kind={type} design={design} photo={photo} lang={lang} zoom={zoom} onPages={setPages} onPick={goTo} activeSec={flash} />
+              <p className={`text-xs text-center mt-4 ${T.faint}`}>Cliquez sur un passage pour le modifier. Aperçu identique au PDF et au Word (mêmes positions, texte sélectionnable, lisible par les ATS).</p>
             </div>
           </div>
         )}
 
         {showPanel && (
-          <aside className={`shrink-0 overflow-y-auto ${wide ? `border-l ${T.line}` : "flex-1"} ${T.app}`} style={wide ? { width: 400 } : undefined} aria-label="Optimisation du document">
-            <OptimPanel app={app} offer={offer} type={type} report={report} pages={pages} text={text} api={api} />
+          <aside className={`shrink-0 overflow-y-auto ${wide ? `border-l ${T.line}` : "flex-1"} ${T.app}`} style={wide ? { width: 400 } : undefined} aria-label={panelMode === "design" ? "Design du document" : "Optimisation du document"}>
+            {panelMode === "design" ? (
+              <div className="px-5 py-2">
+                <DesignPanel
+                  design={design} setDesign={setDesign} kind={type}
+                  accentSuggested={cleanHex(v.accent) !== cleanHex(accent) ? cleanHex(v.accent) : null}
+                  onPhoto={() => setPhotoOpen(true)} hasPhoto={!!photo?.src}
+                  sections={dModel.sections} onReorder={dModel.sections.length === model.sections.length ? reorderSection : null}
+                />
+              </div>
+            ) : <OptimPanel app={app} offer={offer} type={type} report={report} pages={pages} text={text} api={api} />}
           </aside>
         )}
 
+        <PhotoEditor open={photoOpen} onClose={(shape) => { setPhotoOpen(false); if (shape) setDesign({ ...design, photo: { ...design.photo, show: true, shape } }); }} />
         {setupOpen && (
           <div className={`absolute inset-0 z-20 flex flex-col ${T.app}`}>
             <StudioSetup app={app} offer={offer} type={type} onDone={() => setSetupOpen(false)} onCancel={(leave) => { setSetupOpen(false); if (leave) onClose(); }} />
@@ -8244,7 +9392,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 
       {!wide && (
         <nav className={`shrink-0 border-t px-3 py-2 flex justify-center ${T.line}`} aria-label="Vue du studio">
-          <Tabs value={pane} onChange={setPane} tabs={[{ id: "edit", label: "Éditer" }, { id: "preview", label: "Aperçu" }, { id: "panel", label: "Optimiser", count: report.blockers || undefined }]} />
+          <Tabs value={pane} onChange={setPane} tabs={[{ id: "edit", label: "Éditer" }, { id: "preview", label: "Aperçu" }, { id: "design", label: "Design" }, { id: "panel", label: "Optimiser", count: report.blockers || undefined }]} />
         </nav>
       )}
     </>
@@ -8254,7 +9402,7 @@ function StudioWorkspace({ app, offer, type, setType, onClose, flushRef, ui, set
 /* Carte de document dans la fiche candidature : vignette, score, accès au studio. */
 function StudioDocCard({ app, offer, type }) {
   const T = useT();
-  const { openStudio, settings, profile, genStatus, briefs } = useApp();
+  const { openStudio, settings, profile, genStatus, briefs, media } = useApp();
   const versions = app.docs?.[type] || [];
   const v = versions[versions.length - 1];
   const draft = app.drafts?.[type];
@@ -8266,11 +9414,12 @@ function StudioDocCard({ app, offer, type }) {
     [text, app.analysis, type], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const z = 0.15;
+  const design = useMemo(() => designWithAccent(app, settings, useDraft ? draft.accent : v?.accent), [app.design, settings.designDefault, useDraft, draft?.accent, v?.accent]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <Card className="p-4 flex gap-3">
       <button type="button" onClick={() => openStudio(app.id, type)} className={`shrink-0 rounded-lg overflow-hidden ${T.ring}`} aria-label={`Ouvrir ${DOC_LABEL[type]} dans le studio`} style={{ width: 210 * MM * z, height: 297 * MM * z, background: v ? "transparent" : undefined }}>
         {v ? (
-          <div style={{ pointerEvents: "none" }}><PaperPages text={text} accent={useDraft ? draft.accent : v.accent} kind={type} zoom={z} maxPages={1} /></div>
+          <div style={{ pointerEvents: "none" }}><DesignPages text={text} kind={type} design={design} photo={media?.photo} lang={lang} zoom={z} maxPages={1} /></div>
         ) : (
           <div className={`w-full h-full flex items-center justify-center ${T.sub}`}><FileText className={`w-6 h-6 ${T.faint}`} aria-hidden="true" /></div>
         )}
